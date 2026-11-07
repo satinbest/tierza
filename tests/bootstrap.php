@@ -154,6 +154,14 @@ if ( ! function_exists( 'get_option' ) ) {
 	}
 }
 
+if ( ! function_exists( 'delete_option' ) ) {
+	function delete_option( string $option ): bool {
+		global $wp_options;
+		unset( $wp_options[ $option ] );
+		return true;
+	}
+}
+
 if ( ! function_exists( '__' ) ) {
 	function __( string $text, string $domain = 'default' ): string {
 		return $text;
@@ -181,6 +189,105 @@ if ( ! function_exists( 'esc_html' ) ) {
 if ( ! function_exists( 'wp_die' ) ) {
 	function wp_die( string $message = '', string $title = '', $args = [] ): void {
 		throw new RuntimeException( "wp_die: $message" );
+	}
+}
+
+if ( ! defined( 'ARRAY_A' ) ) {
+	define( 'ARRAY_A', 'ARRAY_A' );
+}
+
+if ( ! class_exists( 'wpdb' ) ) {
+	class wpdb {
+		public string $prefix = 'wp_';
+		public int $insert_id = 0;
+
+		public function get_charset_collate(): string {
+			return 'DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_520_ci';
+		}
+
+		/**
+		 * @param string $query
+		 * @param mixed ...$args
+		 */
+		public function prepare( string $query, ...$args ): string {
+			foreach ( $args as $arg ) {
+				$val   = is_string( $arg ) ? "'" . addslashes( $arg ) . "'" : (string) $arg;
+				$query = preg_replace( '/%[sddfF]/', $val, $query, 1 ) ?? $query;
+			}
+			return $query;
+		}
+
+		public function get_var( ?string $query = null ): mixed {
+			return null;
+		}
+
+		/**
+		 * @return mixed
+		 */
+		public function get_row( ?string $query = null, string $output = ARRAY_A ): mixed {
+			return null;
+		}
+
+		/**
+		 * @return mixed
+		 */
+		public function get_results( ?string $query = null, string $output = ARRAY_A ): mixed {
+			return [];
+		}
+
+		public function query( string $query ): int|bool {
+			return true;
+		}
+
+		/**
+		 * @param array<string, mixed> $data
+		 * @param array<string>|null $format
+		 */
+		public function insert( string $table, array $data, ?array $format = null ): int|bool {
+			$this->insert_id++;
+			return 1;
+		}
+
+		/**
+		 * @param array<string, mixed> $data
+		 * @param array<string, mixed> $where
+		 * @param array<string>|null $format
+		 * @param array<string>|null $where_format
+		 */
+		public function update( string $table, array $data, array $where, ?array $format = null, ?array $where_format = null ): int|bool {
+			return 1;
+		}
+
+		/**
+		 * @param array<string, mixed> $where
+		 * @param array<string>|null $where_format
+		 */
+		public function delete( string $table, array $where, ?array $where_format = null ): int|bool {
+			return 1;
+		}
+
+		public function esc_like( string $text ): string {
+			return addcslashes( $text, '_%\\' );
+		}
+	}
+
+	global $wpdb;
+	$wpdb = new wpdb();
+}
+
+if ( ! function_exists( 'current_time' ) ) {
+	function current_time( string $type, bool $gmt = false ): string {
+		return gmdate( 'Y-m-d H:i:s' );
+	}
+}
+
+if ( ! function_exists( 'dbDelta' ) ) {
+	/**
+	 * @param string|array<string> $queries
+	 * @return array<string, string>
+	 */
+	function dbDelta( $queries = '', bool $execute = true ): array {
+		return [];
 	}
 }
 

@@ -14,6 +14,7 @@
     "format:js": "wp-scripts format src",
     "type-check": "tsc --noEmit",
     "test:e2e": "playwright test",
+    "test:db": "wp-env run cli wp eval-file wp-content/plugins/tierza/tests/Live/DatabaseIntegrationLiveTest.php",
     "test:unit": "composer test",
     "lint:php": "composer phpcs",
     "analyze:php": "composer phpstan"

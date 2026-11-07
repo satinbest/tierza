@@ -164,6 +164,9 @@ jobs:
           npx wp-env run cli wp eval "echo 'Locale: ' . get_locale() . ' | RTL: ' . (is_rtl() ? 'true' : 'false') . PHP_EOL;"
           npx wp-env run cli wp eval "echo 'Translated: ' . __('Tierza — B2B & Wholesale Pricing for WooCommerce', 'tierza') . PHP_EOL;"
 
+      - name: Run live database integration tests
+        run: npm run test:db
+
       - name: Check for unexpected PHP errors in debug.log
         run: |
           npx wp-env run cli bash -c "if [ -f /var/www/html/wp-content/debug.log ]; then ! grep -E -i 'fatal|parse error|tierza' /var/www/html/wp-content/debug.log; fi"

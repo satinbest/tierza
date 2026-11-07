@@ -50,10 +50,17 @@ Tierza adheres strictly to layered architecture principles:
 
 ## 🗺️ Approved Development Roadmap
 
-- **TRZ-001**: Plugin Bootstrap *(Current)*
-- **TRZ-002**: Development Environment and Tooling
-- **TRZ-003**: CI Pipeline
-- **TRZ-004**: Database Schema and Data Layer
+- **TRZ-001**: Plugin Bootstrap *(Completed)*
+- **TRZ-002**: Development Environment and Tooling *(Completed)*
+- **TRZ-003**: CI Pipeline *(Completed)*
+- **TRZ-004**: Database Schema and Data Layer *(Upcoming)*
+
+---
+
+## 📚 Documentation
+
+- [Development Setup Guide](docs/development-setup.md)
+- [Continuous Integration (CI) Pipeline Guide](docs/ci-pipeline.md)
 
 ---
 

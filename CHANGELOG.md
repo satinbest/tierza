@@ -16,4 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tierza top-level admin menu and Persian/RTL dashboard template with English fallback.
 - Localization infrastructure with `tierza.pot`, `tierza-fa_IR.po`, and compiled `tierza-fa_IR.mo`.
 - Automated test suite and static analysis configuration (PHPUnit & PHPStan Level 8).
+- WordPress Coding Standards (WPCS) with PHPCS configuration.
+- Reproducible development environment with `@wordpress/env` on Docker (WordPress 6.5.5 & WooCommerce 8.5.2) (TRZ-002).
+- Playwright E2E browser smoke tests verified on live WordPress instance (TRZ-002).
+- GitHub Actions CI pipeline (`.github/workflows/ci.yml`) covering PHP matrix (8.1, 8.4), JS linting, live WordPress integration, Playwright E2E, and production ZIP packaging (TRZ-003).
+- Comprehensive CI pipeline guide (`docs/ci-pipeline.md`) (TRZ-003).
 - Build packaging script for standalone distribution ZIP (`dist/tierza.zip`).

@@ -1,0 +1,288 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  php-quality:
+    name: PHP Quality (PHP ${{ matrix.php-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ['8.1', '8.4']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup PHP environment
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: curl, mbstring, zip, openssl, pdo_sqlite, pdo_mysql, dom, libxml
+          tools: composer:v2
+          coverage: none
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ matrix.php-version }}-${{ hashFiles('composer.lock') }}
+          restore-keys: |
+            composer-${{ matrix.php-version }}-
+
+      - name: Install Composer dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Validate PHP syntax
+        run: |
+          find tierza.php src tests bin -name "*.php" -exec php -l {} +
+
+      - name: Run WordPress Coding Standards (PHPCS)
+        run: composer phpcs
+
+      - name: Run PHPStan static analysis (Level 8)
+        run: composer phpstan
+
+      - name: Run PHPUnit tests (Unit & Integration)
+        run: composer test
+
+  js-quality:
+    name: JavaScript & Asset Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Run TypeScript type checking
+        run: npm run type-check
+
+      - name: Run ESLint
+        run: npm run lint:js
+
+      - name: Compile production assets
+        run: npm run build
+
+      - name: Verify compiled asset output
+        run: |
+          test -f build/index.js || (echo "build/index.js missing" && exit 1)
+          test -f build/index.asset.php || (echo "build/index.asset.php missing" && exit 1)
+
+  wp-integration:
+    name: Live WordPress & WooCommerce Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [php-quality, js-quality]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: curl, mbstring, zip, openssl, pdo_sqlite, pdo_mysql, dom, libxml
+          tools: composer:v2
+          coverage: none
+
+      - name: Install dependencies and build assets
+        run: |
+          composer install --prefer-dist --no-progress
+          npm ci
+          npm run build
+          php bin/compile-mo.php
+
+      - name: Start WordPress & WooCommerce environment
+        run: npm run env:start
+
+      - name: Wait for WordPress service readiness
+        run: |
+          echo "Waiting for WordPress container to respond on http://localhost:8888/wp-login.php..."
+          timeout 120s bash -c 'until curl -s -f http://localhost:8888/wp-login.php > /dev/null; do sleep 3; done'
+          echo "WordPress is ready."
+
+      - name: Verify WordPress and WooCommerce versions
+        run: |
+          npx wp-env run cli wp core version
+          npx wp-env run cli wp plugin list
+
+      - name: Verify Tierza and WooCommerce active status
+        run: |
+          npx wp-env run cli wp plugin is-active Tierza
+          npx wp-env run cli wp plugin is-active woocommerce
+
+      - name: Verify clean deactivation and reactivation
+        run: |
+          npx wp-env run cli wp plugin deactivate Tierza
+          npx wp-env run cli wp plugin activate Tierza
+          npx wp-env run cli wp plugin is-active Tierza
+
+      - name: Verify inactive WooCommerce graceful handling
+        run: |
+          npx wp-env run cli wp plugin deactivate woocommerce
+          npx wp-env run cli wp eval "echo 'WC Active: ' . (Tierza\Infrastructure\Environment::is_woocommerce_active() ? 'yes' : 'no') . PHP_EOL;"
+          npx wp-env run cli wp plugin activate woocommerce
+
+      - name: Install and verify Persian locale (fa_IR)
+        run: |
+          npx wp-env run cli wp language core install fa_IR --activate
+          npx wp-env run cli wp eval "echo 'Locale: ' . get_locale() . ' | RTL: ' . (is_rtl() ? 'true' : 'false') . PHP_EOL;"
+          npx wp-env run cli wp eval "echo 'Translated: ' . __('Tierza — B2B & Wholesale Pricing for WooCommerce', 'tierza') . PHP_EOL;"
+
+      - name: Check for unexpected PHP errors in debug.log
+        run: |
+          npx wp-env run cli bash -c "if [ -f /var/www/html/wp-content/debug.log ]; then ! grep -E -i 'fatal|parse error|tierza' /var/www/html/wp-content/debug.log; fi"
+
+      - name: Upload debug.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp-debug-log
+          path: ~/.wp-env/*/WordPress/wp-content/debug.log
+          retention-days: 7
+
+  playwright-e2e:
+    name: Playwright E2E Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [js-quality]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: curl, mbstring, zip, openssl, pdo_sqlite, pdo_mysql, dom, libxml
+          tools: composer:v2
+          coverage: none
+
+      - name: Install dependencies and build assets
+        run: |
+          composer install --prefer-dist --no-progress
+          npm ci
+          npm run build
+          php bin/compile-mo.php
+
+      - name: Install Playwright browsers with OS dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Start WordPress environment
+        run: npm run env:start
+
+      - name: Install Persian locale for E2E tests
+        run: npx wp-env run cli wp language core install fa_IR --activate
+
+      - name: Wait for WordPress service readiness
+        run: |
+          timeout 120s bash -c 'until curl -s -f http://localhost:8888/wp-login.php > /dev/null; do sleep 3; done'
+
+      - name: Run Playwright E2E smoke tests
+        run: npm run test:e2e
+
+      - name: Upload Playwright artifacts on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+
+  package-release:
+    name: Production ZIP Verification & Packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [php-quality, js-quality]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: curl, mbstring, zip, openssl
+          tools: composer:v2
+          coverage: none
+
+      - name: Install dependencies and compile assets
+        run: |
+          npm ci
+          npm run build
+          composer install --no-dev --optimize-autoloader
+
+      - name: Build release ZIP
+        run: php bin/build-zip.php
+
+      - name: Execute standalone extraction and unzipped execution test
+        run: php bin/verify-standalone.php
+
+      - name: Verify ZIP structure
+        run: |
+          unzip -l dist/tierza.zip | head -n 25
+          unzip -l dist/tierza.zip | grep "tierza/tierza.php"
+          unzip -l dist/tierza.zip | grep "tierza/languages/tierza-fa_IR.mo"
+          # Verify dev artifacts are excluded
+          ! unzip -l dist/tierza.zip | grep "tierza/tests/"
+          ! unzip -l dist/tierza.zip | grep "tierza/phpunit.xml"
+          ! unzip -l dist/tierza.zip | grep "tierza/phpstan.neon"
+          ! unzip -l dist/tierza.zip | grep "tierza/.git"
+
+      - name: Upload release ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tierza-plugin-zip
+          path: dist/tierza.zip
+          retention-days: 30

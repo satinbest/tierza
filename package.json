@@ -12,6 +12,7 @@
     "start": "wp-scripts start",
     "lint:js": "wp-scripts lint-js src",
     "format:js": "wp-scripts format src",
+    "type-check": "tsc --noEmit",
     "test:e2e": "playwright test",
     "test:unit": "composer test",
     "lint:php": "composer phpcs",

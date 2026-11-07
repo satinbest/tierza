@@ -1,4 +1,4 @@
-# Tierza (تیرزا)
+# Tierza — Advanced B2B Pricing for WooCommerce
 
 [![License: GPL-2.0-or-later](https://img.shields.io/badge/License-GPLv2%2B-blue.svg)](https://www.gnu.org/licenses/gpl-2.0.html)
 [![Version: 0.1.0-dev](https://img.shields.io/badge/Version-0.1.0--dev-orange.svg)](#)
@@ -8,35 +8,31 @@
 
 **Tierza** is a free and open-source, modular B2B pricing plugin for WooCommerce, specifically engineered for Iranian wholesale, corporate, and multi-tier merchant workflows.
 
----
-
-## 🇮🇷 درباره افزونه تیرزا
-
-تیرزا یک افزونه قیمت‌گذاری پیشرفته B2B، عمده‌فروشی و همکار برای ووکامرس است که با رعایت استانداردهای روز نرم‌افزاری و معماری تمیز (Clean Architecture) توسعه یافته است.
-
-### ویژگی‌های کلیدی:
-- تعریف نامحدود سطوح و گروه‌های قیمتی همکار و B2B.
-- تخصیص یک گروه اصلی به هر کاربر برای نسخه v1.
-- تخفیف درصدی و قیمت ثابت در سطح گروه، دسته‌بندی، محصول و متغیر.
-- قیمت‌گذاری اختصاصی برای مشتریان خاص.
-- الگوریتم تقدم قطعی و پیش‌بینی‌پذیر قوانین (بدون تداخل یا همپوشانی ناخواسته).
-- حفظ ۱۰۰٪ یکپارچگی قیمت‌های اصلی و حراج ووکامرس (عدم دستکاری مخرب در دیتابیس).
-- سازگاری کامل با کش‌ها، پرداخت استاندارد ووکامرس، و آماده‌سازی برای HPOS و Block Checkout.
-- رابط مدیریت مدرن، واکنش‌گرا و بومی‌شده به زبان فارسی با چینش راست‌به‌چپ (RTL) و پشتیبانی از فال‌بک انگلیسی.
-- متن‌باز، بدون وابستگی‌های غیررایگان، بدون نیاز به لایسنس یا ionCube.
+[**Persian Documentation (مستندات فارسی)**](README.fa.md) | **English Documentation**
 
 ---
 
-## 🏗️ Architecture
+## 🚀 Overview
 
-Tierza adheres strictly to layered architecture principles:
+Tierza provides clean, authoritative, server-side pricing rules for wholesale and tier customers without destructively overwriting WooCommerce's core `regular_price` or `sale_price` values. It is engineered with Clean Architecture principles, ensuring seamless compatibility with WooCommerce standard checkout, Cart & Checkout Blocks, Store API, and HPOS.
 
-1. **Domain Layer**: Pure business models, pricing rules, resolution policies, and mathematical evaluations with zero external coupling.
-2. **Application Layer**: Use cases, command and query handlers, and pricing orchestration.
-3. **Infrastructure Layer**: Persistence, options, system environment, and logging.
-4. **Integration Layer (WooCommerce)**: Adapts pricing calculations to WooCommerce hooks, filters, Cart/Checkout pipelines, and REST/Store APIs.
-5. **REST API Layer**: Secure, capability-checked endpoints under `/wp-json/tierza/v1/`.
-6. **Admin UI Layer**: Persian-native, RTL-first administration interface with English fallback.
+---
+
+## 🚦 Development Status
+
+> [!IMPORTANT]
+> Tierza is currently at version **`0.1.0-dev`**.  
+> The core bootstrap, localization, dev tooling, and CI pipeline are fully completed. **Pricing calculation engines, customer group assignments, and database schemas are under active development in upcoming tasks.**
+
+### Completed Milestones:
+- [x] **TRZ-001 (Plugin Bootstrap)**: Layered architecture (Domain, Application, Infrastructure, Integration, Rest, Admin), PSR-4 autoloading, graceful degradation when WooCommerce is inactive.
+- [x] **Internationalization**: Full Persian RTL support, compiled `.mo` translation files, and English fallback strings.
+- [x] **TRZ-002 (Development Environment & Tooling)**: `@wordpress/env` Docker environment (WordPress 6.5.5, WooCommerce 8.5.2, MariaDB), WordPress Coding Standards (PHPCS), PHPStan Level 8, ESLint, TypeScript, and Playwright E2E browser tests.
+- [x] **TRZ-003 (CI Pipeline)**: GitHub Actions continuous integration testing PHP 8.1 & 8.4 matrix, JS quality, containerized integration, Playwright E2E, and production ZIP artifact validation.
+
+### Planned Milestones:
+- [ ] **TRZ-004**: Customer Pricing Groups Schema & Data Layer
+- [ ] **TRZ-005+**: Deterministic rule resolution engine, category/product tier pricing, customer-specific pricing, REST API controllers, and React admin SPA.
 
 ---
 
@@ -45,53 +41,59 @@ Tierza adheres strictly to layered architecture principles:
 - **PHP**: 8.1 or newer
 - **WordPress**: 6.5 or newer
 - **WooCommerce**: 8.5 or newer
+- **Database**: MySQL 5.7+ or MariaDB 10.4+
 
 ---
 
-## 🗺️ Approved Development Roadmap
+## 📦 Installation
 
-- **TRZ-001**: Plugin Bootstrap *(Completed)*
-- **TRZ-002**: Development Environment and Tooling *(Completed)*
-- **TRZ-003**: CI Pipeline *(Completed)*
-- **TRZ-004**: Database Schema and Data Layer *(Upcoming)*
-
----
-
-## 📚 Documentation
-
-- [Development Setup Guide](docs/development-setup.md)
-- [Continuous Integration (CI) Pipeline Guide](docs/ci-pipeline.md)
-
----
-
-## 🚀 Installation
-
-1. Download the latest `tierza.zip` release from the repository or build it locally.
-2. Log in to your WordPress Admin.
+### From Release ZIP
+1. Download `tierza.zip` from repository releases or artifact builds.
+2. Log in to your WordPress Admin dashboard.
 3. Navigate to **Plugins > Add New > Upload Plugin**.
-4. Select `tierza.zip` and click **Install Now**.
-5. Click **Activate Plugin**.
+4. Select `tierza.zip` and click **Install Now**, then **Activate Plugin**.
 
----
-
-## 🛠️ Development & Testing
-
+### Local Development Setup
 ```bash
+# Clone the repository
+git clone https://github.com/satinbest/tierza.git
+cd tierza
+
 # Install PHP dependencies
 composer install
 
-# Run PHPUnit tests
-composer test
+# Install JS/tooling dependencies
+npm install
 
-# Run PHPStan static analysis (Level 8)
-composer phpstan
-
-# Compile translation MO files
+# Compile translation binary files
 php bin/compile-mo.php
 
-# Package installable release ZIP
-powershell -ExecutionPolicy Bypass -File bin/build-zip.ps1
+# Build frontend assets
+npm run build
+
+# Start live WordPress development environment (Requires Docker)
+npm run env:start
 ```
+
+---
+
+## 🧪 Testing & Quality Commands
+
+| Command | Description |
+| :--- | :--- |
+| `composer test` | Runs PHPUnit unit and integration test suites |
+| `composer phpstan` | Runs PHPStan static analysis at Level 8 |
+| `composer phpcs` | Validates code against WordPress Coding Standards |
+| `npm run type-check` | Verifies TypeScript types with `tsc --noEmit` |
+| `npm run lint:js` | Lints JavaScript and TypeScript files with ESLint |
+| `npm run test:e2e` | Runs Playwright browser tests against live WordPress |
+| `composer build:zip` | Packages the production-ready installable ZIP (`dist/tierza.zip`) |
+
+---
+
+## 🤝 Contribution Guidelines
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on code standards, branch policies, and pull request procedures.
 
 ---
 

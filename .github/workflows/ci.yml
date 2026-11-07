@@ -143,14 +143,14 @@ jobs:
 
       - name: Verify Tierza and WooCommerce active status
         run: |
-          npx wp-env run cli wp plugin is-active Tierza
+          npx wp-env run cli wp plugin is-active tierza
           npx wp-env run cli wp plugin is-active woocommerce
 
       - name: Verify clean deactivation and reactivation
         run: |
-          npx wp-env run cli wp plugin deactivate Tierza
-          npx wp-env run cli wp plugin activate Tierza
-          npx wp-env run cli wp plugin is-active Tierza
+          npx wp-env run cli wp plugin deactivate tierza
+          npx wp-env run cli wp plugin activate tierza
+          npx wp-env run cli wp plugin is-active tierza
 
       - name: Verify inactive WooCommerce graceful handling
         run: |

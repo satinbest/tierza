@@ -1,0 +1,148 @@
+/**
+ * Tierza Admin CSS
+ * Supports Persian typography and RTL layout.
+ */
+
+.tierza-wrap {
+	margin: 20px 20px 0 0;
+	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", "Vazirmatn", "IRANSans", Tahoma, sans-serif;
+	color: #1e1e1e;
+}
+
+.tierza-rtl {
+	direction: rtl;
+	text-align: right;
+}
+
+.tierza-header {
+	background: #ffffff;
+	border: 1px solid #ccd0d4;
+	border-radius: 8px;
+	padding: 24px;
+	margin-bottom: 24px;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.tierza-title {
+	font-size: 22px;
+	font-weight: 700;
+	margin: 0 0 8px 0;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.tierza-title__logo {
+	font-size: 26px;
+}
+
+.tierza-badge {
+	display: inline-block;
+	background: #2271b1;
+	color: #ffffff;
+	font-size: 12px;
+	font-weight: 600;
+	padding: 2px 8px;
+	border-radius: 12px;
+	vertical-align: middle;
+}
+
+.tierza-subtitle {
+	color: #646970;
+	font-size: 14px;
+	margin: 0;
+	line-height: 1.6;
+}
+
+.tierza-card-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+	gap: 20px;
+}
+
+.tierza-card {
+	background: #ffffff;
+	border: 1px solid #ccd0d4;
+	border-radius: 8px;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+	overflow: hidden;
+}
+
+.tierza-card__header {
+	padding: 16px 20px;
+	border-bottom: 1px solid #f0f0f1;
+	background-color: #fafafa;
+}
+
+.tierza-card__header h3 {
+	margin: 0;
+	font-size: 16px;
+	font-weight: 600;
+	color: #1d2327;
+}
+
+.tierza-card__body {
+	padding: 20px;
+}
+
+.tierza-status-list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+
+.tierza-status-list li {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: 10px 0;
+	border-bottom: 1px solid #f0f0f1;
+}
+
+.tierza-status-list li:last-child {
+	border-bottom: none;
+}
+
+.tierza-status-label {
+	color: #50575e;
+	font-size: 13px;
+}
+
+.tierza-status-value {
+	font-size: 13px;
+	font-weight: 600;
+}
+
+.tierza-badge-success {
+	color: #008a20;
+	background: #edfaef;
+	padding: 2px 8px;
+	border-radius: 4px;
+}
+
+.tierza-badge-warning {
+	color: #996800;
+	background: #fcf9e8;
+	padding: 2px 8px;
+	border-radius: 4px;
+}
+
+.tierza-callout {
+	margin-top: 16px;
+	background: #f6f7f7;
+	border-right: 4px solid #2271b1;
+	padding: 12px 16px;
+	border-radius: 4px;
+}
+
+.tierza-feature-list {
+	list-style: none;
+	margin: 8px 0 0 0;
+	padding: 0;
+}
+
+.tierza-feature-list li {
+	margin-bottom: 6px;
+	font-size: 13px;
+	color: #2c3338;
+}

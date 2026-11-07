@@ -1,0 +1,61 @@
+# Copyright (C) 2026 Tierza Team
+# This file is distributed under the GPL-2.0-or-later.
+msgid ""
+msgstr ""
+"Project-Id-Version: Tierza 1.0.0\n"
+"Report-Msgid-Bugs-To: https://github.com/tierza/tierza/issues\n"
+"Last-Translator: Tierza Localization Team <dev@tierza.org>\n"
+"Language-Team: Persian <fa_IR@li.org>\n"
+"Language: fa_IR\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+"POT-Creation-Date: 2026-11-08T00:00:00+03:30\n"
+"PO-Revision-Date: 2026-11-08T00:00:00+03:30\n"
+"X-Generator: WP-CLI 2.8.0\n"
+"X-Domain: tierza\n"
+
+#: tierza.php
+msgid "افزونه قیمت‌گذاری پیشرفته B2B و همکار برای ووکامرس، ویژه کسب‌وکارهای ایرانی."
+msgstr "افزونه قیمت‌گذاری پیشرفته B2B و همکار برای ووکامرس، ویژه کسب‌وکارهای ایرانی."
+
+#: src/Infrastructure/Environment.php:88
+msgid "تیرزا نیازمند پی‌اچ‌پی نسخه %1$s یا بالاتر است. نسخه فعلی سرور شما: %2$s"
+msgstr "تیرزا نیازمند پی‌اچ‌پی نسخه %1$s یا بالاتر است. نسخه فعلی سرور شما: %2$s"
+
+#: src/Infrastructure/Environment.php:98
+msgid "تیرزا نیازمند وردپرس نسخه %1$s یا بالاتر است. نسخه فعلی وردپرس شما: %2$s"
+msgstr "تیرزا نیازمند وردپرس نسخه %1$s یا بالاتر است. نسخه فعلی وردپرس شما: %2$s"
+
+#: src/Infrastructure/Environment.php:105
+msgid "تیرزا برای فعالیت به افزونه ووکامرس (WooCommerce) نیاز دارد. لطفاً ووکامرس را نصب و فعال نمایید."
+msgstr "تیرزا برای فعالیت به افزونه ووکامرس (WooCommerce) نیاز دارد. لطفاً ووکامرس را نصب و فعال نمایید."
+
+#: src/Infrastructure/Environment.php:110
+msgid "تیرزا نیازمند ووکامرس نسخه %1$s یا بالاتر است. نسخه فعلی ووکامرس شما: %2$s"
+msgstr "تیرزا نیازمند ووکامرس نسخه %1$s یا بالاتر است. نسخه فعلی ووکامرس شما: %2$s"
+
+#: src/Admin/AdminMenu.php:26
+msgid "تیرزا — قیمت‌گذاری B2B و همکار ووکامرس"
+msgstr "تیرزا — قیمت‌گذاری B2B و همکار ووکامرس"
+
+#: src/Admin/AdminMenu.php:27
+msgid "تیرزا"
+msgstr "تیرزا"
+
+#: src/Admin/AdminMenu.php:68
+msgid "شما اجازه دسترسی به این بخش را ندارید."
+msgstr "شما اجازه دسترسی به این بخش را ندارید."
+
+#: src/Plugin.php:108
+msgid "خطای افزونه تیرزا (Tierza)"
+msgstr "خطای افزونه تیرزا (Tierza)"
+
+#: src/Plugin.php:121
+msgid "هشدار تیرزا (Tierza)"
+msgstr "هشدار تیرزا (Tierza)"
+
+#: src/Plugin.php:134
+msgid "فعال‌سازی تیرزا ناموفق بود: پی‌اچ‌پی نسخه %1$s یا بالاتر الزامی است. نسخه فعلی سرور: %2$s"
+msgstr "فعال‌سازی تیرزا ناموفق بود: پی‌اچ‌پی نسخه %1$s یا بالاتر الزامی است. نسخه فعلی سرور: %2$s"

@@ -9,8 +9,11 @@
          failOnRisky="true"
          failOnWarning="true">
     <testsuites>
-        <testsuite name="Tierza Unit Tests">
+        <testsuite name="Unit">
             <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Integration">
+            <directory>tests/Integration</directory>
         </testsuite>
     </testsuites>
     <source>

@@ -12,6 +12,12 @@ use Tierza\Infrastructure\Environment;
  */
 class EnvironmentTest extends TestCase {
 
+	protected function tearDown(): void {
+		global $wp_version;
+		$wp_version = '6.7.0';
+		parent::tearDown();
+	}
+
 	public function test_php_version_is_compatible(): void {
 		// Minimum is 8.1, runner is >= 8.1
 		$this->assertTrue( Environment::is_php_compatible() );

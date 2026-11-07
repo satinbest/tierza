@@ -6,7 +6,12 @@
 
 # Build artifacts
 /dist/
+/build/
 *.zip
+
+# Playwright artifacts
+/test-results/
+/playwright-report/
 
 # Cache and logs
 .phpunit.cache/

@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<ruleset name="Tierza Coding Standards">
+    <description>WordPress Coding Standards for Tierza.</description>
+
+    <!-- Pass arguments to PHPCS -->
+    <arg name="basepath" value="."/>
+    <arg name="parallel" value="8"/>
+    <arg name="extensions" value="php"/>
+    <arg value="ps"/>
+
+    <!-- Check files and directories -->
+    <file>tierza.php</file>
+    <file>src</file>
+
+    <!-- Exclude vendor, node_modules, and dist directories -->
+    <exclude-pattern>*/vendor/*</exclude-pattern>
+    <exclude-pattern>*/node_modules/*</exclude-pattern>
+    <exclude-pattern>*/dist/*</exclude-pattern>
+
+    <!-- Config textdomain and minimum supported WP version -->
+    <config name="text_domain" value="tierza"/>
+    <config name="minimum_wp_version" value="6.5"/>
+
+    <!-- Ruleset: WordPress Core and Extra -->
+    <rule ref="WordPress-Core">
+        <!-- PSR-4 class filenames are required by Composer autoloading -->
+        <exclude name="WordPress.Files.FileName.InvalidClassFileName"/>
+        <exclude name="WordPress.Files.FileName.NotHyphenatedLowercase"/>
+        <!-- Allow modern PHP 8.1+ short array syntax -->
+        <exclude name="Universal.Arrays.DisallowShortArraySyntax.Found"/>
+    </rule>
+
+    <rule ref="WordPress-Extra">
+        <exclude name="WordPress.Files.FileName.InvalidClassFileName"/>
+        <exclude name="WordPress.Files.FileName.NotHyphenatedLowercase"/>
+        <!-- Allow SVG data URI base64 encoding -->
+        <exclude name="WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode"/>
+        <exclude name="Universal.NamingConventions.NoReservedKeywordParameterNames.classFound"/>
+    </rule>
+</ruleset>

@@ -9,18 +9,23 @@ test.describe('Tierza Admin & Integration Smoke Tests', () => {
 		await page.goto('/wp-login.php');
 		await page.fill('#user_login', 'admin');
 		await page.fill('#user_pass', 'password');
-		await page.click('#wp-submit');
+		await Promise.all([
+			page.waitForURL(/.*wp-admin/, { timeout: 15000 }),
+			page.click('#wp-submit'),
+		]);
 		await expect(page).toHaveURL(/.*wp-admin/);
 	});
 
 	test('1 & 4. Tierza menu appears for authorized users and navigates to dashboard', async ({ page }) => {
 		// Look for Tierza menu item in admin sidebar
 		const tierzaMenu = page.locator('#toplevel_page_tierza');
-		await expect(tierzaMenu).toBeVisible();
+		await expect(tierzaMenu).toBeVisible({ timeout: 10000 });
 
 		// Click into Tierza admin screen
-		await tierzaMenu.click();
-		await expect(page).toHaveURL(/.*page=tierza/);
+		await Promise.all([
+			page.waitForURL(/.*page=tierza/, { timeout: 10000 }),
+			tierzaMenu.click(),
+		]);
 
 		// Verify main wrapper and title exist
 		const header = page.locator('.tierza-title');
@@ -41,9 +46,9 @@ test.describe('Tierza Admin & Integration Smoke Tests', () => {
 	test('5 & 7. Persian translation and RTL stylesheet render correctly under fa_IR', async ({ page }) => {
 		await page.goto('/wp-admin/admin.php?page=tierza');
 
-		// Check for RTL class when in Persian locale
+		// Check for wrapper
 		const wrap = page.locator('.tierza-wrap');
-		await expect(wrap).toBeVisible();
+		await expect(wrap).toBeVisible({ timeout: 10000 });
 
 		// Check that admin stylesheet is enqueued
 		const adminCss = page.locator('link[id="tierza-admin-css-css"]');

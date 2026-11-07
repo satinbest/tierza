@@ -9,8 +9,8 @@ namespace Tierza\Admin;
  */
 class AdminMenu {
 
-	public const MENU_SLUG   = 'tierza';
-	public const CAPABILITY  = 'manage_woocommerce';
+	public const MENU_SLUG  = 'tierza';
+	public const CAPABILITY = 'manage_woocommerce';
 
 	/**
 	 * Register admin menu hooks.
@@ -24,8 +24,8 @@ class AdminMenu {
 	 * Add Tierza top-level menu page.
 	 */
 	public function add_menu_pages(): void {
-		$page_title = __( 'تیرزا — قیمت‌گذاری B2B و همکار ووکامرس', 'tierza' );
-		$menu_title = __( 'تیرزا', 'tierza' );
+		$page_title = __( 'Tierza — B2B & Wholesale Pricing for WooCommerce', 'tierza' );
+		$menu_title = __( 'Tierza', 'tierza' );
 
 		// Custom SVG icon base64 encoded for high-DPI crisp rendering.
 		$icon_svg = 'data:image/svg+xml;base64,' . base64_encode(
@@ -70,14 +70,14 @@ class AdminMenu {
 	 */
 	public function render_dashboard(): void {
 		if ( ! current_user_can( self::CAPABILITY ) ) {
-			wp_die( esc_html__( 'شما اجازه دسترسی به این بخش را ندارید.', 'tierza' ) );
+			wp_die( esc_html__( 'You do not have sufficient permissions to access this page.', 'tierza' ) );
 		}
 
 		$template_path = TIERZA_PATH . 'templates/admin/dashboard.php';
 		if ( file_exists( $template_path ) ) {
 			require $template_path;
 		} else {
-			echo '<div class="wrap"><h1>' . esc_html__( 'تیرزا', 'tierza' ) . '</h1></div>';
+			echo '<div class="wrap"><h1>' . esc_html__( 'Tierza', 'tierza' ) . '</h1></div>';
 		}
 	}
 }

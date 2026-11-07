@@ -9,9 +9,9 @@ namespace Tierza\Infrastructure;
  */
 class Environment {
 
-	public const MIN_PHP_VERSION = '8.0.0';
-	public const MIN_WP_VERSION  = '6.2';
-	public const MIN_WC_VERSION  = '8.0.0';
+	public const MIN_PHP_VERSION = '8.1.0';
+	public const MIN_WP_VERSION  = '6.5';
+	public const MIN_WC_VERSION  = '8.5.0';
 
 	/**
 	 * Verify if the current PHP version satisfies the minimum requirement.
@@ -90,7 +90,8 @@ class Environment {
 	}
 
 	/**
-	 * Get an array of unmet requirement error messages (Persian and English).
+	 * Get an array of unmet requirement error notices.
+	 * Returns translated string if localization is loaded, or English fallback.
 	 *
 	 * @return array<int, string>
 	 */
@@ -100,7 +101,7 @@ class Environment {
 		if ( ! self::is_php_compatible() ) {
 			$notices[] = sprintf(
 				/* translators: 1: Required PHP version, 2: Current PHP version */
-				__( 'تیرزا نیازمند پی‌اچ‌پی نسخه %1$s یا بالاتر است. نسخه فعلی سرور شما: %2$s', 'tierza' ),
+				__( 'Tierza requires PHP version %1$s or higher. Your server is running PHP version %2$s.', 'tierza' ),
 				self::MIN_PHP_VERSION,
 				PHP_VERSION
 			);
@@ -110,18 +111,18 @@ class Environment {
 			global $wp_version;
 			$notices[] = sprintf(
 				/* translators: 1: Required WP version, 2: Current WP version */
-				__( 'تیرزا نیازمند وردپرس نسخه %1$s یا بالاتر است. نسخه فعلی وردپرس شما: %2$s', 'tierza' ),
+				__( 'Tierza requires WordPress version %1$s or higher. Your server is running WordPress version %2$s.', 'tierza' ),
 				self::MIN_WP_VERSION,
 				$wp_version ?? 'unknown'
 			);
 		}
 
 		if ( ! self::is_woocommerce_active() ) {
-			$notices[] = __( 'تیرزا برای فعالیت به افزونه ووکامرس (WooCommerce) نیاز دارد. لطفاً ووکامرس را نصب و فعال نمایید.', 'tierza' );
+			$notices[] = __( 'Tierza requires WooCommerce to be installed and active. Please install and activate WooCommerce.', 'tierza' );
 		} elseif ( ! self::is_woocommerce_compatible() ) {
 			$notices[] = sprintf(
 				/* translators: 1: Required WooCommerce version, 2: Current WooCommerce version */
-				__( 'تیرزا نیازمند ووکامرس نسخه %1$s یا بالاتر است. نسخه فعلی ووکامرس شما: %2$s', 'tierza' ),
+				__( 'Tierza requires WooCommerce version %1$s or higher. Your active WooCommerce version is %2$s.', 'tierza' ),
 				self::MIN_WC_VERSION,
 				self::get_woocommerce_version() ?? 'unknown'
 			);

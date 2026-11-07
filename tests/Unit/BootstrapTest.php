@@ -21,7 +21,7 @@ class BootstrapTest extends TestCase {
 
 	public function test_plugin_constants_defined(): void {
 		$this->assertTrue( defined( 'TIERZA_VERSION' ) );
-		$this->assertSame( '1.0.0', TIERZA_VERSION );
+		$this->assertSame( '0.1.0-dev', TIERZA_VERSION );
 
 		$this->assertTrue( defined( 'TIERZA_FILE' ) );
 		$this->assertFileExists( TIERZA_FILE );
@@ -39,10 +39,10 @@ class BootstrapTest extends TestCase {
 
 		$this->assertStringContainsString( 'Plugin Name:       Tierza', $content );
 		$this->assertStringContainsString( 'Text Domain:       tierza', $content );
-		$this->assertStringContainsString( 'Version:           1.0.0', $content );
-		$this->assertStringContainsString( 'Requires PHP:      8.0', $content );
-		$this->assertStringContainsString( 'Requires at least: 6.2', $content );
-		$this->assertStringContainsString( 'WC requires at least: 8.0', $content );
+		$this->assertStringContainsString( 'Version:           0.1.0-dev', $content );
+		$this->assertStringContainsString( 'Requires PHP:      8.1', $content );
+		$this->assertStringContainsString( 'Requires at least: 6.5', $content );
+		$this->assertStringContainsString( 'WC requires at least: 8.5', $content );
 		$this->assertStringContainsString( 'License:           GPL-2.0-or-later', $content );
 	}
 
@@ -60,7 +60,7 @@ class BootstrapTest extends TestCase {
 
 		Plugin::activate();
 
-		$this->assertSame( '1.0.0', $wp_options['tierza_version'] ?? null );
+		$this->assertSame( '0.1.0-dev', $wp_options['tierza_version'] ?? null );
 	}
 
 	public function test_deactivation_runs_cleanly(): void {
@@ -81,7 +81,7 @@ class BootstrapTest extends TestCase {
 
 		$this->assertSame( AdminMenu::CAPABILITY, $page['capability'] );
 		$this->assertSame( 56, $page['position'] );
-		$this->assertStringContainsString( 'تیرزا', $page['menu_title'] );
+		$this->assertSame( 'Tierza', $page['menu_title'] );
 	}
 
 	public function test_admin_assets_enqueued_only_on_tierza_pages(): void {
@@ -99,7 +99,7 @@ class BootstrapTest extends TestCase {
 		$this->assertArrayHasKey( 'tierza-admin-css', $wp_enqueued_styles );
 	}
 
-	public function test_dashboard_template_renders_rtl_and_persian(): void {
+	public function test_dashboard_template_renders_rtl_and_content(): void {
 		global $wp_version;
 		$wp_version = '6.7.0';
 
@@ -112,8 +112,8 @@ class BootstrapTest extends TestCase {
 		$this->assertIsString( $output );
 		$this->assertStringContainsString( 'tierza-wrap', $output );
 		$this->assertStringContainsString( 'tierza-rtl', $output );
-		$this->assertStringContainsString( 'تیرزا', $output );
-		$this->assertStringContainsString( 'v1.0.0', $output );
+		$this->assertStringContainsString( 'v0.1.0-dev', $output );
+		$this->assertStringContainsString( 'TRZ-001', $output );
 	}
 
 	public function test_translation_files_integrity(): void {
@@ -125,7 +125,7 @@ class BootstrapTest extends TestCase {
 		$this->assertFileExists( $po_file );
 		$this->assertFileExists( $mo_file );
 
-		// Verify MO binary magic number (little endian 0x950412de or big endian 0xde120495).
+		// Verify MO binary magic number (little endian 0x950412de).
 		$handle = fopen( $mo_file, 'rb' );
 		$this->assertIsResource( $handle );
 		$magic_bytes = fread( $handle, 4 );

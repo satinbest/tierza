@@ -20,14 +20,20 @@ if ( file_exists( $zip_file ) ) {
 	unlink( $zip_file );
 }
 
+// 1. Compile MO files first.
+require_once __DIR__ . '/compile-mo.php';
+
+// 2. Dump clean production autoloader (no dev dependencies).
+echo "Generating clean production autoloader...\n";
+exec( 'composer dump-autoload --no-dev --optimize' );
+
 $zip = new ZipArchive();
 if ( true !== $zip->open( $zip_file, ZipArchive::CREATE | ZipArchive::OVERWRITE ) ) {
 	fwrite( STDERR, "Failed to create ZIP at: $zip_file\n" );
+	// Restore dev autoloader before exiting.
+	exec( 'composer dump-autoload' );
 	exit( 1 );
 }
-
-// Compile MO files first.
-require_once __DIR__ . '/compile-mo.php';
 
 $included_files = [
 	'tierza.php',
@@ -77,7 +83,7 @@ foreach ( $included_directories as $dir ) {
 	}
 }
 
-// Include production vendor autoload if present.
+// Include production vendor autoload and class maps.
 $vendor_autoload = $project_root . '/vendor/autoload.php';
 $vendor_composer = $project_root . '/vendor/composer';
 if ( file_exists( $vendor_autoload ) && is_dir( $vendor_composer ) ) {
@@ -96,6 +102,11 @@ if ( file_exists( $vendor_autoload ) && is_dir( $vendor_composer ) ) {
 }
 
 $zip_status = $zip->close();
+
+// Restore dev autoload for testing & analysis.
+echo "Restoring development autoloader...\n";
+exec( 'composer dump-autoload' );
+
 if ( ! $zip_status ) {
 	fwrite( STDERR, "Failed to close and save ZIP.\n" );
 	exit( 1 );

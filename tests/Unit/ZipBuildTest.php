@@ -28,7 +28,14 @@ class ZipBuildTest extends TestCase {
 		$open_result = $zip->open( $zip_path, ZipArchive::RDONLY );
 		$this->assertTrue( $open_result, 'Failed to open generated ZIP file' );
 
-		// Check critical files inside the ZIP
+		// Verify every entry starts with 'tierza/' root directory
+		for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+			$entry_name = $zip->getNameIndex( $i );
+			$this->assertIsString( $entry_name );
+			$this->assertStringStartsWith( 'tierza/', $entry_name, "ZIP entry '$entry_name' does not start with tierza/ root directory." );
+		}
+
+		// Check critical runtime files inside the ZIP
 		$expected_files = [
 			'tierza/tierza.php',
 			'tierza/readme.txt',
@@ -44,6 +51,7 @@ class ZipBuildTest extends TestCase {
 			'tierza/languages/tierza-fa_IR.mo',
 			'tierza/languages/tierza-fa_IR.po',
 			'tierza/languages/tierza.pot',
+			'tierza/vendor/autoload.php',
 		];
 
 		foreach ( $expected_files as $file ) {
@@ -52,6 +60,28 @@ class ZipBuildTest extends TestCase {
 			$this->assertGreaterThan( 0, $stat['size'], "File $file inside ZIP is empty." );
 		}
 
+		// Verify dev and test files are strictly excluded
+		$excluded_patterns = [
+			'tierza/tests/',
+			'tierza/phpunit.xml',
+			'tierza/phpstan.neon',
+			'tierza/.gitignore',
+			'tierza/bin/',
+			'tierza/.git/',
+		];
+
+		foreach ( $excluded_patterns as $pattern ) {
+			$stat = $zip->statName( $pattern );
+			$this->assertFalse( $stat, "Dev artifact '$pattern' must NOT be in the release ZIP." );
+		}
+
 		$zip->close();
+	}
+
+	public function test_standalone_zip_extraction_and_bootstrap(): void {
+		$cmd = escapeshellcmd( PHP_BINARY ) . ' ' . escapeshellarg( TIERZA_PATH . 'bin/verify-standalone.php' );
+		exec( $cmd, $output, $return_code );
+
+		$this->assertSame( 0, $return_code, 'Standalone ZIP bootstrap verification must exit with code 0' );
 	}
 }

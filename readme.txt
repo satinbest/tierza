@@ -1,10 +1,10 @@
 === Tierza — افزونه قیمت‌گذاری B2B و همکار برای ووکامرس ===
 Contributors: tierzateam
 Tags: b2b, wholesale, woocommerce, pricing, iran, ریال, تومان
-Requires at least: 6.2
+Requires at least: 6.5
 Tested up to: 6.7
-Requires PHP: 8.0
-Stable tag: 1.0.0
+Requires PHP: 8.1
+Stable tag: 0.1.0-dev
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -18,7 +18,7 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 * تعریف نامحدود گروه‌های مشتریان B2B.
 * اعمال تخفیف‌های درصدی و قیمت‌های مقطوع.
 * اولویت‌بندی شفاف و تضمین‌شده قوانین بدون اثر مخرب روی قیمت‌های اصلی محصولات.
-* سازگاری کامل با زبان فارسی و محیط کاربری راست‌به‌چپ (RTL).
+* سازگاری کامل با زبان فارسی و محیط کاربری راست‌به‌چپ (RTL) همراه با پشتیبانی از انگلیسی.
 * محاسبات دقیق و مطمئن در سبد خرید و تسویه‌حساب.
 
 == Installation ==
@@ -29,6 +29,11 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
 == Frequently Asked Questions ==
 
+= حداقل پیش‌نیازهای فنی سیستم چیست؟ =
+* پی‌اچ‌پی: 8.1 یا بالاتر
+* وردپرس: 6.5 یا بالاتر
+* ووکامرس: 8.5 یا بالاتر
+
 = آیا تیرزا به لایسنس یا ionCube نیاز دارد؟ =
 خیر، تیرزا ۱۰۰٪ متن‌باز و با مجوز GPL-2.0-or-later منتشر شده است و به هیچ ابزار کدگذاری شده یا سرویس ابری نیازی ندارد.
 
@@ -37,8 +42,9 @@ License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
 == Changelog ==
 
-= 1.0.0 =
+= 0.1.0-dev =
 * راه‌اندازی اولیه معماری پلاگین (TRZ-001).
-* پشتیبانی از PHP 8.0+ و ووکامرس 8.0+.
-* پنل مدیریت پایه به همراه پشتیبانی کامل از زبان فارسی و RTL.
+* الزام حداقل PHP 8.1، وردپرس 6.5 و ووکامرس 8.5.
 * ساختار ماژولار لایه‌بندی‌شده (Domain, Application, Infrastructure, WooCommerce, REST, Admin).
+* پنل مدیریت پایه به همراه پشتیبانی کامل از زبان فارسی و RTL.
+* سازگاری کامل با ترجمه و فال‌بک زبان انگلیسی.

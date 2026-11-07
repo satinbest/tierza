@@ -1,8 +1,10 @@
 # Tierza (تیرزا)
 
 [![License: GPL-2.0-or-later](https://img.shields.io/badge/License-GPLv2%2B-blue.svg)](https://www.gnu.org/licenses/gpl-2.0.html)
-[![PHP: >=8.0](https://img.shields.io/badge/PHP-%3E%3D8.0-777BB4.svg)](https://www.php.net/)
-[![WooCommerce: >=8.0](https://img.shields.io/badge/WooCommerce-%3E%3D8.0-96588a.svg)](https://woocommerce.com/)
+[![Version: 0.1.0-dev](https://img.shields.io/badge/Version-0.1.0--dev-orange.svg)](#)
+[![PHP: >=8.1](https://img.shields.io/badge/PHP-%3E%3D8.1-777BB4.svg)](https://www.php.net/)
+[![WordPress: >=6.5](https://img.shields.io/badge/WordPress-%3E%3D6.5-21759B.svg)](https://wordpress.org/)
+[![WooCommerce: >=8.5](https://img.shields.io/badge/WooCommerce-%3E%3D8.5-96588a.svg)](https://woocommerce.com/)
 
 **Tierza** is a free and open-source, modular B2B pricing plugin for WooCommerce, specifically engineered for Iranian wholesale, corporate, and multi-tier merchant workflows.
 
@@ -12,15 +14,15 @@
 
 تیرزا یک افزونه قیمت‌گذاری پیشرفته B2B، عمده‌فروشی و همکار برای ووکامرس است که با رعایت استانداردهای روز نرم‌افزاری و معماری تمیز (Clean Architecture) توسعه یافته است.
 
-### ویژگی‌های کلیدی (نسخه ۱.۰):
+### ویژگی‌های کلیدی:
 - تعریف نامحدود سطوح و گروه‌های قیمتی همکار و B2B.
-- تخصیص یک گروه اصلی به هر کاربر (بدون پیچیدگی‌های ناسازگار).
+- تخصیص یک گروه اصلی به هر کاربر برای نسخه v1.
 - تخفیف درصدی و قیمت ثابت در سطح گروه، دسته‌بندی، محصول و متغیر.
 - قیمت‌گذاری اختصاصی برای مشتریان خاص.
 - الگوریتم تقدم قطعی و پیش‌بینی‌پذیر قوانین (بدون تداخل یا همپوشانی ناخواسته).
 - حفظ ۱۰۰٪ یکپارچگی قیمت‌های اصلی و حراج ووکامرس (عدم دستکاری مخرب در دیتابیس).
 - سازگاری کامل با کش‌ها، پرداخت استاندارد ووکامرس، و آماده‌سازی برای HPOS و Block Checkout.
-- رابط مدیریت مدرن، واکنش‌گرا و بومی‌شده به زبان فارسی با چینش راست‌به‌چپ (RTL).
+- رابط مدیریت مدرن، واکنش‌گرا و بومی‌شده به زبان فارسی با چینش راست‌به‌چپ (RTL) و پشتیبانی از فال‌بک انگلیسی.
 - متن‌باز، بدون وابستگی‌های غیررایگان، بدون نیاز به لایسنس یا ionCube.
 
 ---
@@ -34,15 +36,24 @@ Tierza adheres strictly to layered architecture principles:
 3. **Infrastructure Layer**: Persistence, options, system environment, and logging.
 4. **Integration Layer (WooCommerce)**: Adapts pricing calculations to WooCommerce hooks, filters, Cart/Checkout pipelines, and REST/Store APIs.
 5. **REST API Layer**: Secure, capability-checked endpoints under `/wp-json/tierza/v1/`.
-6. **Admin UI Layer**: Persian-native, RTL-first administration interface.
+6. **Admin UI Layer**: Persian-native, RTL-first administration interface with English fallback.
 
 ---
 
 ## ⚙️ Minimum Requirements
 
-- **PHP**: 8.0 or newer
-- **WordPress**: 6.2 or newer
-- **WooCommerce**: 8.0 or newer
+- **PHP**: 8.1 or newer
+- **WordPress**: 6.5 or newer
+- **WooCommerce**: 8.5 or newer
+
+---
+
+## 🗺️ Approved Development Roadmap
+
+- **TRZ-001**: Plugin Bootstrap *(Current)*
+- **TRZ-002**: Development Environment and Tooling
+- **TRZ-003**: CI Pipeline
+- **TRZ-004**: Database Schema and Data Layer
 
 ---
 
@@ -65,7 +76,7 @@ composer install
 # Run PHPUnit tests
 composer test
 
-# Run PHPStan static analysis
+# Run PHPStan static analysis (Level 8)
 composer phpstan
 
 # Compile translation MO files

@@ -2,7 +2,7 @@
 # This file is distributed under the GPL-2.0-or-later.
 msgid ""
 msgstr ""
-"Project-Id-Version: Tierza 1.0.0\n"
+"Project-Id-Version: Tierza 0.1.0-dev\n"
 "Report-Msgid-Bugs-To: https://github.com/tierza/tierza/issues\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: Persian <fa_IR@li.org>\n"
@@ -15,45 +15,105 @@ msgstr ""
 "X-Domain: tierza\n"
 
 #: tierza.php
-msgid "افزونه قیمت‌گذاری پیشرفته B2B و همکار برای ووکامرس، ویژه کسب‌وکارهای ایرانی."
-msgstr ""
-
-#: src/Infrastructure/Environment.php:88
-msgid "تیرزا نیازمند پی‌اچ‌پی نسخه %1$s یا بالاتر است. نسخه فعلی سرور شما: %2$s"
-msgstr ""
-
-#: src/Infrastructure/Environment.php:98
-msgid "تیرزا نیازمند وردپرس نسخه %1$s یا بالاتر است. نسخه فعلی وردپرس شما: %2$s"
-msgstr ""
-
-#: src/Infrastructure/Environment.php:105
-msgid "تیرزا برای فعالیت به افزونه ووکامرس (WooCommerce) نیاز دارد. لطفاً ووکامرس را نصب و فعال نمایید."
-msgstr ""
-
-#: src/Infrastructure/Environment.php:110
-msgid "تیرزا نیازمند ووکامرس نسخه %1$s یا بالاتر است. نسخه فعلی ووکامرس شما: %2$s"
+msgid "Advanced B2B and wholesale tiered pricing for WooCommerce, built for Iranian businesses."
 msgstr ""
 
 #: src/Admin/AdminMenu.php:26
-msgid "تیرزا — قیمت‌گذاری B2B و همکار ووکامرس"
+msgid "Tierza — B2B & Wholesale Pricing for WooCommerce"
 msgstr ""
 
 #: src/Admin/AdminMenu.php:27
-msgid "تیرزا"
+msgid "Tierza"
 msgstr ""
 
 #: src/Admin/AdminMenu.php:68
-msgid "شما اجازه دسترسی به این بخش را ندارید."
+msgid "You do not have sufficient permissions to access this page."
+msgstr ""
+
+#: src/Infrastructure/Environment.php:88
+msgid "Tierza requires PHP version %1$s or higher. Your server is running PHP version %2$s."
+msgstr ""
+
+#: src/Infrastructure/Environment.php:98
+msgid "Tierza requires WordPress version %1$s or higher. Your server is running WordPress version %2$s."
+msgstr ""
+
+#: src/Infrastructure/Environment.php:105
+msgid "Tierza requires WooCommerce to be installed and active. Please install and activate WooCommerce."
+msgstr ""
+
+#: src/Infrastructure/Environment.php:110
+msgid "Tierza requires WooCommerce version %1$s or higher. Your active WooCommerce version is %2$s."
 msgstr ""
 
 #: src/Plugin.php:108
-msgid "خطای افزونه تیرزا (Tierza)"
+msgid "Tierza Plugin Error"
 msgstr ""
 
 #: src/Plugin.php:121
-msgid "هشدار تیرزا (Tierza)"
+msgid "Tierza Warning"
 msgstr ""
 
 #: src/Plugin.php:134
-msgid "فعال‌سازی تیرزا ناموفق بود: پی‌اچ‌پی نسخه %1$s یا بالاتر الزامی است. نسخه فعلی سرور: %2$s"
+msgid "Tierza activation failed: PHP version %1$s or higher is required. Server version: %2$s."
+msgstr ""
+
+#: templates/admin/dashboard.php:15
+msgid "Inactive or Unknown"
+msgstr ""
+
+#: templates/admin/dashboard.php:24
+msgid "Comprehensive, modular, and native wholesale and tier pricing system for WooCommerce stores."
+msgstr ""
+
+#: templates/admin/dashboard.php:33
+msgid "System Status"
+msgstr ""
+
+#: templates/admin/dashboard.php:38
+msgid "Tierza Version:"
+msgstr ""
+
+#: templates/admin/dashboard.php:42
+msgid "Server PHP Version:"
+msgstr ""
+
+#: templates/admin/dashboard.php:44
+msgid "Compatible"
+msgstr ""
+
+#: templates/admin/dashboard.php:48
+msgid "WordPress Version:"
+msgstr ""
+
+#: templates/admin/dashboard.php:54
+msgid "WooCommerce Version:"
+msgstr ""
+
+#: templates/admin/dashboard.php:65
+msgid "Initial Bootstrap (TRZ-001)"
+msgstr ""
+
+#: templates/admin/dashboard.php:69
+msgid "Core infrastructure loaded successfully. Customer pricing groups schema and pricing rule engine will be initialized in upcoming milestones."
+msgstr ""
+
+#: templates/admin/dashboard.php:72
+msgid "Design Highlights:"
+msgstr ""
+
+#: templates/admin/dashboard.php:74
+msgid "✓ Original regular and sale prices are never overwritten"
+msgstr ""
+
+#: templates/admin/dashboard.php:75
+msgid "✓ Authoritative server-side price calculations"
+msgstr ""
+
+#: templates/admin/dashboard.php:76
+msgid "✓ Persian localization with full RTL layout support"
+msgstr ""
+
+#: templates/admin/dashboard.php:77
+msgid "✓ Clean layered architecture"
 msgstr ""

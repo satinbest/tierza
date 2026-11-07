@@ -66,7 +66,7 @@ final class Plugin {
 		// Verify WooCommerce presence and compatibility.
 		if ( ! Environment::is_woocommerce_active() || ! Environment::is_woocommerce_compatible() ) {
 			add_action( 'admin_notices', [ $this, 'render_woocommerce_notice' ] );
-			// We do not load WooCommerce integration or admin menu when WooCommerce is absent.
+			// Suspend WooCommerce-dependent services when WooCommerce is absent or incompatible.
 			return;
 		}
 
@@ -110,7 +110,7 @@ final class Plugin {
 		foreach ( $notices as $notice ) {
 			printf(
 				'<div class="notice notice-error"><p><strong>%s:</strong> %s</p></div>',
-				esc_html__( 'خطای افزونه تیرزا (Tierza)', 'tierza' ),
+				esc_html__( 'Tierza Plugin Error', 'tierza' ),
 				esc_html( $notice )
 			);
 		}
@@ -124,7 +124,7 @@ final class Plugin {
 		foreach ( $notices as $notice ) {
 			printf(
 				'<div class="notice notice-warning is-dismissible"><p><strong>%s:</strong> %s</p></div>',
-				esc_html__( 'هشدار تیرزا (Tierza)', 'tierza' ),
+				esc_html__( 'Tierza Warning', 'tierza' ),
 				esc_html( $notice )
 			);
 		}
@@ -141,7 +141,7 @@ final class Plugin {
 				esc_html(
 					sprintf(
 						/* translators: 1: Required PHP version, 2: Current PHP version */
-						__( 'فعال‌سازی تیرزا ناموفق بود: پی‌اچ‌پی نسخه %1$s یا بالاتر الزامی است. نسخه فعلی سرور: %2$s', 'tierza' ),
+						__( 'Tierza activation failed: PHP version %1$s or higher is required. Server version: %2$s.', 'tierza' ),
 						Environment::MIN_PHP_VERSION,
 						PHP_VERSION
 					)

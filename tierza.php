@@ -2,17 +2,17 @@
 /**
  * Plugin Name:       Tierza
  * Plugin URI:        https://github.com/tierza/tierza
- * Description:       افزونه قیمت‌گذاری پیشرفته B2B و همکار برای ووکامرس، ویژه کسب‌وکارهای ایرانی.
- * Version:           1.0.0
+ * Description:       افزونه قیمت‌گذاری پیشرفته B2B و همکار برای ووکامرس، ویژه کسب‌وکارهای ایرانی. | Advanced B2B wholesale and tiered pricing system for WooCommerce.
+ * Version:           0.1.0-dev
  * Author:            Tierza Team
  * Author URI:        https://tierza.org
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       tierza
  * Domain Path:       /languages
- * Requires at least: 6.2
- * Requires PHP:      8.0
- * WC requires at least: 8.0
+ * Requires at least: 6.5
+ * Requires PHP:      8.1
+ * WC requires at least: 8.5
  * WC tested up to:   9.4
  *
  * @package Tierza
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 // Define core constants.
-define( 'TIERZA_VERSION', '1.0.0' );
+define( 'TIERZA_VERSION', '0.1.0-dev' );
 define( 'TIERZA_FILE', __FILE__ );
 define( 'TIERZA_PATH', plugin_dir_path( __FILE__ ) );
 define( 'TIERZA_URL', plugin_dir_url( __FILE__ ) );

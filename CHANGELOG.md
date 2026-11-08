@@ -59,3 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Enforced fail-closed group eligibility policy requiring trusted entities or repository verification rather than assuming active status (TRZ-006).
 - Enforced strict category-depth metadata validation for competing category rules, preserving valid depth zero (TRZ-006).
 - Expanded PHPUnit test suite to 288 tests with 1,215 assertions and live MariaDB test suite to 37 tests with 228 assertions (TRZ-006).
+- Implementation of Authoritative Price Calculator (`AuthoritativePriceCalculator`) implementing `PriceCalculatorInterface` (TRZ-007).
+- Deterministic monetary calculation for percentage discounts and fixed product/variation pricing with arbitrary-precision decimal strings (TRZ-007).
+- Full support for explicit 0% discount, 100% discount to zero, fixed zero price, and fixed price surcharges exceeding base price (TRZ-007).
+- Output boundary half-up rounding respecting store currency decimal configuration (0 to 8 decimals) with support for zero-decimal currencies (TRZ-007).
+- Active promotional sale price awareness: uses active WooCommerce price as discount base while preserving regular and sale prices untouched (TRZ-007).
+- Strict fail-closed calculation invariant verification with `PricingCalculationException`: rejects guest customer rules, scope mismatches, and invalid percentages (TRZ-007).
+- Comprehensive unit test suite with 39 dedicated calculator tests (331 tests in suite, 1,531 assertions) verifying BCMath/pure-PHP parity, rounding boundaries, and immutability (TRZ-007).
+- Live MariaDB end-to-end integration test verifying complete data flow from database rules to resolver to calculator (38 live tests, 250 assertions) (TRZ-007).
+- Authoritative Price Calculator architecture document (`docs/architecture/price-calculator.md`) (TRZ-007).

@@ -28,7 +28,7 @@ final class PricingValue {
 	 */
 	private string $value;
 
-	public function __construct( string $type, string|int|float $value ) {
+	public function __construct( string $type, string|int $value ) {
 		$normalized_type = strtolower( trim( $type ) );
 
 		if ( ! in_array( $normalized_type, self::ALLOWED_TYPES, true ) ) {
@@ -93,11 +93,11 @@ final class PricingValue {
 		$this->value = $formatted;
 	}
 
-	public static function percentage( string|int|float $percent ): self {
+	public static function percentage( string|int $percent ): self {
 		return new self( self::TYPE_PERCENTAGE, $percent );
 	}
 
-	public static function fixed( string|int|float $amount ): self {
+	public static function fixed( string|int $amount ): self {
 		return new self( self::TYPE_FIXED, $amount );
 	}
 

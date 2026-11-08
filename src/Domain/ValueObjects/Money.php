@@ -187,6 +187,9 @@ final class Money {
 	/**
 	 * Multiplies money by a non-negative multiplier factor.
 	 *
+	 * Uses intermediate scale 12 to preserve guard digits and applies single half-up
+	 * rounding at scale 6, rejecting negative factors, precision overflow and storage overflow.
+	 *
 	 * @param string|int $factor
 	 * @throws InvalidMoneyException
 	 */
@@ -194,26 +197,51 @@ final class Money {
 		$factor_str = is_string( $factor ) ? trim( $factor ) : (string) $factor;
 		if ( ! is_numeric( $factor_str ) || ! DecimalMath::is_valid( $factor_str ) ) {
 			throw new InvalidMoneyException(
-				sprintf( 'Multiplier factor must be a valid numeric, got "%s".', $factor_str )
+				sprintf( 'Multiplier factor must be a valid numeric string without scientific notation, got "%s".', $factor_str )
 			);
+		}
+
+		if ( str_starts_with( $factor_str, '-' ) ) {
+			throw new InvalidMoneyException(
+				sprintf( 'Multiplier factor cannot be negative, got "%s".', $factor_str )
+			);
+		}
+
+		// Reject unsupported fractional digits beyond scale 6, permitting extra trailing zeroes.
+		$clean_factor = ltrim( $factor_str, '+' );
+		if ( str_contains( $clean_factor, '.' ) ) {
+			$fraction = explode( '.', $clean_factor )[1] ?? '';
+			if ( strlen( rtrim( $fraction, '0' ) ) > self::DEFAULT_SCALE ) {
+				throw new InvalidMoneyException(
+					sprintf( 'Multiplier factor "%s" exceeds maximum supported precision of %d decimal places.', $factor_str, self::DEFAULT_SCALE )
+				);
+			}
 		}
 
 		$normalized_factor = DecimalMath::normalize( $factor_str, self::DEFAULT_SCALE );
-		if ( DecimalMath::comp( $normalized_factor, '0', self::DEFAULT_SCALE ) < 0 ) {
+		if ( DecimalMath::comp( $normalized_factor, '0.000000', self::DEFAULT_SCALE ) < 0 ) {
 			throw new InvalidMoneyException(
-				sprintf( 'Multiplier factor cannot be negative, got "%s".', $normalized_factor )
+				sprintf( 'Multiplier factor cannot be negative, got "%s".', $factor_str )
 			);
 		}
 
-		$product = DecimalMath::mul( $this->amount, $normalized_factor, self::DEFAULT_SCALE );
-		return new self( $product, $this->currency );
+		if ( 0 === DecimalMath::comp( $normalized_factor, '0.000000', self::DEFAULT_SCALE ) || $this->is_zero() ) {
+			return self::zero( $this->currency );
+		}
+
+		// Intermediate multiplication with 12 decimals (6 + 6), followed by single half-up rounding.
+		$product = DecimalMath::mul( $this->amount, $normalized_factor, 12 );
+		$rounded = DecimalMath::round( $product, self::DEFAULT_SCALE, PHP_ROUND_HALF_UP );
+
+		return new self( $rounded, $this->currency );
 	}
 
 	/**
 	 * Calculates percentage discount and returns the remaining price:
-	 * final_price = base_price * (1 - (percentage / 100))
+	 * final_price = base_price * (100 - percentage) / 100
 	 *
-	 * Clamps at zero if percentage >= 100%.
+	 * Uses intermediate scale 12 multiplication and scale 14 division to guarantee
+	 * exact rational arithmetic without premature rounding or lost guard digits.
 	 *
 	 * @param string|int $percentage
 	 * @throws InvalidMoneyException
@@ -222,31 +250,57 @@ final class Money {
 		$percent_str = is_string( $percentage ) ? trim( $percentage ) : (string) $percentage;
 		if ( ! is_numeric( $percent_str ) || ! DecimalMath::is_valid( $percent_str ) ) {
 			throw new InvalidMoneyException(
-				sprintf( 'Discount percentage must be numeric, got "%s".', $percent_str )
+				sprintf( 'Discount percentage must be a valid numeric string without scientific notation, got "%s".', $percent_str )
 			);
+		}
+
+		if ( str_starts_with( $percent_str, '-' ) ) {
+			throw new InvalidMoneyException(
+				sprintf( 'Discount percentage cannot be negative, got "%s".', $percent_str )
+			);
+		}
+
+		// Reject unsupported fractional digits beyond scale 6, permitting extra trailing zeroes.
+		$clean_percent = ltrim( $percent_str, '+' );
+		if ( str_contains( $clean_percent, '.' ) ) {
+			$fraction = explode( '.', $clean_percent )[1] ?? '';
+			if ( strlen( rtrim( $fraction, '0' ) ) > self::DEFAULT_SCALE ) {
+				throw new InvalidMoneyException(
+					sprintf( 'Discount percentage "%s" exceeds maximum supported precision of %d decimal places.', $percent_str, self::DEFAULT_SCALE )
+				);
+			}
 		}
 
 		$norm_percent = DecimalMath::normalize( $percent_str, self::DEFAULT_SCALE );
-		if ( DecimalMath::comp( $norm_percent, '0', self::DEFAULT_SCALE ) < 0 ) {
+		if ( DecimalMath::comp( $norm_percent, '0.000000', self::DEFAULT_SCALE ) < 0 ) {
 			throw new InvalidMoneyException(
-				sprintf( 'Discount percentage cannot be negative, got "%s".', $norm_percent )
+				sprintf( 'Discount percentage cannot be negative, got "%s".', $percent_str )
 			);
 		}
 
-		if ( DecimalMath::comp( $norm_percent, '100', self::DEFAULT_SCALE ) >= 0 ) {
-			return self::zero( $this->currency );
+		// Reject percentages exceeding 100 rather than silently clamping.
+		if ( DecimalMath::comp( $norm_percent, '100.000000', self::DEFAULT_SCALE ) > 0 ) {
+			throw new InvalidMoneyException(
+				sprintf( 'Discount percentage cannot exceed 100%%, got "%s".', $norm_percent )
+			);
 		}
 
-		if ( DecimalMath::comp( $norm_percent, '0', self::DEFAULT_SCALE ) === 0 ) {
+		// Exact 0% and 100% boundary shortcuts.
+		if ( 0 === DecimalMath::comp( $norm_percent, '0.000000', self::DEFAULT_SCALE ) ) {
 			return $this;
 		}
 
-		// fraction_to_keep = 1.000000 - (percent / 100)
-		$percent_fraction = DecimalMath::div( $norm_percent, '100', self::DEFAULT_SCALE + 2 );
-		$fraction_to_keep = DecimalMath::sub( '1', $percent_fraction, self::DEFAULT_SCALE + 2 );
+		if ( 0 === DecimalMath::comp( $norm_percent, '100.000000', self::DEFAULT_SCALE ) || $this->is_zero() ) {
+			return self::zero( $this->currency );
+		}
 
-		$calculated = DecimalMath::mul( $this->amount, $fraction_to_keep, self::DEFAULT_SCALE );
-		return new self( $calculated, $this->currency );
+		// Exact rational sequence: scale 12 multiplication, scale 14 division, single half-up round at scale 6.
+		$remaining_percent = DecimalMath::sub( '100.000000', $norm_percent, 6 );
+		$product           = DecimalMath::mul( $this->amount, $remaining_percent, 12 );
+		$raw_calculated    = DecimalMath::div( $product, '100.000000', 14 );
+		$rounded           = DecimalMath::round( $raw_calculated, self::DEFAULT_SCALE, PHP_ROUND_HALF_UP );
+
+		return new self( $rounded, $this->currency );
 	}
 
 	/**

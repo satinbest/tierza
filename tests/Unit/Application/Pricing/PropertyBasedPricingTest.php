@@ -61,10 +61,9 @@ final class PropertyBasedPricingTest extends TestCase {
 
 			$result = $this->bcmath_calc->calculate( $context, $res );
 
-			$expected_rounded = DecimalMath::round( $price_str, $decimals, PHP_ROUND_HALF_UP );
-			$expected_money   = new Money( $expected_rounded, 'USD' );
+			$expected_oracle = ExactRationalPricingOracle::calculate_percentage( $price_str, '0', $decimals );
 
-			$this->assertSame( $expected_money->amount(), $result->final_price()->amount() );
+			$this->assertSame( $expected_oracle, $result->final_price()->amount() );
 			$this->assertTrue( $result->is_zero_percentage() );
 			$this->assertTrue( $result->is_rule_applied() );
 		}

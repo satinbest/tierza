@@ -84,6 +84,26 @@ class PricingValueTest extends TestCase {
 		$this->assertSame( '123456789.123456', $value->value() );
 	}
 
+	public function test_float_input_is_rejected_in_pricing_value_fixed(): void {
+		$this->expectException( \TypeError::class );
+		/** @phpstan-ignore-next-line */
+		PricingValue::fixed( 0.1 );
+	}
+
+	public function test_float_input_is_rejected_in_pricing_value_percentage(): void {
+		$this->expectException( \TypeError::class );
+		/** @phpstan-ignore-next-line */
+		PricingValue::percentage( 12.345678 );
+	}
+
+	public function test_exact_valid_decimal_string_counterparts_accepted(): void {
+		$fixed = PricingValue::fixed( '0.1' );
+		$this->assertSame( '0.100000', $fixed->value() );
+
+		$percent = PricingValue::percentage( '12.345678' );
+		$this->assertSame( '12.345678', $percent->value() );
+	}
+
 	public function test_equality_comparison(): void {
 		$val1 = PricingValue::percentage( '20.00' );
 		$val2 = PricingValue::percentage( '20' );

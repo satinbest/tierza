@@ -125,13 +125,75 @@ final class MoneyTest extends TestCase {
 		$zero_discount = $base->apply_percentage_discount( '0' );
 		$this->assertTrue( $zero_discount->equals( $base ) );
 
-		// 100% discount -> clamped to zero
+		// 20% discount -> 160.00
+		$twenty = $base->apply_percentage_discount( '20' );
+		$this->assertSame( '160.000000', $twenty->amount() );
+
+		// 100% discount -> exact zero
 		$free = $base->apply_percentage_discount( '100' );
 		$this->assertTrue( $free->is_zero() );
+		$this->assertSame( '0.000000', $free->amount() );
+	}
 
-		// >100% discount -> clamped to zero
-		$over_discount = $base->apply_percentage_discount( '120' );
-		$this->assertTrue( $over_discount->is_zero() );
+	public function test_apply_percentage_discount_rejects_exceeding_100(): void {
+		$base = Money::from( '200.00', 'USD' );
+		$this->expectException( InvalidMoneyException::class );
+		$this->expectExceptionMessage( 'Discount percentage cannot exceed 100%' );
+		$base->apply_percentage_discount( '101' );
+	}
+
+	public function test_apply_percentage_discount_rejects_precision_overflow(): void {
+		$base = Money::from( '200.00', 'USD' );
+		$this->expectException( InvalidMoneyException::class );
+		$this->expectExceptionMessage( 'exceeds maximum supported precision of 6 decimal places' );
+		$base->apply_percentage_discount( '0.0000009' );
+	}
+
+	public function test_apply_percentage_discount_rejects_100_with_precision_overflow(): void {
+		$base = Money::from( '200.00', 'USD' );
+		$this->expectException( InvalidMoneyException::class );
+		$base->apply_percentage_discount( '100.0000001' );
+	}
+
+	public function test_multiply_rejects_sub_scale_fractional_precision(): void {
+		$base = Money::from( '100.00', 'USD' );
+		$this->expectException( InvalidMoneyException::class );
+		$this->expectExceptionMessage( 'exceeds maximum supported precision of 6 decimal places' );
+		$base->multiply( '1.0000009' );
+	}
+
+	public function test_multiply_accepts_extra_trailing_zeroes(): void {
+		$base = Money::from( '100.00', 'USD' );
+		$res  = $base->multiply( '1.0000000' );
+		$this->assertSame( '100.000000', $res->amount() );
+	}
+
+	public function test_multiply_rejects_negative_sub_scale_factor(): void {
+		$base = Money::from( '100.00', 'USD' );
+		$this->expectException( InvalidMoneyException::class );
+		$base->multiply( '-0.0000001' );
+	}
+
+	public function test_multiply_preserves_guard_digits_with_intermediate_scale_12(): void {
+		// 10.000005 * 1.500000 = 15.0000075 -> round half-up -> 15.000008
+		$base   = Money::from( '10.000005', 'USD' );
+		$result = $base->multiply( '1.5' );
+		$this->assertSame( '15.000008', $result->amount() );
+	}
+
+	public function test_multiply_overflow_beyond_14_integer_digits_throws_exception(): void {
+		$base = Money::from( '90000000000000.00', 'USD' );
+		$this->expectException( InvalidMoneyException::class );
+		$this->expectExceptionMessage( 'exceeds maximum supported integer magnitude of 14 digits' );
+		$base->multiply( '2' );
+	}
+
+	public function test_add_overflow_beyond_14_integer_digits_throws_exception(): void {
+		$base  = Money::from( '90000000000000.00', 'USD' );
+		$other = Money::from( '20000000000000.00', 'USD' );
+		$this->expectException( InvalidMoneyException::class );
+		$this->expectExceptionMessage( 'exceeds maximum supported integer magnitude of 14 digits' );
+		$base->add( $other );
 	}
 
 	public function test_comparisons(): void {

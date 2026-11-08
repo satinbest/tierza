@@ -9,6 +9,7 @@ use Tierza\Domain\Entities\UserGroupAssignment;
 use Tierza\Domain\Exceptions\InvalidAssignmentException;
 use Tierza\Domain\Repositories\UserGroupRepositoryInterface;
 use Tierza\Infrastructure\Database\Schema;
+use Tierza\Infrastructure\Validation\EntityReferenceValidator;
 use wpdb;
 
 /**
@@ -18,13 +19,13 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 
 	private wpdb $db;
 	private string $table_user_groups;
-	private string $table_groups;
+	private EntityReferenceValidator $validator;
 
-	public function __construct( ?wpdb $db = null ) {
+	public function __construct( ?wpdb $db = null, ?EntityReferenceValidator $validator = null ) {
 		global $wpdb;
 		$this->db                = $db ?? $GLOBALS['wpdb'];
 		$this->table_user_groups = Schema::user_groups_table( $this->db );
-		$this->table_groups      = Schema::groups_table( $this->db );
+		$this->validator         = $validator ?? new EntityReferenceValidator( $this->db );
 	}
 
 	public function assign( int $user_id, int $group_id ): UserGroupAssignment {
@@ -40,12 +41,8 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 			);
 		}
 
-		// Verify target group exists.
-		if ( ! $this->group_exists( $group_id ) ) {
-			throw new InvalidAssignmentException(
-				sprintf( 'Cannot assign user to non-existent pricing group %d.', $group_id )
-			);
-		}
+		// Validate user and group entity references.
+		$this->validator->validate_assignment( $user_id, $group_id );
 
 		// Enforce single primary group per user in MVP.
 		$existing = $this->find_by_user_id( $user_id );
@@ -95,12 +92,8 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 			);
 		}
 
-		// Verify target group exists.
-		if ( ! $this->group_exists( $new_group_id ) ) {
-			throw new InvalidAssignmentException(
-				sprintf( 'Cannot reassign user to non-existent pricing group %d.', $new_group_id )
-			);
-		}
+		// Validate user and group entity references.
+		$this->validator->validate_assignment( $user_id, $new_group_id );
 
 		$existing = $this->find_by_user_id( $user_id );
 
@@ -200,18 +193,6 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 		}
 
 		return $this->hydrate( $row );
-	}
-
-	private function group_exists( int $group_id ): bool {
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-		$found = $this->db->get_var(
-			$this->db->prepare(
-				"SELECT id FROM {$this->table_groups} WHERE id = %d LIMIT 1",
-				$group_id
-			)
-		);
-
-		return null !== $found;
 	}
 
 	/**

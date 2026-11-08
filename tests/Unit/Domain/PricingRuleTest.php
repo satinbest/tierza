@@ -32,7 +32,8 @@ class PricingRuleTest extends TestCase {
 		$this->assertSame( 'percentage', $rule->pricing_value()->type() );
 		$this->assertSame( '12.500000', $rule->pricing_value()->value() );
 		$this->assertTrue( $rule->is_active() );
-		$this->assertSame( 'group:1|global:0|percentage', $rule->logical_key() );
+		$this->assertSame( 'group:1|global:0', $rule->logical_key() );
+		$this->assertSame( 'group:1|global:0', $rule->active_key() );
 	}
 
 	public function test_create_valid_fixed_price_rule_on_product(): void {
@@ -45,7 +46,8 @@ class PricingRuleTest extends TestCase {
 		$this->assertTrue( $rule->pricing_value()->is_fixed() );
 		$this->assertSame( 'product', $rule->scope()->type() );
 		$this->assertSame( 45, $rule->scope()->id() );
-		$this->assertSame( 'group:2|product:45|fixed', $rule->logical_key() );
+		$this->assertSame( 'group:2|product:45', $rule->logical_key() );
+		$this->assertSame( 'group:2|product:45', $rule->active_key() );
 	}
 
 	public function test_create_valid_fixed_price_rule_on_variation(): void {
@@ -96,10 +98,12 @@ class PricingRuleTest extends TestCase {
 		$deactivated = $rule->deactivate();
 		$this->assertFalse( $deactivated->is_active() );
 		$this->assertSame( 'inactive', $deactivated->status()->value() );
+		$this->assertNull( $deactivated->active_key() );
 		$this->assertNotNull( $deactivated->updated_at() );
 
 		$reactivated = $deactivated->activate();
 		$this->assertTrue( $reactivated->is_active() );
+		$this->assertSame( 'group:1|category:5', $reactivated->active_key() );
 	}
 
 	public function test_update_value(): void {

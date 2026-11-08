@@ -196,10 +196,21 @@ if ( ! defined( 'ARRAY_A' ) ) {
 	define( 'ARRAY_A', 'ARRAY_A' );
 }
 
+if ( ! class_exists( 'WP_User' ) ) {
+	class WP_User {
+		public int $ID = 0;
+
+		public function exists(): bool {
+			return $this->ID > 0;
+		}
+	}
+}
+
 if ( ! class_exists( 'wpdb' ) ) {
 	class wpdb {
 		public string $prefix = 'wp_';
 		public int $insert_id = 0;
+		public string $last_error = '';
 
 		public function get_charset_collate(): string {
 			return 'DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_520_ci';
@@ -218,6 +229,11 @@ if ( ! class_exists( 'wpdb' ) ) {
 		}
 
 		public function get_var( ?string $query = null ): mixed {
+			if ( null !== $query && str_contains( $query, 'SHOW TABLES LIKE' ) ) {
+				if ( preg_match( "/'([^']+)'/", $query, $matches ) ) {
+					return $matches[1];
+				}
+			}
 			return null;
 		}
 
@@ -232,6 +248,71 @@ if ( ! class_exists( 'wpdb' ) ) {
 		 * @return mixed
 		 */
 		public function get_results( ?string $query = null, string $output = ARRAY_A ): mixed {
+			if ( null !== $query && str_contains( $query, 'SHOW FULL COLUMNS' ) ) {
+				if ( str_contains( $query, 'tierza_groups' ) ) {
+					return [
+						[ 'Field' => 'id' ],
+						[ 'Field' => 'name' ],
+						[ 'Field' => 'slug' ],
+						[ 'Field' => 'description' ],
+						[ 'Field' => 'status' ],
+						[ 'Field' => 'sort_order' ],
+						[ 'Field' => 'created_at' ],
+						[ 'Field' => 'updated_at' ],
+					];
+				}
+				if ( str_contains( $query, 'tierza_rules' ) ) {
+					return [
+						[ 'Field' => 'id' ],
+						[ 'Field' => 'target_type' ],
+						[ 'Field' => 'target_id' ],
+						[ 'Field' => 'scope_type' ],
+						[ 'Field' => 'scope_id' ],
+						[ 'Field' => 'pricing_type' ],
+						[ 'Field' => 'value' ],
+						[ 'Field' => 'status' ],
+						[ 'Field' => 'active_key' ],
+						[ 'Field' => 'created_at' ],
+						[ 'Field' => 'updated_at' ],
+					];
+				}
+				if ( str_contains( $query, 'tierza_user_groups' ) ) {
+					return [
+						[ 'Field' => 'id' ],
+						[ 'Field' => 'user_id' ],
+						[ 'Field' => 'group_id' ],
+						[ 'Field' => 'created_at' ],
+						[ 'Field' => 'updated_at' ],
+					];
+				}
+			}
+
+			if ( null !== $query && str_contains( $query, 'SHOW INDEX' ) ) {
+				if ( str_contains( $query, 'tierza_groups' ) ) {
+					return [
+						[ 'Key_name' => 'PRIMARY' ],
+						[ 'Key_name' => 'uq_slug' ],
+						[ 'Key_name' => 'idx_status_sort' ],
+					];
+				}
+				if ( str_contains( $query, 'tierza_rules' ) ) {
+					return [
+						[ 'Key_name' => 'PRIMARY' ],
+						[ 'Key_name' => 'uq_active_rule' ],
+						[ 'Key_name' => 'idx_target' ],
+						[ 'Key_name' => 'idx_scope' ],
+						[ 'Key_name' => 'idx_lookup' ],
+					];
+				}
+				if ( str_contains( $query, 'tierza_user_groups' ) ) {
+					return [
+						[ 'Key_name' => 'PRIMARY' ],
+						[ 'Key_name' => 'uq_user_id' ],
+						[ 'Key_name' => 'idx_group_id' ],
+					];
+				}
+			}
+
 			return [];
 		}
 

@@ -29,11 +29,12 @@ Tierza provides clean, authoritative, server-side pricing rules for wholesale an
 - [x] **Internationalization**: Full Persian RTL support, compiled `.mo` translation files, and English fallback strings.
 - [x] **TRZ-002 (Development Environment & Tooling)**: `@wordpress/env` Docker environment (WordPress 6.5.5, WooCommerce 8.5.2, MariaDB), WordPress Coding Standards (PHPCS), PHPStan Level 8, ESLint, TypeScript, and Playwright E2E browser tests.
 - [x] **TRZ-003 (CI Pipeline)**: GitHub Actions continuous integration testing PHP 8.1 & 8.4 matrix, JS quality, containerized integration, Playwright E2E, and production ZIP artifact validation.
-- [x] **TRZ-004 (Database Schema & Persistence Layer)**: Production-ready MariaDB/MySQL database schema (`tierza_groups`, `tierza_rules`, `tierza_user_groups`), domain entities, value objects, repository implementations, uniqueness policies, and real database integration tests.
+- [x] **TRZ-004 (Database Schema & Persistence Layer)**: Production-ready MariaDB/MySQL database schema (`tierza_groups`, `tierza_rules`, `tierza_user_groups`), database-enforced active rule uniqueness (`uq_active_rule`), domain entities, repositories, failure-safe idempotent migrations, entity reference validation, and 21 live database integration tests.
 
 ### Planned Milestones:
-- [ ] **TRZ-005**: Deterministic Rule Resolution Engine & Authority Calculations
-- [ ] **TRZ-006+**: Category/product tier pricing, customer-specific pricing, REST API controllers, and React admin SPA.
+- [ ] **TRZ-005**: Pricing Contracts (Pricing interfaces, value objects, exceptions, and data contracts)
+- [ ] **TRZ-006**: Rule Resolver (Precedence hierarchy, deterministic rule resolution, category & product tier evaluation)
+- [ ] **TRZ-007+**: WooCommerce price filtering, Cart/Checkout integration, REST API, and React admin SPA.
 
 ---
 

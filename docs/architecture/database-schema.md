@@ -75,11 +75,13 @@ Stores percentage-based or fixed pricing rules targeted to groups or specific us
 | `pricing_type` | `VARCHAR(20)` | No | | Pricing calculation type: `'percentage'` or `'fixed'`. |
 | `value` | `DECIMAL(20,6)` | No | `0.000000` | Rule value: percentage (0–100) or fixed amount. |
 | `status` | `VARCHAR(20)` | No | `'active'` | Rule status: `'active'` or `'inactive'`. |
+| `active_key` | `VARCHAR(100)` | Yes | `NULL` | Atomic active rule uniqueness key (`target:id\|scope:id`). `NULL` for inactive rules. |
 | `created_at` | `DATETIME` | No | | Timestamp when record was created. |
 | `updated_at` | `DATETIME` | No | | Timestamp when record was last updated. |
 
 **Indexes & Constraints:**
 - `PRIMARY KEY (id)`
+- `UNIQUE KEY uq_active_rule (active_key)`: Database-enforced atomic uniqueness preventing concurrent active rule duplicates.
 - `KEY idx_target (target_type, target_id, status)`: Fast filtering for a given customer or group.
 - `KEY idx_scope (scope_type, scope_id, status)`: Fast filtering by product, category, or global scope.
 - `KEY idx_lookup (target_type, target_id, scope_type, scope_id, status)`: Composite index for resolution queries and active rule collision checks.
@@ -94,9 +96,11 @@ CREATE TABLE {$wpdb->prefix}tierza_rules (
   pricing_type varchar(20) NOT NULL,
   value decimal(20,6) NOT NULL DEFAULT 0.000000,
   status varchar(20) NOT NULL DEFAULT 'active',
+  active_key varchar(100) DEFAULT NULL,
   created_at datetime NOT NULL,
   updated_at datetime NOT NULL,
   PRIMARY KEY  (id),
+  UNIQUE KEY uq_active_rule (active_key),
   KEY idx_target (target_type, target_id, status),
   KEY idx_scope (scope_type, scope_id, status),
   KEY idx_lookup (target_type, target_id, scope_type, scope_id, status)
@@ -169,6 +173,7 @@ erDiagram
         varchar pricing_type
         decimal value
         varchar status
+        varchar active_key UK
     }
 ```
 
@@ -181,14 +186,21 @@ erDiagram
 - Persian letters (`\p{L}`) and numbers (`\p{N}`) are preserved.
 - Uniqueness is enforced both at the application layer (`WpGroupRepository::save`) and at the database layer (`UNIQUE KEY uq_slug`).
 
-### 4.2 Active Pricing Rules Uniqueness
-- WordPress-compatible MySQL/MariaDB engines do not support partial unique indexes (e.g. `UNIQUE (...) WHERE status = 'active'`).
-- Enforcing a full database unique index on `(target_type, target_id, scope_type, scope_id, pricing_type)` would prevent saving historical/inactive rules.
-- **Tierza Uniqueness Policy**:
-  1. The application layer (`WpRuleRepository`) verifies before inserting or activating a rule that no existing rule with `status = 'active'` shares the identical `(target_type, target_id, scope_type, scope_id, pricing_type)`.
-  2. If a collision is detected, `DuplicateRuleException` is thrown.
-  3. Multiple inactive rules may coexist for auditing, history, or scheduling.
-  4. Lookup is instantaneous via `KEY idx_lookup`.
+### 4.2 Active Pricing Rules Uniqueness & Concurrency Safety
+- In Tierza v1, only **one active rule** may exist for any logical target and scope combination:
+  $$\text{Logical Key} = \text{target\_type} + \text{target\_id} + \text{scope\_type} + \text{scope\_id}$$
+- **Pricing Type is NOT part of the conflict identity**: An active percentage rule and an active fixed rule targeting the same entity and scope conflict immediately and cannot coexist.
+- **Atomic Database-Level Enforcement (`active_key`)**:
+  1. Standard MySQL / MariaDB storage engines treat `NULL` as distinct values under `UNIQUE` indexes (per SQL-92 standards).
+  2. For active rules (`status = 'active'`), Tierza computes and persists `active_key` as:
+     `sprintf('%s:%d|%s:%d', $target_type, $target_id, $scope_type, $scope_id)`
+  3. For inactive rules (`status = 'inactive'`), `active_key` is set to `NULL`.
+  4. The unique index `UNIQUE KEY uq_active_rule (active_key)` prevents race conditions and concurrent inserts from creating duplicate active rules, providing guaranteed atomicity without table locks.
+  5. Multiple inactive historical rules may coexist indefinitely with `active_key = NULL`.
+- **Application-Level Pre-Checks**:
+  `WpRuleRepository::find_conflicting_active_rule()` checks for existing active rules before insertion or reactivation and throws a domain `DuplicateRuleException`.
+- **Concurrency Fallback**:
+  If concurrent requests pass the application check simultaneously, the database raises error `1062` (Duplicate entry for key `uq_active_rule`), which `WpRuleRepository` catches and wraps cleanly into `DuplicateRuleException`.
 
 ### 4.3 User Group Assignments
 - In MVP, each WordPress customer is assigned to exactly **one primary pricing group**.
@@ -197,8 +209,19 @@ erDiagram
 
 ---
 
-## 5. Data Integrity & Safeguards
+## 5. Data Integrity, Reference Validation & Safeguards
 
+### 5.1 Entity Reference Validation
+Tierza performs real-time referential validation via `EntityReferenceValidator` before persisting rules or group assignments:
+1. **User References**: Validates that `target_id` (or assignment `user_id`) exists in `{$wpdb->users}`.
+2. **Group References**: Validates that `target_id` (or assignment `group_id`) exists in `{$wpdb->prefix}tierza_groups`.
+3. **Product Scope**: Validates that `scope_id` exists in `{$wpdb->posts}` with `post_type = 'product'`.
+4. **Variation Scope**: Validates that `scope_id` exists with `post_type = 'product_variation'` and links to a valid parent product.
+5. **Category Scope**: Validates that `scope_id` exists in `{$wpdb->term_taxonomy}` with `taxonomy = 'product_cat'`.
+
+Attempting to reference a non-existent entity raises `InvalidEntityReferenceException`.
+
+### 5.2 Safeguards & Domain Constraints
 1. **Group Deletion Safeguard**:
    A pricing group cannot be deleted while:
    - Users are assigned to it in `tierza_user_groups` (`GroupDeletionSafeguardException`).
@@ -217,7 +240,11 @@ erDiagram
 - Current schema version is stored in the WordPress `options` table under option key **`tierza_db_version`**.
 - During plugin activation, `Schema::install()` is invoked.
 - On each plugin boot (`plugins_loaded`), `Schema::maybe_upgrade()` performs a lightweight version check against `Schema::CURRENT_DB_VERSION`.
-- If an update is required, `dbDelta()` applies idempotent DDL changes without deleting or modifying existing records.
+- If an update is required, `dbDelta()` applies idempotent DDL changes.
+- **Failure-Safe Schema Verification**:
+  1. Immediately following DDL execution, `Schema::verify_schema()` inspects the database to ensure all 3 tables exist, all expected columns are present, and essential unique keys (`uq_slug`, `uq_active_rule`, `uq_user_id`) exist.
+  2. If any discrepancy is found, `SchemaMigrationException` is thrown, and `tierza_db_version` is **not updated**.
+  3. Subsequent activations or admin loads can safely retry migration without data loss or partial state corruption.
 
 ---
 

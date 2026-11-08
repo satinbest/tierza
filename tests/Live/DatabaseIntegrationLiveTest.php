@@ -4,7 +4,7 @@
  *
  * Runs against live WordPress and MariaDB/MySQL inside Docker.
  * Validates tables, indexes, CRUD, uniqueness constraints, decimal round-trips,
- * safeguards, and migrations on actual database services.
+ * safeguards, reference validation, concurrency safety, and migrations on actual database services.
  *
  * @package Tierza\Tests\Live
  */
@@ -21,6 +21,8 @@ use Tierza\Domain\Exceptions\DuplicateRuleException;
 use Tierza\Domain\Exceptions\DuplicateSlugException;
 use Tierza\Domain\Exceptions\GroupDeletionSafeguardException;
 use Tierza\Domain\Exceptions\InvalidAssignmentException;
+use Tierza\Domain\Exceptions\InvalidRuleException;
+use Tierza\Domain\Exceptions\SchemaMigrationException;
 use Tierza\Domain\ValueObjects\GroupSlug;
 use Tierza\Domain\ValueObjects\GroupStatus;
 use Tierza\Domain\ValueObjects\PricingValue;
@@ -31,6 +33,7 @@ use Tierza\Infrastructure\Database\Schema;
 use Tierza\Infrastructure\Repositories\WpGroupRepository;
 use Tierza\Infrastructure\Repositories\WpRuleRepository;
 use Tierza\Infrastructure\Repositories\WpUserGroupRepository;
+use Tierza\Infrastructure\Validation\EntityReferenceValidator;
 
 class DatabaseIntegrationLiveTest {
 
@@ -38,6 +41,7 @@ class DatabaseIntegrationLiveTest {
 	private WpGroupRepository $group_repo;
 	private WpRuleRepository $rule_repo;
 	private WpUserGroupRepository $user_group_repo;
+	private EntityReferenceValidator $validator;
 
 	private int $assertions = 0;
 	private int $tests_passed = 0;
@@ -47,9 +51,10 @@ class DatabaseIntegrationLiveTest {
 	public function __construct() {
 		global $wpdb;
 		$this->db              = $wpdb;
+		$this->validator       = new EntityReferenceValidator( $this->db );
 		$this->group_repo      = new WpGroupRepository( $this->db );
-		$this->rule_repo       = new WpRuleRepository( $this->db );
-		$this->user_group_repo = new WpUserGroupRepository( $this->db );
+		$this->rule_repo       = new WpRuleRepository( $this->db, $this->validator );
+		$this->user_group_repo = new WpUserGroupRepository( $this->db, $this->validator );
 	}
 
 	public function run(): int {
@@ -57,16 +62,26 @@ class DatabaseIntegrationLiveTest {
 		echo " Tierza Real Database Integration Test Suite (MariaDB/WP) " . PHP_EOL;
 		echo "==========================================================" . PHP_EOL;
 
+		// Clean up any leftover test data before starting suite.
+		$this->clean_tables();
+
 		$methods = [
 			'test_schema_installation_and_idempotence',
 			'test_tables_exist_with_correct_prefix',
 			'test_schema_version_tracking',
+			'test_schema_verification_detects_all_columns_and_indexes',
+			'test_schema_migration_failure_handling',
 			'test_group_crud_and_persian_support',
 			'test_duplicate_group_slug_rejection',
 			'test_rule_crud_and_precision_roundtrip',
 			'test_explicit_zero_rules_are_preserved',
-			'test_conflicting_active_rules_rejection',
+			'test_active_rule_uniqueness_percentage_vs_fixed_conflict',
+			'test_updating_active_rule_does_not_conflict_with_itself',
+			'test_activating_inactive_rule_checks_conflicts',
 			'test_multiple_inactive_rules_allowed',
+			'test_database_enforced_active_key_uniqueness_concurrency',
+			'test_reference_validation_rejects_nonexistent_entities',
+			'test_reference_validation_accepts_valid_entities',
 			'test_user_group_assignment_and_reassignment',
 			'test_user_group_safeguards_invalid_group',
 			'test_group_deletion_safeguards_with_users_and_rules',
@@ -96,6 +111,21 @@ class DatabaseIntegrationLiveTest {
 		echo "==========================================================" . PHP_EOL;
 
 		return empty( $this->failures ) ? 0 : 1;
+	}
+
+	private function clean_tables(): void {
+		if ( Schema::tables_exist( $this->db ) ) {
+			$table_ug     = $this->db->prefix . 'tierza_user_groups';
+			$table_rules  = $this->db->prefix . 'tierza_rules';
+			$table_groups = $this->db->prefix . 'tierza_groups';
+
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$this->db->query( "TRUNCATE TABLE {$table_ug}" );
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$this->db->query( "TRUNCATE TABLE {$table_rules}" );
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$this->db->query( "TRUNCATE TABLE {$table_groups}" );
+		}
 	}
 
 	private function assert( bool $condition, string $message ): void {
@@ -134,8 +164,36 @@ class DatabaseIntegrationLiveTest {
 		$this->assert( '1.0.0' === $version, "DB version option must be 1.0.0, got: " . var_export( $version, true ) );
 	}
 
+	public function test_schema_verification_detects_all_columns_and_indexes(): void {
+		$issues = Schema::verify_schema( $this->db );
+		$this->assert( empty( $issues ), 'Schema verification must report 0 issues on healthy installation: ' . implode( ', ', $issues ) );
+
+		// Explicitly assert presence of active_key and uq_active_rule in tierza_rules.
+		$table_rules = Schema::rules_table( $this->db );
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$cols = $this->db->get_results( "SHOW FULL COLUMNS FROM {$table_rules}", ARRAY_A );
+		$col_names = array_column( $cols, 'Field' );
+		$this->assert( in_array( 'active_key', $col_names, true ), 'active_key column must exist in rules table.' );
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$indexes = $this->db->get_results( "SHOW INDEX FROM {$table_rules}", ARRAY_A );
+		$index_names = array_column( $indexes, 'Key_name' );
+		$this->assert( in_array( 'uq_active_rule', $index_names, true ), 'uq_active_rule unique index must exist in rules table.' );
+	}
+
+	public function test_schema_migration_failure_handling(): void {
+		// Verify that verify_schema() detects when tables are missing under an unmigrated prefix.
+		$original_prefix = $this->db->prefix;
+		try {
+			$this->db->prefix = 'wp_corrupted_';
+			$issues = Schema::verify_schema( $this->db );
+			$this->assert( ! empty( $issues ), 'verify_schema must detect missing tables on unmigrated prefix.' );
+		} finally {
+			$this->db->prefix = $original_prefix;
+		}
+	}
+
 	public function test_group_crud_and_persian_support(): void {
-		// Create group with Persian name and Unicode slug.
 		$group = new PricingGroup(
 			'همکاران طلایی مشهد',
 			'همکاران-طلایی-مشهد',
@@ -146,37 +204,39 @@ class DatabaseIntegrationLiveTest {
 		);
 
 		$saved = $this->group_repo->save( $group );
-		$group_id = $saved->id();
-		$this->assert( null !== $group_id && $group_id > 0, 'Saved group must receive a positive auto-increment ID.' );
+		$group_id = (int) $saved->id();
+		$this->assert( $group_id > 0, 'Saved group must receive a positive auto-increment ID.' );
 
-		// Read by ID.
-		$found = $this->group_repo->find_by_id( $group_id );
-		$this->assert( null !== $found, 'Group must be found by ID.' );
-		$this->assert( 'همکاران طلایی مشهد' === $found->name(), 'Persian name must round-trip accurately.' );
-		$this->assert( 'همکاران-طلایی-مشهد' === $found->slug()->value(), 'Persian slug must round-trip accurately.' );
-		$this->assert( 15 === $found->sort_order(), 'Sort order must be preserved.' );
-		$this->assert( $found->is_active(), 'Group must be active.' );
+		try {
+			// Read by ID.
+			$found = $this->group_repo->find_by_id( $group_id );
+			$this->assert( null !== $found, 'Group must be found by ID.' );
+			$this->assert( 'همکاران طلایی مشهد' === $found->name(), 'Persian name must round-trip accurately.' );
+			$this->assert( 'همکاران-طلایی-مشهد' === $found->slug()->value(), 'Persian slug must round-trip accurately.' );
+			$this->assert( 15 === $found->sort_order(), 'Sort order must be preserved.' );
+			$this->assert( $found->is_active(), 'Group must be active.' );
 
-		// Read by Slug.
-		$found_by_slug = $this->group_repo->find_by_slug( 'همکاران-طلایی-مشهد' );
-		$this->assert( null !== $found_by_slug && $found_by_slug->id() === $group_id, 'Group must be found by slug.' );
+			// Read by Slug.
+			$found_by_slug = $this->group_repo->find_by_slug( 'همکاران-طلایی-مشهد' );
+			$this->assert( null !== $found_by_slug && $found_by_slug->id() === $group_id, 'Group must be found by slug.' );
 
-		// Update group.
-		$updated = $found->update_details( 'همکاران طلایی مشهد - ویرایش شده', 'همکاران-طلایی-مشهد', 'توضیحات ویرایش‌شده', 20 );
-		$this->group_repo->save( $updated );
+			// Update group.
+			$updated = $found->update_details( 'همکاران طلایی مشهد - ویرایش شده', 'همکاران-طلایی-مشهد', 'توضیحات ویرایش‌شده', 20 );
+			$this->group_repo->save( $updated );
 
-		$verified = $this->group_repo->find_by_id( $group_id );
-		$this->assert( null !== $verified, 'Updated group must be found.' );
-		$this->assert( 'همکاران طلایی مشهد - ویرایش شده' === $verified->name(), 'Updated name must persist.' );
-		$this->assert( 20 === $verified->sort_order(), 'Updated sort order must persist.' );
+			$verified = $this->group_repo->find_by_id( $group_id );
+			$this->assert( null !== $verified, 'Updated group must be found.' );
+			$this->assert( 'همکاران طلایی مشهد - ویرایش شده' === $verified->name(), 'Updated name must persist.' );
+			$this->assert( 20 === $verified->sort_order(), 'Updated sort order must persist.' );
 
-		// Search by name.
-		$search_results = $this->group_repo->search_by_name( 'طلایی' );
-		$this->assert( ! empty( $search_results ), 'Search by Persian keyword must return results.' );
-
-		// Cleanup.
-		$this->group_repo->delete( $group_id );
-		$this->assert( null === $this->group_repo->find_by_id( $group_id ), 'Deleted group must no longer exist.' );
+			// Search by name.
+			$search_results = $this->group_repo->search_by_name( 'طلایی' );
+			$this->assert( ! empty( $search_results ), 'Search by Persian keyword must return results.' );
+		} finally {
+			// Cleanup.
+			$this->group_repo->delete( $group_id );
+			$this->assert( null === $this->group_repo->find_by_id( $group_id ), 'Deleted group must no longer exist.' );
+		}
 	}
 
 	public function test_duplicate_group_slug_rejection(): void {
@@ -184,180 +244,445 @@ class DatabaseIntegrationLiveTest {
 		$saved1 = $this->group_repo->save( $group1 );
 		$this->assert( null !== $saved1->id(), 'First group must save successfully.' );
 
-		$group2 = new PricingGroup( 'Gold 2', 'gold-tier-test' );
-		$threw = false;
 		try {
-			$this->group_repo->save( $group2 );
-		} catch ( DuplicateSlugException $e ) {
-			$threw = true;
-		}
-
-		$this->assert( $threw, 'Saving group with duplicate slug must throw DuplicateSlugException.' );
-
-		// Cleanup.
-		if ( null !== $saved1->id() ) {
-			$this->group_repo->delete( $saved1->id() );
+			$group2 = new PricingGroup( 'Gold 2', 'gold-tier-test' );
+			$threw = false;
+			try {
+				$this->group_repo->save( $group2 );
+			} catch ( DuplicateSlugException $e ) {
+				$threw = true;
+			}
+			$this->assert( $threw, 'Saving group with duplicate slug must throw DuplicateSlugException.' );
+		} finally {
+			if ( null !== $saved1->id() ) {
+				$this->group_repo->delete( (int) $saved1->id() );
+			}
 		}
 	}
 
 	public function test_rule_crud_and_precision_roundtrip(): void {
-		$rule = new PricingRule(
-			RuleTarget::group( 999 ),
-			RuleScope::product( 1001 ),
-			PricingValue::fixed( '123456789.123456' )
+		// Create a test group and product.
+		$group = $this->group_repo->save( new PricingGroup( 'Precision Group', 'precision-group-test' ) );
+		$group_id = (int) $group->id();
+
+		// Create a mock product in wp_posts for reference validation.
+		$this->db->insert(
+			$this->db->prefix . 'posts',
+			[
+				'post_title'  => 'Test Product Precision',
+				'post_type'   => 'product',
+				'post_status' => 'publish',
+			]
 		);
+		$product_id = (int) $this->db->insert_id;
 
-		$saved = $this->rule_repo->save( $rule );
-		$rule_id = $saved->id();
-		$this->assert( null !== $rule_id && $rule_id > 0, 'Saved rule must receive positive ID.' );
+		try {
+			$rule = new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::product( $product_id ),
+				PricingValue::fixed( '123456789.123456' )
+			);
 
-		$found = $this->rule_repo->find_by_id( $rule_id );
-		$this->assert( null !== $found, 'Rule must be found by ID.' );
-		$this->assert( '123456789.123456' === $found->pricing_value()->value(), 'High decimal precision must round-trip exactly without float loss.' );
-		$this->assert( $found->pricing_value()->is_fixed(), 'Pricing type must be fixed.' );
-		$this->assert( $found->scope()->is_product(), 'Scope must be product.' );
-		$this->assert( 1001 === $found->scope()->id(), 'Product ID must be 1001.' );
+			$saved = $this->rule_repo->save( $rule );
+			$rule_id = (int) $saved->id();
+			$this->assert( $rule_id > 0, 'Saved rule must receive positive ID.' );
 
-		// Update value.
-		$updated = $found->update_value( PricingValue::fixed( '999999999.654321' ) );
-		$this->rule_repo->save( $updated );
+			$found = $this->rule_repo->find_by_id( $rule_id );
+			$this->assert( null !== $found, 'Rule must be found by ID.' );
+			$this->assert( '123456789.123456' === $found->pricing_value()->value(), 'High decimal precision must round-trip exactly without float loss.' );
+			$this->assert( $found->pricing_value()->is_fixed(), 'Pricing type must be fixed.' );
+			$this->assert( $found->scope()->is_product(), 'Scope must be product.' );
+			$this->assert( $product_id === $found->scope()->id(), 'Product ID must match.' );
 
-		$verified = $this->rule_repo->find_by_id( $rule_id );
-		$this->assert( null !== $verified, 'Updated rule must exist.' );
-		$this->assert( '999999999.654321' === $verified->pricing_value()->value(), 'Updated decimal must persist.' );
+			// Update value.
+			$updated = $found->update_value( PricingValue::fixed( '999999999.654321' ) );
+			$this->rule_repo->save( $updated );
 
-		// Cleanup.
-		$this->rule_repo->delete( $rule_id );
-		$this->assert( null === $this->rule_repo->find_by_id( $rule_id ), 'Deleted rule must not exist.' );
+			$verified = $this->rule_repo->find_by_id( $rule_id );
+			$this->assert( null !== $verified, 'Updated rule must exist.' );
+			$this->assert( '999999999.654321' === $verified->pricing_value()->value(), 'Updated decimal must persist.' );
+
+			// Cleanup rule.
+			$this->rule_repo->delete( $rule_id );
+			$this->assert( null === $this->rule_repo->find_by_id( $rule_id ), 'Deleted rule must not exist.' );
+		} finally {
+			$this->group_repo->delete( $group_id );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $product_id ] );
+		}
 	}
 
 	public function test_explicit_zero_rules_are_preserved(): void {
-		$rule = new PricingRule(
-			RuleTarget::group( 888 ),
-			RuleScope::global(),
-			PricingValue::percentage( '0' )
-		);
+		$group = $this->group_repo->save( new PricingGroup( 'Zero Rule Group', 'zero-rule-group-test' ) );
+		$group_id = (int) $group->id();
 
-		$saved = $this->rule_repo->save( $rule );
-		$rule_id = $saved->id();
-		$this->assert( null !== $rule_id, '0% rule must save.' );
+		try {
+			$rule = new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::global(),
+				PricingValue::percentage( '0' )
+			);
 
-		$found = $this->rule_repo->find_by_id( $rule_id );
-		$this->assert( null !== $found, '0% rule must be retrievable.' );
-		$this->assert( $found->pricing_value()->is_zero(), 'is_zero() must be true.' );
-		$this->assert( '0.000000' === $found->pricing_value()->value(), 'Value must be exact 0.000000.' );
+			$saved = $this->rule_repo->save( $rule );
+			$rule_id = (int) $saved->id();
+			$this->assert( $rule_id > 0, '0% rule must save.' );
 
-		// Cleanup.
-		$this->rule_repo->delete( $rule_id );
+			$found = $this->rule_repo->find_by_id( $rule_id );
+			$this->assert( null !== $found, '0% rule must be retrievable.' );
+			$this->assert( $found->pricing_value()->is_zero(), 'is_zero() must be true.' );
+			$this->assert( '0.000000' === $found->pricing_value()->value(), 'Value must be exact 0.000000.' );
+
+			$this->rule_repo->delete( $rule_id );
+		} finally {
+			$this->group_repo->delete( $group_id );
+		}
 	}
 
-	public function test_conflicting_active_rules_rejection(): void {
-		$rule1 = new PricingRule(
-			RuleTarget::group( 777 ),
-			RuleScope::category( 50 ),
-			PricingValue::percentage( '15' ),
-			null,
-			RuleStatus::ACTIVE
-		);
-		$saved1 = $this->rule_repo->save( $rule1 );
+	public function test_active_rule_uniqueness_percentage_vs_fixed_conflict(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Conflict Group', 'conflict-group-test' ) );
+		$group_id = (int) $group->id();
 
-		// Second active rule with identical logical signature (target, scope, pricing_type).
-		$rule2 = new PricingRule(
-			RuleTarget::group( 777 ),
-			RuleScope::category( 50 ),
-			PricingValue::percentage( '25' ),
-			null,
-			RuleStatus::ACTIVE
+		// Create mock product.
+		$this->db->insert(
+			$this->db->prefix . 'posts',
+			[ 'post_title' => 'Conflict Product', 'post_type' => 'product', 'post_status' => 'publish' ]
 		);
+		$product_id = (int) $this->db->insert_id;
 
-		$threw = false;
 		try {
-			$this->rule_repo->save( $rule2 );
-		} catch ( DuplicateRuleException $e ) {
-			$threw = true;
+			// Rule 1: Active percentage rule on product.
+			$rule1 = new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::product( $product_id ),
+				PricingValue::percentage( '15' ),
+				null,
+				RuleStatus::ACTIVE
+			);
+			$saved1 = $this->rule_repo->save( $rule1 );
+			$this->assert( null !== $saved1->id(), 'First active percentage rule must save.' );
+
+			// Rule 2: Active FIXED-PRICE rule on the SAME product and target.
+			// In Tierza v1, logical uniqueness key is (target_type, target_id, scope_type, scope_id).
+			// Percentage and Fixed MUST conflict!
+			$rule2 = new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::product( $product_id ),
+				PricingValue::fixed( '200000' ),
+				null,
+				RuleStatus::ACTIVE
+			);
+
+			$threw = false;
+			try {
+				$this->rule_repo->save( $rule2 );
+			} catch ( DuplicateRuleException $e ) {
+				$threw = true;
+			}
+
+			$this->assert( $threw, 'Active percentage and active fixed rule on same target/scope MUST conflict and throw DuplicateRuleException.' );
+
+			$this->rule_repo->delete( (int) $saved1->id() );
+		} finally {
+			$this->group_repo->delete( $group_id );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $product_id ] );
 		}
+	}
 
-		$this->assert( $threw, 'Conflicting active rule must throw DuplicateRuleException.' );
+	public function test_updating_active_rule_does_not_conflict_with_itself(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Self Update Group', 'self-update-group-test' ) );
+		$group_id = (int) $group->id();
 
-		// Cleanup.
-		if ( null !== $saved1->id() ) {
-			$this->rule_repo->delete( $saved1->id() );
+		try {
+			$rule = new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::global(),
+				PricingValue::percentage( '10' )
+			);
+			$saved = $this->rule_repo->save( $rule );
+			$rule_id = (int) $saved->id();
+
+			// Update its own value while remaining active.
+			$updated = $saved->update_value( PricingValue::percentage( '12' ) );
+			$saved_again = $this->rule_repo->save( $updated );
+
+			$this->assert( $rule_id === (int) $saved_again->id(), 'Rule ID must remain identical on update.' );
+			$this->assert( '12.000000' === $saved_again->pricing_value()->value(), 'Updated rule value must be 12.000000.' );
+
+			$this->rule_repo->delete( $rule_id );
+		} finally {
+			if ( isset( $rule_id ) ) {
+				$this->rule_repo->delete( $rule_id );
+			}
+			$this->group_repo->delete( $group_id );
+		}
+	}
+
+	public function test_activating_inactive_rule_checks_conflicts(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Activation Test Group', 'activation-test-group' ) );
+		$group_id = (int) $group->id();
+
+		try {
+			// Rule 1: Active rule.
+			$rule1 = $this->rule_repo->save(
+				new PricingRule(
+					RuleTarget::group( $group_id ),
+					RuleScope::global(),
+					PricingValue::percentage( '10' ),
+					null,
+					RuleStatus::ACTIVE
+				)
+			);
+
+			// Rule 2: Inactive rule on SAME target and scope (must succeed!).
+			$rule2 = $this->rule_repo->save(
+				new PricingRule(
+					RuleTarget::group( $group_id ),
+					RuleScope::global(),
+					PricingValue::percentage( '20' ),
+					null,
+					RuleStatus::INACTIVE
+				)
+			);
+			$this->assert( null !== $rule2->id(), 'Inactive rule must be saved without conflict.' );
+
+			// Activating Rule 2 must fail due to active conflict with Rule 1.
+			$threw = false;
+			try {
+				$this->rule_repo->save( $rule2->activate() );
+			} catch ( DuplicateRuleException $e ) {
+				$threw = true;
+			}
+			$this->assert( $threw, 'Activating an inactive rule conflicting with an active rule must throw DuplicateRuleException.' );
+
+			$this->rule_repo->delete( (int) $rule1->id() );
+			$this->rule_repo->delete( (int) $rule2->id() );
+		} finally {
+			$this->group_repo->delete( $group_id );
 		}
 	}
 
 	public function test_multiple_inactive_rules_allowed(): void {
-		// Create rule 1 inactive.
-		$rule1 = new PricingRule(
-			RuleTarget::group( 666 ),
-			RuleScope::global(),
-			PricingValue::percentage( '10' ),
-			null,
-			RuleStatus::INACTIVE
-		);
-		$saved1 = $this->rule_repo->save( $rule1 );
+		$group = $this->group_repo->save( new PricingGroup( 'History Group', 'history-group-test' ) );
+		$group_id = (int) $group->id();
 
-		// Create rule 2 inactive with same target/scope.
-		$rule2 = new PricingRule(
-			RuleTarget::group( 666 ),
-			RuleScope::global(),
-			PricingValue::percentage( '20' ),
-			null,
-			RuleStatus::INACTIVE
-		);
-		$saved2 = $this->rule_repo->save( $rule2 );
+		try {
+			$rule1 = $this->rule_repo->save(
+				new PricingRule(
+					RuleTarget::group( $group_id ),
+					RuleScope::global(),
+					PricingValue::percentage( '10' ),
+					null,
+					RuleStatus::INACTIVE
+				)
+			);
 
-		$this->assert( null !== $saved1->id() && null !== $saved2->id(), 'Multiple inactive rules with same signature must be permitted for history.' );
+			$rule2 = $this->rule_repo->save(
+				new PricingRule(
+					RuleTarget::group( $group_id ),
+					RuleScope::global(),
+					PricingValue::percentage( '20' ),
+					null,
+					RuleStatus::INACTIVE
+				)
+			);
 
-		// Cleanup.
-		if ( null !== $saved1->id() ) {
-			$this->rule_repo->delete( $saved1->id() );
+			$this->assert( null !== $rule1->id() && null !== $rule2->id(), 'Multiple inactive historical rules must be permitted.' );
+
+			$this->rule_repo->delete( (int) $rule1->id() );
+			$this->rule_repo->delete( (int) $rule2->id() );
+		} finally {
+			$this->group_repo->delete( $group_id );
 		}
-		if ( null !== $saved2->id() ) {
-			$this->rule_repo->delete( $saved2->id() );
+	}
+
+	public function test_database_enforced_active_key_uniqueness_concurrency(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Race Group', 'race-group-test' ) );
+		$group_id = (int) $group->id();
+
+		try {
+			$table_rules = Schema::rules_table( $this->db );
+			$active_key = sprintf( 'group:%d|global:0', $group_id );
+			$now = current_time( 'mysql', true );
+
+			// Thread 1 inserts row with active_key.
+			$res1 = $this->db->insert(
+				$table_rules,
+				[
+					'target_type'  => 'group',
+					'target_id'    => $group_id,
+					'scope_type'   => 'global',
+					'scope_id'     => 0,
+					'pricing_type' => 'percentage',
+					'value'        => '10.000000',
+					'status'       => 'active',
+					'active_key'   => $active_key,
+					'created_at'   => $now,
+					'updated_at'   => $now,
+				]
+			);
+			$this->assert( 1 === $res1, 'Thread 1 insert must succeed.' );
+			$id1 = (int) $this->db->insert_id;
+
+			// Thread 2 attempts simultaneous concurrent insert with identical active_key.
+			// Database engine UNIQUE KEY uq_active_rule MUST reject it.
+			$res2 = $this->db->insert(
+				$table_rules,
+				[
+					'target_type'  => 'group',
+					'target_id'    => $group_id,
+					'scope_type'   => 'global',
+					'scope_id'     => 0,
+					'pricing_type' => 'fixed',
+					'value'        => '50000.000000',
+					'status'       => 'active',
+					'active_key'   => $active_key,
+					'created_at'   => $now,
+					'updated_at'   => $now,
+				]
+			);
+
+			$this->assert( false === $res2, 'Thread 2 concurrent duplicate insert must be rejected by database engine.' );
+			$this->assert(
+				str_contains( strtolower( $this->db->last_error ), 'duplicate' ) || str_contains( strtolower( $this->db->last_error ), 'uq_active_rule' ),
+				'Database error must indicate unique constraint violation on uq_active_rule.'
+			);
+
+			$this->db->delete( $table_rules, [ 'id' => $id1 ] );
+		} finally {
+			$this->group_repo->delete( $group_id );
+		}
+	}
+
+	public function test_reference_validation_rejects_nonexistent_entities(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Ref Group', 'ref-group-test' ) );
+		$group_id = (int) $group->id();
+
+		try {
+			// Non-existent target user.
+			$threw_user = false;
+			try {
+				$this->rule_repo->save(
+					new PricingRule(
+						RuleTarget::user( 99999999 ),
+						RuleScope::global(),
+						PricingValue::percentage( '5' )
+					)
+				);
+			} catch ( InvalidRuleException $e ) {
+				$threw_user = true;
+			}
+			$this->assert( $threw_user, 'Rule for non-existent target user must be rejected.' );
+
+			// Non-existent product.
+			$threw_product = false;
+			try {
+				$this->rule_repo->save(
+					new PricingRule(
+						RuleTarget::group( $group_id ),
+						RuleScope::product( 88888888 ),
+						PricingValue::fixed( '1000' )
+					)
+				);
+			} catch ( InvalidRuleException $e ) {
+				$threw_product = true;
+			}
+			$this->assert( $threw_product, 'Rule for non-existent product must be rejected.' );
+
+			// Non-existent category.
+			$threw_cat = false;
+			try {
+				$this->rule_repo->save(
+					new PricingRule(
+						RuleTarget::group( $group_id ),
+						RuleScope::category( 77777777 ),
+						PricingValue::percentage( '10' )
+					)
+				);
+			} catch ( InvalidRuleException $e ) {
+				$threw_cat = true;
+			}
+			$this->assert( $threw_cat, 'Rule for non-existent category must be rejected.' );
+		} finally {
+			$this->group_repo->delete( $group_id );
+		}
+	}
+
+	public function test_reference_validation_accepts_valid_entities(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Valid Ref Group', 'valid-ref-group' ) );
+		$group_id = (int) $group->id();
+
+		// Create mock product in wp_posts.
+		$this->db->insert(
+			$this->db->prefix . 'posts',
+			[ 'post_title' => 'Valid Product', 'post_type' => 'product', 'post_status' => 'publish' ]
+		);
+		$product_id = (int) $this->db->insert_id;
+
+		try {
+			$rule = new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::product( $product_id ),
+				PricingValue::fixed( '500000' )
+			);
+			$saved = $this->rule_repo->save( $rule );
+			$this->assert( null !== $saved->id(), 'Rule targeting valid product must save successfully.' );
+
+			$this->rule_repo->delete( (int) $saved->id() );
+		} finally {
+			$this->group_repo->delete( $group_id );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $product_id ] );
 		}
 	}
 
 	public function test_user_group_assignment_and_reassignment(): void {
-		// Create 2 test groups.
 		$group_a = $this->group_repo->save( new PricingGroup( 'Test Group A', 'test-group-a' ) );
 		$group_b = $this->group_repo->save( new PricingGroup( 'Test Group B', 'test-group-b' ) );
 
-		$user_id = 9999;
+		// Create a test user in wp_users for reference validation.
+		$this->db->insert(
+			$this->db->prefix . 'users',
+			[
+				'user_login'    => 'tierza_test_user_assignment',
+				'user_pass'     => 'fakepass',
+				'user_nicename' => 'tierza_test',
+				'user_email'    => 'test_assignment@tierza.org',
+			]
+		);
+		$user_id = (int) $this->db->insert_id;
 
-		// Clean any previous assignment for user_id 9999.
-		$this->user_group_repo->remove( $user_id );
-
-		// Assign to group A.
-		$assignment = $this->user_group_repo->assign( $user_id, (int) $group_a->id() );
-		$this->assert( (int) $group_a->id() === $assignment->group_id(), 'User must be assigned to Group A.' );
-
-		// Attempting duplicate assign() must fail (MVP single primary group policy).
-		$threw = false;
 		try {
-			$this->user_group_repo->assign( $user_id, (int) $group_b->id() );
-		} catch ( InvalidAssignmentException $e ) {
-			$threw = true;
+			// Assign to group A.
+			$assignment = $this->user_group_repo->assign( $user_id, (int) $group_a->id() );
+			$this->assert( (int) $group_a->id() === $assignment->group_id(), 'User must be assigned to Group A.' );
+
+			// Attempting duplicate assign() must fail.
+			$threw = false;
+			try {
+				$this->user_group_repo->assign( $user_id, (int) $group_b->id() );
+			} catch ( InvalidAssignmentException $e ) {
+				$threw = true;
+			}
+			$this->assert( $threw, 'Direct assign() on already assigned user must throw InvalidAssignmentException.' );
+
+			// Reassign to group B.
+			$reassigned = $this->user_group_repo->reassign( $user_id, (int) $group_b->id() );
+			$this->assert( (int) $group_b->id() === $reassigned->group_id(), 'User must be reassigned to Group B.' );
+
+			// Query by user ID.
+			$current = $this->user_group_repo->find_by_user_id( $user_id );
+			$this->assert( null !== $current && (int) $group_b->id() === $current->group_id(), 'Query by user ID must show Group B.' );
+
+			// List users in group B.
+			$list = $this->user_group_repo->list_by_group_id( (int) $group_b->id() );
+			$this->assert( ! empty( $list ), 'Group B user list must not be empty.' );
+
+			// Cleanup assignment.
+			$this->user_group_repo->remove( $user_id );
+			$this->assert( null === $this->user_group_repo->find_by_user_id( $user_id ), 'Removed user assignment must be null.' );
+		} finally {
+			$this->group_repo->delete( (int) $group_a->id() );
+			$this->group_repo->delete( (int) $group_b->id() );
+			$this->db->delete( $this->db->prefix . 'users', [ 'ID' => $user_id ] );
 		}
-		$this->assert( $threw, 'Direct assign() on already assigned user must throw InvalidAssignmentException.' );
-
-		// Reassign to group B.
-		$reassigned = $this->user_group_repo->reassign( $user_id, (int) $group_b->id() );
-		$this->assert( (int) $group_b->id() === $reassigned->group_id(), 'User must be reassigned to Group B.' );
-
-		// Query by user ID.
-		$current = $this->user_group_repo->find_by_user_id( $user_id );
-		$this->assert( null !== $current && (int) $group_b->id() === $current->group_id(), 'Query by user ID must show Group B.' );
-
-		// List users in group B.
-		$list = $this->user_group_repo->list_by_group_id( (int) $group_b->id() );
-		$this->assert( ! empty( $list ), 'Group B user list must not be empty.' );
-
-		// Cleanup.
-		$this->user_group_repo->remove( $user_id );
-		$this->assert( null === $this->user_group_repo->find_by_user_id( $user_id ), 'Removed user assignment must be null.' );
-
-		$this->group_repo->delete( (int) $group_a->id() );
-		$this->group_repo->delete( (int) $group_b->id() );
 	}
 
 	public function test_user_group_safeguards_invalid_group(): void {
@@ -375,46 +700,55 @@ class DatabaseIntegrationLiveTest {
 		$group = $this->group_repo->save( new PricingGroup( 'Protected Group', 'protected-group' ) );
 		$group_id = (int) $group->id();
 
-		// Add assigned user.
-		$user_id = 7777;
-		$this->user_group_repo->assign( $user_id, $group_id );
-
-		// Attempt delete -> must throw.
-		$threw_user = false;
-		try {
-			$this->group_repo->delete( $group_id );
-		} catch ( GroupDeletionSafeguardException $e ) {
-			$threw_user = true;
-		}
-		$this->assert( $threw_user, 'Deleting group with assigned users must throw GroupDeletionSafeguardException.' );
-
-		// Remove user assignment.
-		$this->user_group_repo->remove( $user_id );
-
-		// Add rule to group.
-		$rule = $this->rule_repo->save(
-			new PricingRule(
-				RuleTarget::group( $group_id ),
-				RuleScope::global(),
-				PricingValue::percentage( '5' )
-			)
+		// Create mock user.
+		$this->db->insert(
+			$this->db->prefix . 'users',
+			[ 'user_login' => 'user_protected_del', 'user_pass' => 'pass', 'user_email' => 'prot_del@tierza.org' ]
 		);
+		$user_id = (int) $this->db->insert_id;
 
-		// Attempt delete -> must throw due to rule.
-		$threw_rule = false;
 		try {
-			$this->group_repo->delete( $group_id );
-		} catch ( GroupDeletionSafeguardException $e ) {
-			$threw_rule = true;
+			$this->user_group_repo->assign( $user_id, $group_id );
+
+			// Attempt delete -> must throw due to assigned user.
+			$threw_user = false;
+			try {
+				$this->group_repo->delete( $group_id );
+			} catch ( GroupDeletionSafeguardException $e ) {
+				$threw_user = true;
+			}
+			$this->assert( $threw_user, 'Deleting group with assigned users must throw GroupDeletionSafeguardException.' );
+
+			// Remove user assignment.
+			$this->user_group_repo->remove( $user_id );
+
+			// Add rule to group.
+			$rule = $this->rule_repo->save(
+				new PricingRule(
+					RuleTarget::group( $group_id ),
+					RuleScope::global(),
+					PricingValue::percentage( '5' )
+				)
+			);
+
+			// Attempt delete -> must throw due to rule.
+			$threw_rule = false;
+			try {
+				$this->group_repo->delete( $group_id );
+			} catch ( GroupDeletionSafeguardException $e ) {
+				$threw_rule = true;
+			}
+			$this->assert( $threw_rule, 'Deleting group with attached rules must throw GroupDeletionSafeguardException.' );
+
+			// Remove rule.
+			$this->rule_repo->delete( (int) $rule->id() );
+
+			// Now delete must succeed.
+			$deleted = $this->group_repo->delete( $group_id );
+			$this->assert( $deleted, 'Group delete must succeed once users and rules are removed.' );
+		} finally {
+			$this->db->delete( $this->db->prefix . 'users', [ 'ID' => $user_id ] );
 		}
-		$this->assert( $threw_rule, 'Deleting group with attached rules must throw GroupDeletionSafeguardException.' );
-
-		// Remove rule.
-		$this->rule_repo->delete( (int) $rule->id() );
-
-		// Now delete must succeed.
-		$deleted = $this->group_repo->delete( $group_id );
-		$this->assert( $deleted, 'Group delete must succeed once users and rules are removed.' );
 	}
 
 	public function test_group_deletion_success_when_isolated(): void {
@@ -428,15 +762,16 @@ class DatabaseIntegrationLiveTest {
 		$group = $this->group_repo->save( new PricingGroup( 'Migration Persistent Group', 'migration-persistent-group' ) );
 		$group_id = (int) $group->id();
 
-		// Execute schema migration multiple times.
-		Schema::install( $this->db );
-		Schema::maybe_upgrade( $this->db );
+		try {
+			// Execute schema migration multiple times.
+			Schema::install( $this->db );
+			Schema::maybe_upgrade( $this->db );
 
-		$found = $this->group_repo->find_by_id( $group_id );
-		$this->assert( null !== $found, 'Existing group must survive repeated schema migrations without data loss.' );
-
-		// Cleanup.
-		$this->group_repo->delete( $group_id );
+			$found = $this->group_repo->find_by_id( $group_id );
+			$this->assert( null !== $found, 'Existing group must survive repeated schema migrations without data loss.' );
+		} finally {
+			$this->group_repo->delete( $group_id );
+		}
 	}
 }
 

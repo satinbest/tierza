@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tierza\Infrastructure\Database;
 
+use Tierza\Domain\Exceptions\SchemaMigrationException;
 use wpdb;
 
 /**
@@ -51,9 +52,8 @@ final class Schema {
 	/**
 	 * Run table creation and idempotent migrations.
 	 */
-	public static function install( ?wpdb $wpdb = null ): void {
-		global $wpdb;
-		$db = $wpdb ?? $GLOBALS['wpdb'];
+	public static function install( ?wpdb $db_instance = null ): void {
+		$db = $db_instance ?? ( isset( $GLOBALS['wpdb'] ) && $GLOBALS['wpdb'] instanceof wpdb ? $GLOBALS['wpdb'] : null );
 
 		if ( ! $db instanceof wpdb ) {
 			return;
@@ -92,9 +92,11 @@ final class Schema {
   pricing_type varchar(20) NOT NULL,
   value decimal(20,6) NOT NULL DEFAULT 0.000000,
   status varchar(20) NOT NULL DEFAULT 'active',
+  active_key varchar(100) NULL,
   created_at datetime NOT NULL,
   updated_at datetime NOT NULL,
   PRIMARY KEY  (id),
+  UNIQUE KEY uq_active_rule (active_key),
   KEY idx_target (target_type, target_id, status),
   KEY idx_scope (scope_type, scope_id, status),
   KEY idx_lookup (target_type, target_id, scope_type, scope_id, status)
@@ -124,17 +126,93 @@ final class Schema {
 			dbDelta( $sql_user_groups );
 		}
 
+		// Verify schema before updating version.
+		$issues = self::verify_schema( $db );
+		if ( ! empty( $issues ) ) {
+			throw new SchemaMigrationException(
+				sprintf(
+					'Tierza schema migration failed verification: %s',
+					implode( '; ', $issues )
+				)
+			);
+		}
+
 		update_option( self::DB_VERSION_OPTION, self::CURRENT_DB_VERSION );
+	}
+
+	/**
+	 * Verify that all required tables, essential columns, and indexes exist.
+	 *
+	 * @return string[] List of issues, or empty array if healthy.
+	 */
+	public static function verify_schema( ?wpdb $db_instance = null ): array {
+		$db = $db_instance ?? ( isset( $GLOBALS['wpdb'] ) && $GLOBALS['wpdb'] instanceof wpdb ? $GLOBALS['wpdb'] : null );
+
+		if ( ! $db instanceof wpdb ) {
+			return [ 'Database connection is unavailable.' ];
+		}
+
+		$issues = [];
+		$tables = [
+			self::groups_table( $db )      => [
+				'columns' => [ 'id', 'name', 'slug', 'status', 'sort_order', 'created_at', 'updated_at' ],
+				'indexes' => [ 'PRIMARY', 'uq_slug' ],
+			],
+			self::rules_table( $db )       => [
+				'columns' => [ 'id', 'target_type', 'target_id', 'scope_type', 'scope_id', 'pricing_type', 'value', 'status', 'active_key', 'created_at', 'updated_at' ],
+				'indexes' => [ 'PRIMARY', 'uq_active_rule' ],
+			],
+			self::user_groups_table( $db ) => [
+				'columns' => [ 'id', 'user_id', 'group_id', 'created_at', 'updated_at' ],
+				'indexes' => [ 'PRIMARY', 'uq_user_id' ],
+			],
+		];
+
+		foreach ( $tables as $table => $specs ) {
+			$query       = $db->prepare( 'SHOW TABLES LIKE %s', $table );
+			$found_table = $db->get_var( $query );
+
+			if ( $found_table !== $table ) {
+				$issues[] = sprintf( 'Missing table "%s".', $table );
+				continue;
+			}
+
+			// Check essential columns.
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$cols_data = $db->get_results( "SHOW FULL COLUMNS FROM {$table}", ARRAY_A );
+			if ( is_array( $cols_data ) ) {
+				$existing_cols = array_column( $cols_data, 'Field' );
+				foreach ( $specs['columns'] as $col ) {
+					if ( ! in_array( $col, $existing_cols, true ) ) {
+						$issues[] = sprintf( 'Table "%s" is missing column "%s".', $table, $col );
+					}
+				}
+			}
+
+			// Check essential indexes.
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$index_data = $db->get_results( "SHOW INDEX FROM {$table}", ARRAY_A );
+			if ( is_array( $index_data ) ) {
+				$existing_indexes = array_column( $index_data, 'Key_name' );
+				foreach ( $specs['indexes'] as $idx ) {
+					if ( ! in_array( $idx, $existing_indexes, true ) ) {
+						$issues[] = sprintf( 'Table "%s" is missing index "%s".', $table, $idx );
+					}
+				}
+			}
+		}
+
+		return $issues;
 	}
 
 	/**
 	 * Check whether schema needs to be upgraded.
 	 */
-	public static function maybe_upgrade( ?wpdb $wpdb = null ): void {
+	public static function maybe_upgrade( ?wpdb $db_instance = null ): void {
 		$installed_version = get_option( self::DB_VERSION_OPTION, '0.0.0' );
 
 		if ( version_compare( (string) $installed_version, self::CURRENT_DB_VERSION, '<' ) ) {
-			self::install( $wpdb );
+			self::install( $db_instance );
 		}
 	}
 

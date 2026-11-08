@@ -122,15 +122,23 @@ final class PricingRule {
 
 	/**
 	 * Unique logical key for active collision checking.
+	 * Format: "target_type:target_id|scope_type:scope_id".
+	 * Pricing type is intentionally excluded to ensure only one active rule exists per target & scope.
 	 */
 	public function logical_key(): string {
 		return sprintf(
-			'%s:%d|%s:%d|%s',
+			'%s:%d|%s:%d',
 			$this->target->type(),
 			$this->target->id(),
 			$this->scope->type(),
-			$this->scope->id(),
-			$this->pricing_value->type()
+			$this->scope->id()
 		);
+	}
+
+	/**
+	 * Database active key representation (null when inactive to allow multiple historical inactive rules).
+	 */
+	public function active_key(): ?string {
+		return $this->is_active() ? $this->logical_key() : null;
 	}
 }

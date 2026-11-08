@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tierza\Infrastructure\Repositories;
 
 use DateTimeImmutable;
+use RuntimeException;
 use Tierza\Domain\Entities\PricingRule;
 use Tierza\Domain\Exceptions\DuplicateRuleException;
 use Tierza\Domain\Repositories\RuleRepositoryInterface;
@@ -13,6 +14,7 @@ use Tierza\Domain\ValueObjects\RuleScope;
 use Tierza\Domain\ValueObjects\RuleStatus;
 use Tierza\Domain\ValueObjects\RuleTarget;
 use Tierza\Infrastructure\Database\Schema;
+use Tierza\Infrastructure\Validation\EntityReferenceValidator;
 use wpdb;
 
 /**
@@ -22,38 +24,44 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 
 	private wpdb $db;
 	private string $table_rules;
+	private EntityReferenceValidator $validator;
 
-	public function __construct( ?wpdb $db = null ) {
+	public function __construct( ?wpdb $db = null, ?EntityReferenceValidator $validator = null ) {
 		global $wpdb;
 		$this->db          = $db ?? $GLOBALS['wpdb'];
 		$this->table_rules = Schema::rules_table( $this->db );
+		$this->validator   = $validator ?? new EntityReferenceValidator( $this->db );
 	}
 
 	public function save( PricingRule $rule ): PricingRule {
-		// Enforce active rule logical uniqueness.
+		// Validate target and scope entity references before persistence.
+		$this->validator->validate_target( $rule->target() );
+		$this->validator->validate_scope( $rule->scope() );
+
+		// Enforce active rule logical uniqueness at application layer.
 		if ( $rule->is_active() ) {
 			$conflict = $this->find_conflicting_active_rule( $rule );
 			if ( null !== $conflict ) {
 				throw new DuplicateRuleException(
 					sprintf(
-						'Conflicting active rule already exists (Rule ID %d) for target %s:%d, scope %s:%d, pricing %s.',
+						'Conflicting active rule already exists (Rule ID %d) for target %s:%d and scope %s:%d.',
 						(int) $conflict->id(),
 						$rule->target()->type(),
 						$rule->target()->id(),
 						$rule->scope()->type(),
-						$rule->scope()->id(),
-						$rule->pricing_value()->type()
+						$rule->scope()->id()
 					)
 				);
 			}
 		}
 
-		$now     = current_time( 'mysql', true );
-		$rule_id = $rule->id();
+		$now        = current_time( 'mysql', true );
+		$rule_id    = $rule->id();
+		$active_key = $rule->active_key();
 
 		if ( null === $rule_id ) {
-			// Insert new record.
-			$this->db->insert(
+			// Insert new record with database-enforced unique active_key.
+			$inserted = $this->db->insert(
 				$this->table_rules,
 				[
 					'target_type'  => $rule->target()->type(),
@@ -63,18 +71,34 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 					'pricing_type' => $rule->pricing_value()->type(),
 					'value'        => $rule->pricing_value()->value(),
 					'status'       => $rule->status()->value(),
+					'active_key'   => $active_key,
 					'created_at'   => $now,
 					'updated_at'   => $now,
 				],
-				[ '%s', '%d', '%s', '%d', '%s', '%s', '%s', '%s', '%s' ]
+				[ '%s', '%d', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s' ]
 			);
+
+			if ( false === $inserted ) {
+				if ( ! empty( $this->db->last_error ) && preg_match( '/uq_active_rule|duplicate/i', $this->db->last_error ) ) {
+					throw new DuplicateRuleException(
+						sprintf(
+							'Concurrent active rule conflict detected at database engine level for target %s:%d and scope %s:%d.',
+							$rule->target()->type(),
+							$rule->target()->id(),
+							$rule->scope()->type(),
+							$rule->scope()->id()
+						)
+					);
+				}
+				throw new RuntimeException( sprintf( 'Failed to insert rule: %s', $this->db->last_error ) );
+			}
 
 			$insert_id = (int) $this->db->insert_id;
 			return $this->find_by_id( $insert_id ) ?? $rule->with_id( $insert_id );
 		}
 
 		// Update existing record.
-		$this->db->update(
+		$updated = $this->db->update(
 			$this->table_rules,
 			[
 				'target_type'  => $rule->target()->type(),
@@ -84,12 +108,25 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 				'pricing_type' => $rule->pricing_value()->type(),
 				'value'        => $rule->pricing_value()->value(),
 				'status'       => $rule->status()->value(),
+				'active_key'   => $active_key,
 				'updated_at'   => $now,
 			],
 			[ 'id' => $rule_id ],
-			[ '%s', '%d', '%s', '%d', '%s', '%s', '%s', '%s' ],
+			[ '%s', '%d', '%s', '%d', '%s', '%s', '%s', '%s', '%s' ],
 			[ '%d' ]
 		);
+
+		if ( false === $updated && ! empty( $this->db->last_error ) && preg_match( '/uq_active_rule|duplicate/i', $this->db->last_error ) ) {
+			throw new DuplicateRuleException(
+				sprintf(
+					'Concurrent active rule conflict detected on update for target %s:%d and scope %s:%d.',
+					$rule->target()->type(),
+					$rule->target()->id(),
+					$rule->scope()->type(),
+					$rule->scope()->id()
+				)
+			);
+		}
 
 		return $this->find_by_id( $rule_id ) ?? $rule;
 	}
@@ -150,23 +187,21 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 	}
 
 	public function find_conflicting_active_rule( PricingRule $rule ): ?PricingRule {
-		$target_type  = $rule->target()->type();
-		$target_id    = $rule->target()->id();
-		$scope_type   = $rule->scope()->type();
-		$scope_id     = $rule->scope()->id();
-		$pricing_type = $rule->pricing_value()->type();
-		$rule_id      = $rule->id();
+		$target_type = $rule->target()->type();
+		$target_id   = $rule->target()->id();
+		$scope_type  = $rule->scope()->type();
+		$scope_id    = $rule->scope()->id();
+		$rule_id     = $rule->id();
 
 		if ( null !== $rule_id ) {
 			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			$row = $this->db->get_row(
 				$this->db->prepare(
-					"SELECT * FROM {$this->table_rules} WHERE target_type = %s AND target_id = %d AND scope_type = %s AND scope_id = %d AND pricing_type = %s AND status = %s AND id != %d LIMIT 1",
+					"SELECT * FROM {$this->table_rules} WHERE target_type = %s AND target_id = %d AND scope_type = %s AND scope_id = %d AND status = %s AND id != %d LIMIT 1",
 					$target_type,
 					$target_id,
 					$scope_type,
 					$scope_id,
-					$pricing_type,
 					RuleStatus::ACTIVE,
 					$rule_id
 				),
@@ -176,12 +211,11 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			$row = $this->db->get_row(
 				$this->db->prepare(
-					"SELECT * FROM {$this->table_rules} WHERE target_type = %s AND target_id = %d AND scope_type = %s AND scope_id = %d AND pricing_type = %s AND status = %s LIMIT 1",
+					"SELECT * FROM {$this->table_rules} WHERE target_type = %s AND target_id = %d AND scope_type = %s AND scope_id = %d AND status = %s LIMIT 1",
 					$target_type,
 					$target_id,
 					$scope_type,
 					$scope_id,
-					$pricing_type,
 					RuleStatus::ACTIVE
 				),
 				ARRAY_A

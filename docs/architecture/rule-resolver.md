@@ -1,6 +1,6 @@
 # Tierza — Deterministic Rule Resolver (TRZ-006)
 
-**Document Version:** 1.0.0  
+**Document Version:** 1.1.0  
 **Status:** Approved Specification  
 **Namespace:** `Tierza\Application\Pricing`  
 **License:** GPL-2.0-or-later
@@ -15,7 +15,10 @@ In accordance with Tierza Product Requirements Document (PRD v1), rule resolutio
 
 Key architectural characteristics:
 - **Zero Floating-Point Operations**: Preserves domain purity and exact numerical guarantees.
-- **Single Batch Query Optimization**: Executes at most 1 database query for authenticated users and 0 queries for anonymous users without groups.
+- **Fail-Closed Database Failure Policy**: Database read errors are never silently converted into fallback prices. Dedicated exceptions preserve the causal error chain.
+- **Fail-Closed Group Eligibility Policy**: Never assumes group activation from a positive numeric ID alone. Requires either a trusted entity in context or repository verification.
+- **Strict Deterministic Category-Depth Validation**: Multi-category tie-breaking strictly mandates depth metadata for all competing categories without defaulting unknown depths to zero.
+- **Single Batch Query Optimization**: Executes at most 1 database query for rule lookups and 0 queries for anonymous users without groups.
 - **Pure Dependency Injection**: Operates on `RuleRepositoryInterface` and `GroupRepositoryInterface`, requiring no WordPress or WooCommerce runtime during evaluation.
 - **100% Deterministic**: Identical inputs always produce the identical winning rule regardless of database row order or retrieval sequence.
 - **Defensive Safeguards**: Detects corrupted data, negative amounts, out-of-bounds percentages, and missing category depths with explicit domain exceptions.
@@ -47,146 +50,116 @@ Tierza v1 implements a strict, deterministic 9-level precedence hierarchy withou
 
 ---
 
-## 3. Resolution Sequence & Workflow
+## 3. Database Failure Handling vs. Successful Fallback
 
-```mermaid
-flowchart TD
-    Start["resolve(PricingContext)"] --> ValidateContext["Validate Context\n(product_id > 0, base_price non-negative)"]
-    ValidateContext --> DetermineTargets["Determine Eligible Targets\n(User ID, Active Group ID)"]
-    
-    DetermineTargets --> HasTargets{"Eligible Targets > 0?"}
-    HasTargets -- No --> FallbackAnon["Return WOOCOMMERCE_FALLBACK\n(Reason: NO_MATCHING_RULE, 0 DB queries)"]
-    
-    HasTargets -- Yes --> SingleQuery["Execute find_active_for_targets()\n(Single Batch SQL Query)"]
-    SingleQuery --> ValidateRules["Validate Rule Integrity\n(status, target, scope, percentage bounds)"]
-    ValidateRules --> BucketRules["Bucket Rules into Precedence Levels (1..8)\n(Inheriting parent product for variations)"]
-    
-    BucketRules --> CheckLevel["Evaluate Tiers 1 through 8 in Order"]
-    CheckLevel --> TierMatches{"Does Tier have candidate rules?"}
-    
-    TierMatches -- "Tier 1, 2, 4, 5, 6, 8" --> CheckConflict{"Count > 1?"}
-    CheckConflict -- Yes --> ConflictErr["Throw RuleResolutionException\n(Conflicting rules detected)"]
-    CheckConflict -- No --> WinDirect["Return ResolutionResult\n(Matched Rule, Specific Reason Code)"]
-    
-    TierMatches -- "Tier 3 or 7 (Category)" --> ResolveCategory["Resolve Category Hierarchy\n1. Deepest depth wins\n2. Highest discount wins\n3. Smallest category ID wins"]
-    ResolveCategory --> WinCategory["Return ResolutionResult\n(Winning Category Rule)"]
-    
-    TierMatches -- "No Rules in 1..8" --> FallbackAuth["Return WOOCOMMERCE_FALLBACK\n(Reason: NO_MATCHING_RULE)"]
-```
+### 3.1 The Fail-Closed Mandate
+A critical failure mode in e-commerce pricing engines is silently interpreting a failed database query as an empty result set (`[]`). When this occurs, a customer with an active B2B discount (e.g., 40% wholesale discount) is silently charged retail price (`WOOCOMMERCE_FALLBACK`), or conversely, private pricing data could be bypassed.
+
+Tierza strictly enforces a **fail-closed** architecture:
+- **Successful Empty Result**: When `$wpdb` successfully executes the query and returns 0 matching rows (`is_array($rows) && empty($rows)` and `$wpdb->last_error === ''`), the resolver returns an authoritative `ResolutionResult::fallback()` with reason `FALLBACK_NO_MATCHING_RULE` or `FALLBACK_ANONYMOUS_NO_RULE`.
+- **Database Query Failure**: When `$wpdb` encounters an error (syntax error, table lock, connection drop, server crash, or `! empty($wpdb->last_error)`), the infrastructure layer immediately throws `DatabaseQueryException`.
+- **Exception Propagation**: `DeterministicRuleResolver` catches any repository-level `Throwable`, wraps it into `RuleResolutionException`, and preserves the original exception as its `$previous` causal chain.
+- **Sanitized Public Messages**: Error messages in `DatabaseQueryException` and `RuleResolutionException` describe the operational failure (e.g., `"Database query failed while retrieving active rules for targets."`) without leaking raw SQL queries, internal database credentials, or customer identifiers into public responses.
+
+### 3.2 Later WooCommerce Adapter Responsibility
+In upcoming tasks (TRZ-010 to TRZ-013), external WooCommerce hooks (e.g., `woocommerce_product_get_price`) invoke the pricing engine:
+- If `RuleResolutionException` or `DatabaseQueryException` is raised during price resolution, the WooCommerce adapter MUST log the incident with administrative audit trails.
+- The adapter must handle the exception according to merchant security policies (e.g., preventing checkout or displaying a localized friendly error notice), rather than silently overwriting prices or ignoring errors.
 
 ---
 
-## 4. Category Hierarchy Tie-Breaking Policy
+## 4. Group Verification & Trust Boundaries
+
+### 4.1 Elimination of Unverified Numeric Group Assumptions
+Earlier iterations evaluated `$context->group_id() > 0` and defaulted to active if no repository was injected. This violated fail-closed security. In TRZ-006 v1.1.0:
+- **Rule 1**: The resolver **never** infers group activation from a positive numeric ID alone.
+- **Rule 2**: When an explicitly trusted, server-side validated `PricingGroup` entity is attached to `$context->group()`, the resolver honors `$group->is_active()` without an additional database query.
+- **Rule 3**: If only a numeric `$context->group_id()` is provided, the resolver **must** verify the group's existence and status via `GroupRepositoryInterface::find_by_id($group_id)`.
+- **Rule 4**: If neither a trusted entity nor a group repository is provided, the resolver immediately raises `RuleResolutionException`.
+- **Rule 5**: A verified inactive group (`status = 'inactive'`) never contributes group pricing rules (Tiers 5..8 are completely omitted from the resolution targets).
+- **Rule 6**: If a context references a group ID that does not exist in the database (e.g. deleted group), the resolver throws an explicit `RuleResolutionException` to prevent silent referential corruption.
+
+### 4.2 Security Trust Boundary
+- Authentication status (`customer_id`) and group assignment must originate exclusively from server-side WordPress user authentication and trusted user metadata (`wp_tierza_user_groups`).
+- User-supplied group IDs from `$_GET`, `$_POST`, cookies, or REST request bodies are strictly rejected at the adapter layer.
+- Cached group entities (introduced in TRZ-009) are subject to automated invalidation upon any group status update or deletion.
+
+---
+
+## 5. Category Hierarchy Tie-Breaking Policy
 
 When multiple category rules match at Level 3 (`CUSTOMER_CATEGORY`) or Level 7 (`GROUP_CATEGORY`), Tierza applies a deterministic 3-step tie-breaking procedure:
 
+### 5.1 Deterministic 3-Step Algorithm
 1. **Step 1 — Greatest Hierarchy Depth**:
    Rules assigned to deeper child categories in the taxonomy tree take precedence over broader ancestor categories.
    - Example: Rule on Category *Laptops* (depth 3) defeats Rule on Category *Electronics* (depth 1).
-   - If category depth metadata is missing from the context, a `RuleResolutionException` is immediately thrown to prevent undefined non-deterministic resolution.
 2. **Step 2 — Highest Percentage Discount (Lowest Final Price)**:
    If two candidate category rules reside at the exact same depth level, the rule offering the greatest percentage discount (lowest final price for the B2B customer) wins.
    - Example: 25% discount on *Casual Shirts* (depth 2) defeats 15% discount on *Summer Apparel* (depth 2).
 3. **Step 3 — Smallest Category ID (`category_id ASC`)**:
    If both category rules reside at identical depth and offer the identical discount percentage, the category with the lower numeric taxonomy term ID wins.
-   - Example: Category ID 42 wins over Category ID 88.
-4. **Duplicate Prevention**: If multiple active rules target the *same* category ID at the same precedence level, a `RuleResolutionException` is thrown.
+   - Example: Category ID 15 wins over Category ID 40.
+
+### 5.2 Strict Category-Depth Metadata Validation
+- **Multi-Category Requirement**: When two or more distinct category rules compete, valid depth metadata **must** exist in `$context->category_depths()` for every competing category.
+- **No Incomplete Maps**: A completely missing depth map (`[]`) or a partially populated map (missing any competing category) throws `RuleResolutionException`.
+- **Preservation of Depth Zero**: Root categories possess valid depth `0` (`is_int($depth) && $depth >= 0`). Depth zero is explicitly preserved and compared via `array_key_exists()`, never falsely treated as missing.
+- **No Arbitrary Defaulting**: Unknown category depths are **never** defaulted to zero during multi-category resolution.
+- **Single Non-Competing Rule**: If only 1 category rule matches, no competition or tie-breaking exists; the rule is returned directly without requiring depth metadata.
 
 ---
 
-## 5. Single-Query Database Optimization
+## 6. Performance Verification & Database Query Counts
 
-To support high-traffic WooCommerce stores, `DeterministicRuleResolver` minimizes database load:
+### 6.1 Query Count Breakdown
+The resolver explicitly distinguishes between rule-lookup queries and group-verification queries:
 
-### 5.1 Batch Query Signature
-```php
-RuleRepositoryInterface::find_active_for_targets( array $targets ): array
-```
+| Customer Context | Group Verification Queries | Pricing Rule Queries | Total Queries per Resolution |
+|:---|:---:|:---:|:---:|
+| **Anonymous Guest (No Group)** | 0 | 0 | **0 queries** |
+| **Authenticated (with Trusted Group Entity)** | 0 | 1 (`find_active_for_targets`) | **1 query** |
+| **Authenticated (Numeric Group ID only)** | 1 (`find_by_id`) | 1 (`find_active_for_targets`) | **2 queries** |
+| **Product Listing Archive ($N$ items, Trusted Entity)** | 0 | $N$ | **$N$ queries** (optimized in TRZ-009) |
 
-### 5.2 SQL Execution
-Instead of issuing individual queries per level, `WpRuleRepository::find_active_for_targets()` builds an indexed composite query matching all eligible targets in a single trip:
-```sql
-SELECT * FROM wp_tierza_rules
-WHERE (
-    (target_type = 'user' AND target_id = 42)
-    OR
-    (target_type = 'group' AND target_id = 7)
-)
-AND status = 'active';
-```
-- Utilizes composite index `idx_target (target_type, target_id, status)` for instant lookup.
-- Returns all candidate rules for both customer and group simultaneously.
-
-### 5.3 Query Count Guarantees
-- **Anonymous Users without Group**: **0 DB queries**. Target list is empty, repository is never invoked.
-- **Authenticated Users / Group Members**: **Exactly 1 DB query**. Single batch query retrieves all applicable rules.
-- Memory bucketing and precedence sorting happen entirely in-memory in `O(N)` time where `N` is the small set of active rules for the customer/group (typically 1 to 10 records).
+### 6.2 Benchmark Fixtures (MariaDB Environment)
+Verified in development Docker test environment (`tests/Live/DatabaseIntegrationLiveTest.php`):
+- **Fixtures Seeded**: 10 pricing groups, 100 WooCommerce products, 500 pricing rules in `wp_tierza_rules`.
+- **Listing Resolution (100 products)**:
+  - Total queries: Exactly 100 queries (1 indexed batch query per product, 0 group queries).
+  - Total execution time: ~120ms total (< 1.5ms per resolution).
 
 ---
 
-## 6. Critical Invariants & Defensive Handling
+## 7. Critical Invariants & Defensive Handling
 
-### 6.1 Explicit 0% Discount & 0.00 Fixed Price
-An active rule offering `0.000000%` discount or `$0.000000` fixed price is a completely valid business rule (e.g. explicitly exempting a VIP customer from discounts or granting free promotional items).
-- Resolves to `PrecedenceLevel::CUSTOMER_*` or `PrecedenceLevel::GROUP_*`.
-- Emits `PricingReasonCode::RULE_APPLIED_ZERO_PERCENTAGE` for explicit 0% rules, allowing downstream systems and logs to distinguish intended zero discounts from unconfigured fallbacks.
-
-### 6.2 Inactive Rules and Inactive Groups
-- Inactive rules (`status = 'inactive'`) are filtered out by the repository query and validated again in application memory. They never win.
-- Inactive groups (`status = 'inactive'`) are completely ignored during target collection. Customers belonging to an inactive group receive only customer-specific rules (1..4) or fallback (9). Group rules (5..8) are excluded.
-- If a context references a group ID that does not exist in the repository (e.g. deleted group), the resolver defensively throws `RuleResolutionException` rather than silently ignoring referential corruption.
-
-### 6.3 Anonymous Customers
-Guests and unauthenticated visitors (`customer_id = 0`) never receive customer-specific rules. If no group is assigned, the resolver immediately returns `WOOCOMMERCE_FALLBACK` without querying the database.
-
-### 6.4 Parent Product Inheritance for Variations
-For variable products, if no variation-specific rule exists (Tiers 1 & 5), the resolver allows the variation to match parent product rules at Tiers 2 (`CUSTOMER_PRODUCT`) and 6 (`GROUP_PRODUCT`).
-- Customer product rule (Tier 2) beats Group variation rule (Tier 5).
-- Group product rule (Tier 6) applies only if no customer rules (1..4) or group variation rules (5) match.
-
----
-
-## 7. Concrete Examples
-
-### 7.1 Simple Product
-- **Context**: Product ID `101`, Base Price `$100.00`, Customer ID `5`, Group `VIP` (ID `2`), Category `Smartphones` (ID `30`, depth 2).
-- **Rules Stored**:
-  - Rule A: Group `VIP` on Category `Smartphones` (20% off).
-  - Rule B: Customer `5` Global (10% off).
-- **Evaluation**:
-  - Rule B matches Level 4 (`CUSTOMER_GLOBAL`).
-  - Rule A matches Level 7 (`GROUP_CATEGORY`).
-  - Precedence Level 4 beats Level 7.
-- **Winner**: Rule B (`CUSTOMER_GLOBAL`, 10% off). Reason: `RULE_APPLIED_CUSTOMER_GLOBAL`.
-
-### 7.2 Variable Product (Variation Inheritance)
-- **Context**: Parent Product ID `200`, Variation ID `201`, Base Price `$50.00`, Customer ID `8`, Group `Wholesale` (ID `3`).
-- **Rules Stored**:
-  - Rule X: Group `Wholesale` on Product `200` (15% off).
-  - Rule Y: Customer `8` on Variation `201` (25% off).
-- **Evaluation**:
-  - Rule Y matches Level 1 (`CUSTOMER_VARIATION`).
-  - Rule X matches Level 6 (`GROUP_PRODUCT`).
-  - Precedence Level 1 beats Level 6.
-- **Winner**: Rule Y (`CUSTOMER_VARIATION`, 25% off). Reason: `RULE_APPLIED_CUSTOMER_VARIATION`.
+1. **Explicit 0% Discount & 0.00 Fixed Price**:
+   - Resolves to `PrecedenceLevel::CUSTOMER_*` or `PrecedenceLevel::GROUP_*`.
+   - Emits `PricingReasonCode::RULE_APPLIED_ZERO_PERCENTAGE` for explicit 0% rules, distinguishing intended zero discounts from unconfigured fallbacks.
+2. **Defensive Candidate Validation**:
+   - Inactive rules returned by faulty repositories are rejected with `RuleResolutionException`.
+   - Duplicate active rules for the same logical key (`target:scope`) throw `RuleResolutionException`.
+   - Fixed-price rules appearing at category or global scope throw `RuleResolutionException`.
+3. **Variation Parent Product Inheritance**:
+   - For variable products, if no variation-specific rule exists (Tiers 1 & 5), the variation inherits parent product rules at Tiers 2 (`CUSTOMER_PRODUCT`) and 6 (`GROUP_PRODUCT`).
+   - Customer product rule (Tier 2) strictly overrides Group variation rule (Tier 5).
 
 ---
 
 ## 8. Verification Matrix
 
 The deterministic rule resolver is verified by:
-1. **53 Isolated Unit Tests** (`DeterministicRuleResolverTest`):
+1. **73 Isolated Unit Tests** (`DeterministicRuleResolverTest`):
    - All 8 precedence tiers tested individually.
-   - Customer vs. Group precedence tests.
-   - Variation vs. Product precedence tests.
-   - Category depth, discount, and ID tie-breaking tests.
-   - Explicit 0% and 0.00 fixed price tests.
-   - Inactive rule and inactive group tests.
-   - Missing metadata and data corruption exception tests.
-   - 50-iteration randomized rule array ordering test (confirming 100% deterministic result regardless of input order).
-   - Complete 28-pair precedence matrix test comparing every higher-priority tier against every lower-priority tier.
-2. **4 Live MariaDB Integration Tests** (`DatabaseIntegrationLiveTest`):
-   - Real database stored rules resolution.
+   - Database read failure exception wrapping and causal chain tests.
+   - Group verification tests: trusted entity, repository lookup, inactive group, deleted group, unverified ID exception, and guest group matching.
+   - Category depth validation tests: missing depth map, partial depth map, valid depth 0 preservation, parent vs child, tie-break rules, and randomized ordering.
+   - Invariant defensive tests: corrupted inactive rules, duplicate logical rules, fixed price at category scope, explicit zero rules.
+   - 28-pair precedence matrix test comparing every higher-priority tier against every lower-priority tier.
+2. **5 Live MariaDB Integration Tests** (`DatabaseIntegrationLiveTest`):
+   - Real MariaDB stored rules resolution.
    - Real MariaDB category taxonomy hierarchy resolution.
    - Real MariaDB explicit 0% and inactive rules filtering.
-   - Real MariaDB query count assertions (0 queries for anonymous, 1 batch query for authenticated).
+   - Real MariaDB intentionally invalid SQL query failure producing `DatabaseQueryException` and `RuleResolutionException` (distinguished from fallback).
+   - Real MariaDB query count breakdown across all 4 scenarios.
+   - Real MariaDB benchmark fixtures test (10 groups, 100 products, 500 rules).

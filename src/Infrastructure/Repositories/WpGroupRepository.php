@@ -12,6 +12,7 @@ use Tierza\Domain\Repositories\GroupRepositoryInterface;
 use Tierza\Domain\ValueObjects\GroupSlug;
 use Tierza\Domain\ValueObjects\GroupStatus;
 use Tierza\Infrastructure\Database\Schema;
+use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use wpdb;
 
 /**
@@ -113,6 +114,10 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			ARRAY_A
 		);
 
+		if ( ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while retrieving pricing group by ID.' );
+		}
+
 		if ( ! is_array( $row ) ) {
 			return null;
 		}
@@ -131,6 +136,10 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			),
 			ARRAY_A
 		);
+
+		if ( ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while retrieving pricing group by slug.' );
+		}
 
 		if ( ! is_array( $row ) ) {
 			return null;
@@ -166,8 +175,8 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			);
 		}
 
-		if ( ! is_array( $rows ) ) {
-			return [];
+		if ( ! empty( $this->db->last_error ) || ! is_array( $rows ) ) {
+			throw new DatabaseQueryException( 'Database query failed while listing pricing groups.' );
 		}
 
 		return array_map( [ $this, 'hydrate' ], $rows );
@@ -185,6 +194,10 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 		} else {
 			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			$count = $this->db->get_var( "SELECT COUNT(*) FROM {$this->table_groups}" );
+		}
+
+		if ( ! empty( $this->db->last_error ) || false === $count || null === $count ) {
+			throw new DatabaseQueryException( 'Database query failed while counting pricing groups.' );
 		}
 
 		return (int) $count;
@@ -206,8 +219,8 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			ARRAY_A
 		);
 
-		if ( ! is_array( $rows ) ) {
-			return [];
+		if ( ! empty( $this->db->last_error ) || ! is_array( $rows ) ) {
+			throw new DatabaseQueryException( 'Database query failed while searching pricing groups.' );
 		}
 
 		return array_map( [ $this, 'hydrate' ], $rows );
@@ -232,6 +245,10 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			[ '%d' ]
 		);
 
+		if ( false === $deleted && ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while deleting pricing group.' );
+		}
+
 		return false !== $deleted && $deleted > 0;
 	}
 
@@ -244,6 +261,10 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			)
 		);
 
+		if ( ! empty( $this->db->last_error ) || false === $count || null === $count ) {
+			throw new DatabaseQueryException( 'Database query failed while checking assigned group users.' );
+		}
+
 		return (int) $count > 0;
 	}
 
@@ -255,6 +276,10 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 				$group_id
 			)
 		);
+
+		if ( ! empty( $this->db->last_error ) || false === $count || null === $count ) {
+			throw new DatabaseQueryException( 'Database query failed while checking attached group rules.' );
+		}
 
 		return (int) $count > 0;
 	}

@@ -239,6 +239,10 @@ final class PricingContext {
 		return $this->category_depths;
 	}
 
+	public function has_category_depth( int $category_id ): bool {
+		return array_key_exists( $category_id, $this->category_depths );
+	}
+
 	public function get_category_depth( int $category_id ): int {
 		return $this->category_depths[ $category_id ] ?? 0;
 	}

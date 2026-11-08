@@ -198,29 +198,33 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 			return $group->is_active();
 		}
 
-		// If an entity was not attached to context, verify against the group repository if injected.
-		if ( null !== $this->group_repository ) {
-			try {
-				$loaded_group = $this->group_repository->find_by_id( $group_id );
-			} catch ( Throwable $e ) {
-				throw new RuleResolutionException(
-					sprintf( 'Failed to verify referenced pricing group ID %d: %s', $group_id, $e->getMessage() ),
-					0,
-					$e
-				);
-			}
-
-			if ( null === $loaded_group ) {
-				throw new RuleResolutionException(
-					sprintf( 'Referenced pricing group ID %d does not exist or has been deleted.', $group_id )
-				);
-			}
-
-			return $loaded_group->is_active();
+		// If an entity was not attached to context, verify against the group repository.
+		if ( null === $this->group_repository ) {
+			throw new RuleResolutionException(
+				sprintf(
+					'Cannot verify group eligibility for group ID %d: neither a trusted PricingGroup entity in PricingContext nor a GroupRepositoryInterface was provided.',
+					$group_id
+				)
+			);
 		}
 
-		// If no group repository is available, accept the numeric group ID as active by default.
-		return true;
+		try {
+			$loaded_group = $this->group_repository->find_by_id( $group_id );
+		} catch ( Throwable $e ) {
+			throw new RuleResolutionException(
+				sprintf( 'Failed to verify referenced pricing group ID %d: %s', $group_id, $e->getMessage() ),
+				0,
+				$e
+			);
+		}
+
+		if ( null === $loaded_group ) {
+			throw new RuleResolutionException(
+				sprintf( 'Referenced pricing group ID %d does not exist or has been deleted.', $group_id )
+			);
+		}
+
+		return $loaded_group->is_active();
 	}
 
 	/**
@@ -258,6 +262,13 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 		foreach ( $rules as $rule ) {
 			$rule_id = (int) $rule->id();
 
+			// 0. Active status check (defensive against faulty repository returning inactive rules)
+			if ( ! $rule->is_active() ) {
+				throw new RuleResolutionException(
+					sprintf( 'Corrupted candidate rules: repository returned inactive rule ID %d.', $rule_id )
+				);
+			}
+
 			// 1. Target consistency check
 			$rule_target = $rule->target();
 			$sig         = $rule_target->type() . ':' . $rule_target->id();
@@ -268,7 +279,8 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 			}
 
 			// 2. Pricing value bounds check
-			$val = $rule->pricing_value();
+			$val   = $rule->pricing_value();
+			$scope = $rule->scope();
 			if ( $val->is_percentage() ) {
 				if ( DecimalMath::comp( $val->value(), '0', 6 ) < 0 || DecimalMath::comp( $val->value(), '100', 6 ) > 0 ) {
 					throw new RuleResolutionException(
@@ -281,10 +293,15 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 						sprintf( 'Invalid fixed price value "%s" on rule ID %d. Value cannot be negative.', $val->value(), $rule_id )
 					);
 				}
+
+				if ( ! ( $scope->is_product() || $scope->is_variation() ) ) {
+					throw new RuleResolutionException(
+						sprintf( 'Invalid rule: fixed-price rules are restricted to product or variation scopes, rule ID %d has scope "%s".', $rule_id, $scope->type() )
+					);
+				}
 			}
 
-			// 3. Scope validity check
-			$scope = $rule->scope();
+			// 4. Scope validity check
 			if ( $scope->is_global() && 0 !== $scope->id() ) {
 				throw new RuleResolutionException(
 					sprintf( 'Invalid rule scope: global rule ID %d must have scope ID 0, got %d.', $rule_id, $scope->id() )
@@ -402,31 +419,20 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 		PricingContext $context,
 		PrecedenceLevel $level
 	): PricingRule {
-		// Single category match: validate depth metadata if depth map is active.
+		// Single category match: no competing rules, depth comparison is not required.
 		if ( 1 === count( $rules ) ) {
-			$cat_id        = $rules[0]->scope()->id();
-			$has_depth_map = ! empty( $context->category_depths() );
-			if ( $has_depth_map && ! isset( $context->category_depths()[ $cat_id ] ) ) {
-				throw new RuleResolutionException(
-					sprintf( 'Missing category-depth metadata for category ID %d in pricing context.', $cat_id )
-				);
-			}
-
 			return $rules[0];
 		}
 
-		// Multiple category rules: validate and sort deterministically.
-		$has_depth_map = ! empty( $context->category_depths() );
-
-		// Check for missing depth metadata upfront.
-		if ( $has_depth_map ) {
-			foreach ( $rules as $rule ) {
-				$cat_id = $rule->scope()->id();
-				if ( ! isset( $context->category_depths()[ $cat_id ] ) ) {
-					throw new RuleResolutionException(
-						sprintf( 'Missing category-depth metadata for category ID %d in pricing context.', $cat_id )
-					);
-				}
+		// When two or more category rules compete, require valid depth metadata for every competing category.
+		// A completely missing depth map or partially populated depth map is invalid for multi-category resolution.
+		$depth_map = $context->category_depths();
+		foreach ( $rules as $rule ) {
+			$cat_id = $rule->scope()->id();
+			if ( ! array_key_exists( $cat_id, $depth_map ) ) {
+				throw new RuleResolutionException(
+					sprintf( 'Cannot resolve competing category rules: missing category-depth metadata for category ID %d in pricing context.', $cat_id )
+				);
 			}
 		}
 
@@ -445,13 +451,13 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 		// Sort candidate category rules using deterministic 3-step PRD policy.
 		usort(
 			$rules,
-			static function ( PricingRule $a, PricingRule $b ) use ( $context ): int {
+			static function ( PricingRule $a, PricingRule $b ) use ( $depth_map ): int {
 				$cat_a = $a->scope()->id();
 				$cat_b = $b->scope()->id();
 
 				// Step 1: Greatest hierarchy depth wins (deeper depth comes first).
-				$depth_a = $context->get_category_depth( $cat_a );
-				$depth_b = $context->get_category_depth( $cat_b );
+				$depth_a = $depth_map[ $cat_a ];
+				$depth_b = $depth_map[ $cat_b ];
 				if ( $depth_a !== $depth_b ) {
 					return $depth_b <=> $depth_a;
 				}

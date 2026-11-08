@@ -20,6 +20,7 @@ use Tierza\Domain\ValueObjects\PricingValue;
 use Tierza\Domain\ValueObjects\RuleScope;
 use Tierza\Domain\ValueObjects\RuleStatus;
 use Tierza\Domain\ValueObjects\RuleTarget;
+use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 
 final class DeterministicRuleResolverTest extends TestCase {
 
@@ -427,11 +428,13 @@ final class DeterministicRuleResolverTest extends TestCase {
 			category_depths: [ 20 => 1 ] // 30 is missing from depth map!
 		);
 
+		$rule20 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 20 ), PricingValue::percentage( '15.000000' ) );
 		$rule30 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 30 ), PricingValue::percentage( '25.000000' ) );
+		$this->rule_repo->save( $rule20 );
 		$this->rule_repo->save( $rule30 );
 
 		$this->expectException( RuleResolutionException::class );
-		$this->expectExceptionMessage( 'Missing category-depth metadata for category ID 30' );
+		$this->expectExceptionMessage( 'missing category-depth metadata for category ID 30' );
 
 		$this->resolver->resolve( $context );
 	}
@@ -606,5 +609,420 @@ final class DeterministicRuleResolverTest extends TestCase {
 		}
 
 		return $cases;
+	}
+
+	// =========================================================================
+	// Section 1: Database Failure & Repository Error Tests
+	// =========================================================================
+
+	public function test_repository_read_failure_does_not_become_fallback_and_preserves_cause(): void {
+		$context  = $this->create_standard_context( product_id: 42, customer_id: 10 );
+		$bad_repo = $this->createMock( \Tierza\Domain\Repositories\RuleRepositoryInterface::class );
+		$db_error = new DatabaseQueryException( 'Database query failed while retrieving active rules for targets.' );
+		$bad_repo->method( 'find_active_for_targets' )->willThrowException( $db_error );
+
+		$resolver = new DeterministicRuleResolver( $bad_repo, $this->group_repo );
+
+		$this->expectException( RuleResolutionException::class );
+		$this->expectExceptionMessage( 'Repository failure while querying pricing rules' );
+
+		try {
+			$resolver->resolve( $context );
+		} catch ( RuleResolutionException $e ) {
+			$this->assertSame( $db_error, $e->getPrevious() );
+			throw $e;
+		}
+	}
+
+	public function test_successful_empty_query_returns_clean_fallback(): void {
+		$context = $this->create_standard_context( product_id: 42, customer_id: 10 );
+
+		// Repository contains 0 rules -> returns [] successfully without error
+		$result = $this->resolver->resolve( $context );
+
+		$this->assertTrue( $result->is_fallback() );
+		$this->assertSame( PrecedenceLevel::WOOCOMMERCE_FALLBACK, $result->precedence_level() );
+		$this->assertSame( PricingReasonCode::FALLBACK_NO_MATCHING_RULE->value, $result->reason_code() );
+	}
+
+	// =========================================================================
+	// Section 2: Group Verification & Active Assumptions Tests
+	// =========================================================================
+
+	public function test_numeric_group_id_without_trusted_entity_or_repository_throws_exception(): void {
+		// Context provides only a numeric group ID 5, but NO entity
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			group_id: 5 // Numeric only
+		);
+
+		// Resolver instantiated with NO group repository
+		$resolver = new DeterministicRuleResolver( $this->rule_repo, null );
+
+		$this->expectException( RuleResolutionException::class );
+		$this->expectExceptionMessage( 'Cannot verify group eligibility for group ID 5: neither a trusted PricingGroup entity in PricingContext nor a GroupRepositoryInterface was provided.' );
+
+		$resolver->resolve( $context );
+	}
+
+	public function test_active_valid_group_via_trusted_entity_succeeds(): void {
+		$group   = $this->create_active_group( 5 );
+		$context = $this->create_standard_context( product_id: 42, customer_id: 10, group: $group );
+
+		$group_rule = new PricingRule( RuleTarget::group( 5 ), RuleScope::product( 42 ), PricingValue::percentage( '20.000000' ) );
+		$this->rule_repo->save( $group_rule );
+
+		// Resolver does not even need group repo because entity is explicitly trusted in context
+		$resolver = new DeterministicRuleResolver( $this->rule_repo, null );
+		$result   = $resolver->resolve( $context );
+
+		$this->assertFalse( $result->is_fallback() );
+		$this->assertSame( PrecedenceLevel::GROUP_PRODUCT, $result->precedence_level() );
+	}
+
+	public function test_active_valid_group_via_repository_lookup_succeeds(): void {
+		$this->group_repo->save( new PricingGroup( 'Active Group', 'active-grp', 8, '', GroupStatus::ACTIVE ) );
+
+		// Context has ONLY group_id = 8, no entity
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			group_id: 8
+		);
+
+		$group_rule = new PricingRule( RuleTarget::group( 8 ), RuleScope::product( 42 ), PricingValue::percentage( '20.000000' ) );
+		$this->rule_repo->save( $group_rule );
+
+		$result = $this->resolver->resolve( $context );
+
+		$this->assertFalse( $result->is_fallback() );
+		$this->assertSame( PrecedenceLevel::GROUP_PRODUCT, $result->precedence_level() );
+	}
+
+	public function test_inactive_group_via_repository_lookup_does_not_contribute_group_rules(): void {
+		$this->group_repo->save( new PricingGroup( 'Inactive Group', 'inactive-grp', 9, '', GroupStatus::INACTIVE ) );
+
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			group_id: 9
+		);
+
+		$group_rule = new PricingRule( RuleTarget::group( 9 ), RuleScope::product( 42 ), PricingValue::percentage( '20.000000' ) );
+		$this->rule_repo->save( $group_rule );
+
+		$result = $this->resolver->resolve( $context );
+
+		$this->assertTrue( $result->is_fallback() );
+	}
+
+	public function test_group_repository_failure_wraps_in_rule_resolution_exception_with_cause(): void {
+		$bad_group_repo = $this->createMock( \Tierza\Domain\Repositories\GroupRepositoryInterface::class );
+		$db_error       = new DatabaseQueryException( 'Database query failed while retrieving pricing group by ID.' );
+		$bad_group_repo->method( 'find_by_id' )->willThrowException( $db_error );
+
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			group_id: 12
+		);
+
+		$resolver = new DeterministicRuleResolver( $this->rule_repo, $bad_group_repo );
+
+		$this->expectException( RuleResolutionException::class );
+		$this->expectExceptionMessage( 'Failed to verify referenced pricing group ID 12' );
+
+		try {
+			$resolver->resolve( $context );
+		} catch ( RuleResolutionException $e ) {
+			$this->assertSame( $db_error, $e->getPrevious() );
+			throw $e;
+		}
+	}
+
+	public function test_authenticated_customer_with_inactive_group_still_matches_customer_rule(): void {
+		$inactive_group = $this->create_inactive_group( 7 );
+		$context        = $this->create_standard_context( product_id: 42, customer_id: 10, group: $inactive_group );
+
+		// Customer rule (Level 2) and Inactive Group rule (Level 6)
+		$customer_rule = new PricingRule( RuleTarget::user( 10 ), RuleScope::product( 42 ), PricingValue::percentage( '15.000000' ) );
+		$group_rule    = new PricingRule( RuleTarget::group( 7 ), RuleScope::product( 42 ), PricingValue::percentage( '35.000000' ) );
+
+		$this->rule_repo->save( $customer_rule );
+		$this->rule_repo->save( $group_rule );
+
+		$result = $this->resolver->resolve( $context );
+
+		// Customer rule must match and win; inactive group rule is completely omitted
+		$this->assertFalse( $result->is_fallback() );
+		$this->assertSame( PrecedenceLevel::CUSTOMER_PRODUCT, $result->precedence_level() );
+		$this->assertSame( '15.000000', $result->rule()->pricing_value()->value() );
+	}
+
+	public function test_anonymous_customer_without_group_executes_zero_queries_and_returns_fallback(): void {
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 0 // Guest
+		);
+
+		$mock_repo = $this->createMock( \Tierza\Domain\Repositories\RuleRepositoryInterface::class );
+		$mock_repo->expects( $this->never() )->method( 'find_active_for_targets' );
+
+		$resolver = new DeterministicRuleResolver( $mock_repo, $this->group_repo );
+		$result   = $resolver->resolve( $context );
+
+		$this->assertTrue( $result->is_fallback() );
+		$this->assertSame( PricingReasonCode::FALLBACK_ANONYMOUS_NO_RULE->value, $result->reason_code() );
+	}
+
+	public function test_anonymous_customer_with_verified_public_group_matches_group_rule(): void {
+		$public_group = $this->create_active_group( 3 );
+		$context      = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 0, // Guest
+			group: $public_group
+		);
+
+		$group_rule = new PricingRule( RuleTarget::group( 3 ), RuleScope::product( 42 ), PricingValue::percentage( '10.000000' ) );
+		$this->rule_repo->save( $group_rule );
+
+		$result = $this->resolver->resolve( $context );
+
+		$this->assertFalse( $result->is_fallback() );
+		$this->assertSame( PrecedenceLevel::GROUP_PRODUCT, $result->precedence_level() );
+		$this->assertSame( '10.000000', $result->rule()->pricing_value()->value() );
+	}
+
+	// =========================================================================
+	// Section 3: Deterministic Category-Depth Validation Tests
+	// =========================================================================
+
+	public function test_competing_categories_with_completely_missing_depth_map_throws_exception(): void {
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			category_ids: [ 10, 20 ],
+			category_depths: [] // Completely empty depth map!
+		);
+
+		$rule10 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 10 ), PricingValue::percentage( '10.000000' ) );
+		$rule20 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 20 ), PricingValue::percentage( '20.000000' ) );
+		$this->rule_repo->save( $rule10 );
+		$this->rule_repo->save( $rule20 );
+
+		$this->expectException( RuleResolutionException::class );
+		$this->expectExceptionMessage( 'missing category-depth metadata for category ID 10 in pricing context.' );
+
+		$this->resolver->resolve( $context );
+	}
+
+	public function test_competing_categories_with_partial_depth_data_throws_exception(): void {
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			category_ids: [ 10, 20 ],
+			category_depths: [ 10 => 1 ] // 20 is missing!
+		);
+
+		$rule10 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 10 ), PricingValue::percentage( '10.000000' ) );
+		$rule20 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 20 ), PricingValue::percentage( '20.000000' ) );
+		$this->rule_repo->save( $rule10 );
+		$this->rule_repo->save( $rule20 );
+
+		$this->expectException( RuleResolutionException::class );
+		$this->expectExceptionMessage( 'missing category-depth metadata for category ID 20 in pricing context.' );
+
+		$this->resolver->resolve( $context );
+	}
+
+	public function test_competing_categories_at_valid_depth_zero_are_preserved_and_resolved_by_discount(): void {
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			category_ids: [ 10, 20 ],
+			category_depths: [ 10 => 0, 20 => 0 ] // Both at valid root depth 0
+		);
+
+		$rule10 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 10 ), PricingValue::percentage( '15.000000' ) );
+		$rule20 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 20 ), PricingValue::percentage( '30.000000' ) );
+		$this->rule_repo->save( $rule10 );
+		$this->rule_repo->save( $rule20 );
+
+		$result = $this->resolver->resolve( $context );
+
+		// Equal depth 0 -> higher discount (30% > 15%) wins!
+		$this->assertSame( 20, $result->rule()->scope()->id() );
+		$this->assertSame( '30.000000', $result->rule()->pricing_value()->value() );
+	}
+
+	public function test_competing_categories_at_valid_depth_zero_with_equal_discount_resolved_by_smallest_id(): void {
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			category_ids: [ 10, 20 ],
+			category_depths: [ 10 => 0, 20 => 0 ]
+		);
+
+		$rule10 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 10 ), PricingValue::percentage( '20.000000' ) );
+		$rule20 = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 20 ), PricingValue::percentage( '20.000000' ) );
+		$this->rule_repo->save( $rule20 );
+		$this->rule_repo->save( $rule10 );
+
+		$result = $this->resolver->resolve( $context );
+
+		// Equal depth 0 and equal discount 20% -> smaller ID (10 < 20) wins!
+		$this->assertSame( 10, $result->rule()->scope()->id() );
+	}
+
+	public function test_parent_category_versus_child_category_depth_wins(): void {
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			category_ids: [ 5, 15 ],
+			category_depths: [ 5 => 1, 15 => 2 ] // 15 is child at depth 2
+		);
+
+		$rule_parent = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 5 ), PricingValue::percentage( '50.000000' ) );
+		$rule_child  = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 15 ), PricingValue::percentage( '10.000000' ) );
+		$this->rule_repo->save( $rule_parent );
+		$this->rule_repo->save( $rule_child );
+
+		$result = $this->resolver->resolve( $context );
+
+		// Child category at depth 2 wins over parent at depth 1, despite parent having 50% vs 10%
+		$this->assertSame( 15, $result->rule()->scope()->id() );
+		$this->assertSame( '10.000000', $result->rule()->pricing_value()->value() );
+	}
+
+	public function test_single_category_rule_without_depth_metadata_succeeds_without_error(): void {
+		// Single category match: no competing rules, depth comparison is not required
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			category_ids: [ 25 ],
+			category_depths: [] // No depth metadata provided
+		);
+
+		$single_rule = new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 25 ), PricingValue::percentage( '18.000000' ) );
+		$this->rule_repo->save( $single_rule );
+
+		$result = $this->resolver->resolve( $context );
+
+		$this->assertFalse( $result->is_fallback() );
+		$this->assertSame( PrecedenceLevel::CUSTOMER_CATEGORY, $result->precedence_level() );
+		$this->assertSame( 25, $result->rule()->scope()->id() );
+		$this->assertSame( '18.000000', $result->rule()->pricing_value()->value() );
+	}
+
+	public function test_randomized_repository_ordering_for_competing_categories(): void {
+		$context = new PricingContext(
+			product_id: 42,
+			base_price: Money::from( '100.00', 'USD' ),
+			customer_id: 10,
+			category_ids: [ 10, 20, 30, 40 ],
+			category_depths: [ 10 => 1, 20 => 2, 30 => 2, 40 => 3 ]
+		);
+
+		// Rule 40 at depth 3 is the clear expected winner
+		$rules = [
+			new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 10 ), PricingValue::percentage( '50.000000' ), 1 ),
+			new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 20 ), PricingValue::percentage( '20.000000' ), 2 ),
+			new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 30 ), PricingValue::percentage( '25.000000' ), 3 ),
+			new PricingRule( RuleTarget::user( 10 ), RuleScope::category( 40 ), PricingValue::percentage( '10.000000' ), 4 ),
+		];
+
+		for ( $i = 0; $i < 10; $i++ ) {
+			$shuffled = $rules;
+			shuffle( $shuffled );
+			$this->rule_repo->clear();
+			foreach ( $shuffled as $r ) {
+				$this->rule_repo->save( $r );
+			}
+
+			$result = $this->resolver->resolve( $context );
+			$this->assertSame( 40, $result->rule()->scope()->id() );
+		}
+	}
+
+	// =========================================================================
+	// Section 4: Related Invariants & Defensive Handling Tests
+	// =========================================================================
+
+	public function test_corrupted_inactive_rule_from_repository_throws_exception(): void {
+		$context = $this->create_standard_context( product_id: 42, customer_id: 10 );
+
+		// Simulate a rogue repository returning an inactive rule
+		$inactive_rule = new PricingRule(
+			RuleTarget::user( 10 ),
+			RuleScope::product( 42 ),
+			PricingValue::percentage( '20.000000' ),
+			1,
+			RuleStatus::INACTIVE
+		);
+
+		$rogue_repo = $this->createMock( \Tierza\Domain\Repositories\RuleRepositoryInterface::class );
+		$rogue_repo->method( 'find_active_for_targets' )->willReturn( [ $inactive_rule ] );
+
+		$resolver = new DeterministicRuleResolver( $rogue_repo, $this->group_repo );
+
+		$this->expectException( RuleResolutionException::class );
+		$this->expectExceptionMessage( 'Corrupted candidate rules: repository returned inactive rule ID 1.' );
+
+		$resolver->resolve( $context );
+	}
+
+	public function test_fixed_price_rule_at_category_scope_throws_exception(): void {
+		$context = $this->create_standard_context( product_id: 42, customer_id: 10, category_ids: [ 20 ], category_depths: [ 20 => 1 ] );
+
+		// Fixed-price rule on category scope (constructed via bypass)
+		$rule = new PricingRule(
+			RuleTarget::user( 10 ),
+			RuleScope::product( 42 ),
+			PricingValue::fixed( '50.000000' )
+		);
+		// Mutate scope to category via reflection to test defensive resolver validation
+		$ref   = new \ReflectionClass( $rule );
+		$scope = $ref->getProperty( 'scope' );
+		$scope->setAccessible( true );
+		$scope->setValue( $rule, RuleScope::category( 20 ) );
+
+		$this->rule_repo->save( $rule );
+
+		$this->expectException( RuleResolutionException::class );
+		$this->expectExceptionMessage( 'fixed-price rules are restricted to product or variation scopes' );
+
+		$this->resolver->resolve( $context );
+	}
+
+	public function test_stale_cached_group_entity_trust_boundary_documentation(): void {
+		// When a trusted PricingGroup entity is provided in PricingContext, the resolver
+		// treats it as the authoritative server-side snapshot for that calculation turn.
+		$group   = $this->create_active_group( 5 );
+		$context = $this->create_standard_context( product_id: 42, customer_id: 10, group: $group );
+
+		$this->assertSame( 5, $context->group()->id() );
+		$this->assertTrue( $context->group()->is_active() );
+
+		// The resolver does NOT perform a redundant DB query to re-fetch the group if the entity is present
+		$mock_group_repo = $this->createMock( \Tierza\Domain\Repositories\GroupRepositoryInterface::class );
+		$mock_group_repo->expects( $this->never() )->method( 'find_by_id' );
+
+		$resolver = new DeterministicRuleResolver( $this->rule_repo, $mock_group_repo );
+		$result   = $resolver->resolve( $context );
+
+		$this->assertTrue( $result->is_fallback() );
 	}
 }

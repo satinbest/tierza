@@ -14,6 +14,7 @@ use Tierza\Domain\ValueObjects\RuleScope;
 use Tierza\Domain\ValueObjects\RuleStatus;
 use Tierza\Domain\ValueObjects\RuleTarget;
 use Tierza\Infrastructure\Database\Schema;
+use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use Tierza\Infrastructure\Validation\EntityReferenceValidator;
 use wpdb;
 
@@ -93,7 +94,7 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 						)
 					);
 				}
-				throw new RuntimeException( sprintf( 'Failed to insert rule: %s', $last_error ) );
+				throw new DatabaseQueryException( 'Database execution failed while inserting pricing rule.' );
 			}
 
 			$insert_id = (int) $this->db->insert_id;
@@ -122,16 +123,21 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 		$last_error = $this->db->last_error;
 		$this->db->suppress_errors( $suppress );
 
-		if ( false === $updated && ! empty( $last_error ) && preg_match( '/uq_active_rule|duplicate/i', $last_error ) ) {
-			throw new DuplicateRuleException(
-				sprintf(
-					'Concurrent active rule conflict detected on update for target %s:%d and scope %s:%d.',
-					$rule->target()->type(),
-					$rule->target()->id(),
-					$rule->scope()->type(),
-					$rule->scope()->id()
-				)
-			);
+		if ( false === $updated ) {
+			if ( ! empty( $last_error ) && preg_match( '/uq_active_rule|duplicate/i', $last_error ) ) {
+				throw new DuplicateRuleException(
+					sprintf(
+						'Concurrent active rule conflict detected on update for target %s:%d and scope %s:%d.',
+						$rule->target()->type(),
+						$rule->target()->id(),
+						$rule->scope()->type(),
+						$rule->scope()->id()
+					)
+				);
+			}
+			if ( ! empty( $last_error ) ) {
+				throw new DatabaseQueryException( 'Database execution failed while updating pricing rule.' );
+			}
 		}
 
 		return $this->find_by_id( $rule_id ) ?? $rule;
@@ -146,6 +152,10 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			),
 			ARRAY_A
 		);
+
+		if ( ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while retrieving rule by ID.' );
+		}
 
 		if ( ! is_array( $row ) ) {
 			return null;
@@ -166,8 +176,8 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			ARRAY_A
 		);
 
-		if ( ! is_array( $rows ) ) {
-			return [];
+		if ( ! empty( $this->db->last_error ) || ! is_array( $rows ) ) {
+			throw new DatabaseQueryException( 'Database query failed while retrieving active rules by target.' );
 		}
 
 		return array_map( [ $this, 'hydrate' ], $rows );
@@ -199,8 +209,8 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 		$rows = $this->db->get_results( $sql, ARRAY_A );
 
-		if ( ! is_array( $rows ) ) {
-			return [];
+		if ( ! empty( $this->db->last_error ) || ! is_array( $rows ) ) {
+			throw new DatabaseQueryException( 'Database query failed while retrieving active rules for targets.' );
 		}
 
 		return array_map( [ $this, 'hydrate' ], $rows );
@@ -218,8 +228,8 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			ARRAY_A
 		);
 
-		if ( ! is_array( $rows ) ) {
-			return [];
+		if ( ! empty( $this->db->last_error ) || ! is_array( $rows ) ) {
+			throw new DatabaseQueryException( 'Database query failed while retrieving active rules by scope.' );
 		}
 
 		return array_map( [ $this, 'hydrate' ], $rows );
@@ -259,6 +269,10 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 				),
 				ARRAY_A
 			);
+		}
+
+		if ( ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while checking for conflicting active rules.' );
 		}
 
 		if ( ! is_array( $row ) ) {
@@ -318,8 +332,8 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 		$rows = $this->db->get_results( $prepared, ARRAY_A );
 
-		if ( ! is_array( $rows ) ) {
-			return [];
+		if ( ! empty( $this->db->last_error ) || ! is_array( $rows ) ) {
+			throw new DatabaseQueryException( 'Database query failed while listing rules.' );
 		}
 
 		return array_map( [ $this, 'hydrate' ], $rows );
@@ -375,6 +389,10 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			$count = $this->db->get_var( $query_sql );
 		}
 
+		if ( ! empty( $this->db->last_error ) || false === $count || null === $count ) {
+			throw new DatabaseQueryException( 'Database query failed while counting rules.' );
+		}
+
 		return (int) $count;
 	}
 
@@ -384,6 +402,10 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			[ 'id' => $id ],
 			[ '%d' ]
 		);
+
+		if ( false === $deleted && ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while deleting rule.' );
+		}
 
 		return false !== $deleted && $deleted > 0;
 	}

@@ -55,3 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Complete 53-test resolver unit test suite including 28-pair precedence matrix and 50-iteration randomized order invariance tests (TRZ-006).
 - Live MariaDB resolver integration tests verifying end-to-end repository queries, category taxonomy matching, and query counts (TRZ-006).
 - Comprehensive Rule Resolver architecture document (`docs/architecture/rule-resolver.md`) (TRZ-006).
+- Hardened database read failure handling with `DatabaseQueryException` ensuring failed SQL queries never silently produce fallback prices (TRZ-006).
+- Enforced fail-closed group eligibility policy requiring trusted entities or repository verification rather than assuming active status (TRZ-006).
+- Enforced strict category-depth metadata validation for competing category rules, preserving valid depth zero (TRZ-006).
+- Expanded PHPUnit test suite to 288 tests with 1,215 assertions and live MariaDB test suite to 37 tests with 228 assertions (TRZ-006).

@@ -31,3 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardened schema verification verifying index uniqueness and exact column sequences (TRZ-004).
 - Entity reference validation (`EntityReferenceValidator`) verifying users, groups, products, variations, and categories (TRZ-004).
 - 31 live database integration and legacy upgrade tests executed on WordPress & MariaDB Docker environment (TRZ-004).
+- Strongly typed immutable PricingContext representing customer, group, product, variation, category hierarchy, quantity, and store currency outside WP globals (TRZ-005).
+- Deterministic arbitrary-precision decimal monetary value objects (Money and DecimalMath) with 6-decimal internal scale and pure-PHP fallback (TRZ-005).
+- Rule resolver domain interface (RuleResolverInterface) with strict 9-level precedence hierarchy and deterministic category tie-breaking specification (TRZ-005).
+- Authoritative price calculation contract (PriceCalculatorInterface) supporting percentage discounts and fixed pricing (TRZ-005).
+- Immutable PricingResult domain contract with machine-readable reason codes, explicit 0% rule vs no-rule distinction, and safe audit metadata (TRZ-005).
+- Comprehensive pricing architecture specification (docs/architecture/pricing-contracts.md) (TRZ-005).
+- 45 new unit tests bringing PHPUnit suite to 136 tests with 641 assertions passing at 100% (TRZ-005).

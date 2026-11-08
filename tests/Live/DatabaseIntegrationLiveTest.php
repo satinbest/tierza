@@ -15,6 +15,7 @@ use wpdb;
 use Throwable;
 use RuntimeException;
 
+use Tierza\Application\Pricing\DeterministicRuleResolver;
 use Tierza\Domain\Entities\PricingGroup;
 use Tierza\Domain\Entities\PricingRule;
 use Tierza\Domain\Exceptions\DuplicateRuleException;
@@ -22,7 +23,14 @@ use Tierza\Domain\Exceptions\DuplicateSlugException;
 use Tierza\Domain\Exceptions\GroupDeletionSafeguardException;
 use Tierza\Domain\Exceptions\InvalidAssignmentException;
 use Tierza\Domain\Exceptions\InvalidRuleException;
+use Tierza\Domain\Exceptions\RuleResolutionException;
 use Tierza\Domain\Exceptions\SchemaMigrationException;
+use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
+use Tierza\Domain\Pricing\Enums\PrecedenceLevel;
+use Tierza\Domain\Pricing\Enums\PricingReasonCode;
+use Tierza\Domain\Pricing\Enums\PricingSource;
+use Tierza\Domain\Pricing\PricingContext;
+use Tierza\Domain\ValueObjects\Money;
 use Tierza\Domain\ValueObjects\GroupSlug;
 use Tierza\Domain\ValueObjects\GroupStatus;
 use Tierza\Domain\ValueObjects\PricingValue;
@@ -97,6 +105,12 @@ class DatabaseIntegrationLiveTest {
 			'test_legacy_upgrade_repeated_after_successful_backfill_is_idempotent',
 			'test_legacy_upgrade_existing_rule_ids_values_and_timestamps_preserved',
 			'test_legacy_upgrade_new_uniqueness_constraint_rejects_concurrent_duplicates',
+			'test_rule_resolver_real_stored_rules_in_mariadb',
+			'test_rule_resolver_category_hierarchy_in_mariadb',
+			'test_rule_resolver_explicit_zero_and_inactive_rules_in_mariadb',
+			'test_rule_resolver_real_database_read_failure_produces_exception_not_fallback',
+			'test_rule_resolver_query_counts_on_real_mariadb',
+			'test_rule_resolver_benchmark_fixtures_and_execution_time',
 		];
 
 		foreach ( $methods as $method ) {
@@ -1173,6 +1187,346 @@ class DatabaseIntegrationLiveTest {
 		// Restore clean 1.0.0 schema at end of upgrade tests.
 		Schema::install( $this->db );
 		$this->clean_tables();
+	}
+
+	public function test_rule_resolver_real_stored_rules_in_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Live Resolver Group', 'live-resolver-group' ) );
+		$group_id = (int) $group->id();
+
+		// Create mock product and variation
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'Live Product', 'post_type' => 'product', 'post_status' => 'publish' ] );
+		$product_id = (int) $this->db->insert_id;
+
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'Live Variation', 'post_type' => 'product_variation', 'post_status' => 'publish', 'post_parent' => $product_id ] );
+		$variation_id = (int) $this->db->insert_id;
+
+		$customer_id = 1; // existing admin user
+
+		$rule1 = $this->rule_repo->save( new PricingRule( RuleTarget::group( $group_id ), RuleScope::product( $product_id ), PricingValue::percentage( '15.000000' ) ) );
+		$rule2 = $this->rule_repo->save( new PricingRule( RuleTarget::user( $customer_id ), RuleScope::variation( $variation_id ), PricingValue::percentage( '25.000000' ) ) );
+
+		try {
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+			$context  = new PricingContext(
+				product_id: $product_id,
+				base_price: Money::from( '200.00', 'USD' ),
+				customer_id: $customer_id,
+				group: $group,
+				variation_id: $variation_id
+			);
+
+			$result = $resolver->resolve( $context );
+
+			$this->assert( ! $result->is_fallback(), 'Result must not be fallback.' );
+			$this->assert( PrecedenceLevel::CUSTOMER_VARIATION === $result->precedence_level(), 'Customer variation must win over group product.' );
+			$this->assert( $rule2->id() === $result->rule()->id(), 'Winning rule ID must match customer variation rule.' );
+			$this->assert( '25.000000' === $result->rule()->pricing_value()->value(), 'Winning percentage must be 25%.' );
+		} finally {
+			$this->rule_repo->delete( (int) $rule1->id() );
+			$this->rule_repo->delete( (int) $rule2->id() );
+			$this->group_repo->delete( $group_id );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $variation_id ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $product_id ] );
+		}
+	}
+
+	public function test_rule_resolver_category_hierarchy_in_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Live Category Group', 'live-cat-group' ) );
+		$group_id = (int) $group->id();
+
+		// Mock categories
+		$this->db->insert( $this->db->prefix . 'terms', [ 'name' => 'Parent Cat', 'slug' => 'parent-cat-live' ] );
+		$parent_cat_id = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $parent_cat_id, 'taxonomy' => 'product_cat', 'count' => 1 ] );
+
+		$this->db->insert( $this->db->prefix . 'terms', [ 'name' => 'Child Cat', 'slug' => 'child-cat-live' ] );
+		$child_cat_id = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $child_cat_id, 'taxonomy' => 'product_cat', 'parent' => $parent_cat_id, 'count' => 1 ] );
+
+		// Parent rule (depth 1, 50% discount) vs Child rule (depth 2, 10% discount)
+		$rule_parent = $this->rule_repo->save( new PricingRule( RuleTarget::group( $group_id ), RuleScope::category( $parent_cat_id ), PricingValue::percentage( '50.000000' ) ) );
+		$rule_child  = $this->rule_repo->save( new PricingRule( RuleTarget::group( $group_id ), RuleScope::category( $child_cat_id ), PricingValue::percentage( '10.000000' ) ) );
+
+		try {
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+			$context  = new PricingContext(
+				product_id: 10,
+				base_price: Money::from( '100.00', 'USD' ),
+				customer_id: 0,
+				group: $group,
+				category_ids: [ $parent_cat_id, $child_cat_id ],
+				category_depths: [ $parent_cat_id => 1, $child_cat_id => 2 ]
+			);
+
+			$result = $resolver->resolve( $context );
+
+			$this->assert( PrecedenceLevel::GROUP_CATEGORY === $result->precedence_level(), 'Group category must be resolved.' );
+			$this->assert( $rule_child->id() === $result->rule()->id(), 'Child category rule at depth 2 must win over parent at depth 1.' );
+			$this->assert( '10.000000' === $result->rule()->pricing_value()->value(), 'Winning discount must be child discount.' );
+		} finally {
+			$this->rule_repo->delete( (int) $rule_parent->id() );
+			$this->rule_repo->delete( (int) $rule_child->id() );
+			$this->group_repo->delete( $group_id );
+			$this->db->delete( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $child_cat_id ] );
+			$this->db->delete( $this->db->prefix . 'terms', [ 'term_id' => $child_cat_id ] );
+			$this->db->delete( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $parent_cat_id ] );
+			$this->db->delete( $this->db->prefix . 'terms', [ 'term_id' => $parent_cat_id ] );
+		}
+	}
+
+	public function test_rule_resolver_explicit_zero_and_inactive_rules_in_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Live Zero Group', 'live-zero-group' ) );
+		$group_id = (int) $group->id();
+
+		// Inactive 50% rule
+		$inactive_rule = new PricingRule(
+			RuleTarget::group( $group_id ),
+			RuleScope::global(),
+			PricingValue::percentage( '50.000000' ),
+			null,
+			RuleStatus::INACTIVE
+		);
+		$saved_inactive = $this->rule_repo->save( $inactive_rule );
+
+		// Active explicit 0% rule for user 1
+		$zero_rule = new PricingRule(
+			RuleTarget::user( 1 ),
+			RuleScope::global(),
+			PricingValue::percentage( '0.000000' )
+		);
+		$saved_zero = $this->rule_repo->save( $zero_rule );
+
+		try {
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+			$context  = new PricingContext(
+				product_id: 10,
+				base_price: Money::from( '100.00', 'USD' ),
+				customer_id: 1,
+				group: $group
+			);
+
+			$result = $resolver->resolve( $context );
+
+			$this->assert( PrecedenceLevel::CUSTOMER_GLOBAL === $result->precedence_level(), 'Customer global must win.' );
+			$this->assert( '0.000000' === $result->rule()->pricing_value()->value(), 'Explicit 0% rule must be winning value.' );
+			$this->assert( PricingReasonCode::RULE_APPLIED_ZERO_PERCENTAGE->value === $result->reason_code(), 'Reason code must indicate zero percentage applied.' );
+		} finally {
+			$this->rule_repo->delete( (int) $saved_inactive->id() );
+			$this->rule_repo->delete( (int) $saved_zero->id() );
+			$this->group_repo->delete( $group_id );
+		}
+	}
+
+	public function test_rule_resolver_real_database_read_failure_produces_exception_not_fallback(): void {
+		// Create a repository pointing to a non-existent table to trigger real SQL error in MariaDB
+		$broken_repo = new WpRuleRepository( $this->db );
+		$ref         = new \ReflectionClass( $broken_repo );
+		$prop        = $ref->getProperty( 'table_rules' );
+		$prop->setAccessible( true );
+		$prop->setValue( $broken_repo, $this->db->prefix . 'tierza_nonexistent_table' );
+
+		// 1. Direct repo call must throw DatabaseQueryException (not return [])
+		$caught_db_exception = false;
+		$suppress            = $this->db->suppress_errors( true );
+		try {
+			$broken_repo->find_active_for_targets( [ RuleTarget::user( 1 ) ] );
+		} catch ( DatabaseQueryException $e ) {
+			$caught_db_exception = true;
+			$this->assert( str_contains( $e->getMessage(), 'Database query failed' ), 'Exception message must be sanitized.' );
+		} finally {
+			$this->db->suppress_errors( $suppress );
+		}
+		$this->assert( $caught_db_exception, 'Intentionally broken query must throw DatabaseQueryException on real MariaDB.' );
+
+		// 2. Resolver must translate this to RuleResolutionException (not silently return fallback)
+		$resolver = new DeterministicRuleResolver( $broken_repo, $this->group_repo );
+		$context  = new PricingContext( product_id: 10, base_price: Money::from( '100.00', 'USD' ), customer_id: 1 );
+
+		$caught_resolution_exception = false;
+		$suppress                    = $this->db->suppress_errors( true );
+		try {
+			$resolver->resolve( $context );
+		} catch ( RuleResolutionException $e ) {
+			$caught_resolution_exception = true;
+			$this->assert( $e->getPrevious() instanceof DatabaseQueryException, 'Causal chain must preserve DatabaseQueryException.' );
+		} finally {
+			$this->db->suppress_errors( $suppress );
+		}
+		$this->assert( $caught_resolution_exception, 'Resolver must not convert database read failure into fallback.' );
+
+		// 3. In contrast, a clean query finding 0 rules must return valid fallback
+		$clean_resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+		$clean_result   = $clean_resolver->resolve( $context );
+		$this->assert( $clean_result->is_fallback(), 'Empty results from valid table must return clean fallback.' );
+		$this->assert( PrecedenceLevel::WOOCOMMERCE_FALLBACK === $clean_result->precedence_level(), 'Must return WOOCOMMERCE_FALLBACK.' );
+	}
+
+	public function test_rule_resolver_query_counts_on_real_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Query Count Group', 'query-count-group' ) );
+		$group_id = (int) $group->id();
+
+		$rule = $this->rule_repo->save( new PricingRule( RuleTarget::group( $group_id ), RuleScope::global(), PricingValue::percentage( '10.000000' ) ) );
+
+		try {
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+
+			// Scenario 1: Anonymous user without group -> exactly 0 queries!
+			$anon_context = new PricingContext( product_id: 10, base_price: Money::from( '100.00', 'USD' ), customer_id: 0 );
+			$q_before     = $this->db->num_queries;
+			$anon_res     = $resolver->resolve( $anon_context );
+			$q_after      = $this->db->num_queries;
+			$this->assert( 0 === ( $q_after - $q_before ), 'Anonymous user without group must execute 0 DB queries.' );
+			$this->assert( $anon_res->is_fallback(), 'Anonymous user must fallback.' );
+
+			// Scenario 2: Authenticated user with trusted group entity attached -> exactly 1 query!
+			$auth_context = new PricingContext( product_id: 10, base_price: Money::from( '100.00', 'USD' ), customer_id: 1, group: $group );
+			$q_before     = $this->db->num_queries;
+			$auth_res     = $resolver->resolve( $auth_context );
+			$q_after      = $this->db->num_queries;
+			$this->assert( 1 === ( $q_after - $q_before ), 'Authenticated user with trusted group entity must execute exactly 1 DB query.' );
+			$this->assert( ! $auth_res->is_fallback(), 'Authenticated user with group must match rule.' );
+
+			// Scenario 3: Authenticated user with numeric group_id only -> exactly 2 queries (1 group verify + 1 rule lookup)!
+			$numeric_context = new PricingContext( product_id: 10, base_price: Money::from( '100.00', 'USD' ), customer_id: 1, group_id: $group_id );
+			$q_before        = $this->db->num_queries;
+			$num_res         = $resolver->resolve( $numeric_context );
+			$q_after         = $this->db->num_queries;
+			$this->assert( 2 === ( $q_after - $q_before ), 'Authenticated user with numeric group ID must execute 2 DB queries (1 group verification + 1 rule lookup).' );
+			$this->assert( ! $num_res->is_fallback(), 'Must resolve rule.' );
+
+			// Scenario 4: Product listing across 10 products with trusted group entity -> exactly 10 rule queries (0 group queries)!
+			$q_before = $this->db->num_queries;
+			for ( $pid = 1; $pid <= 10; $pid++ ) {
+				$item_context = new PricingContext( product_id: $pid, base_price: Money::from( '50.00', 'USD' ), customer_id: 1, group: $group );
+				$resolver->resolve( $item_context );
+			}
+			$q_after = $this->db->num_queries;
+			$this->assert( 10 === ( $q_after - $q_before ), 'Product listing of 10 items with trusted group entity must execute exactly 10 rule queries (1 per product, 0 group queries).' );
+		} finally {
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->group_repo->delete( $group_id );
+		}
+	}
+
+	public function test_rule_resolver_benchmark_fixtures_and_execution_time(): void {
+		$table_rules  = Schema::rules_table( $this->db );
+		$table_groups = Schema::groups_table( $this->db );
+		$now          = current_time( 'mysql', true );
+
+		// 1. Seed 10 groups
+		$group_ids = [];
+		for ( $g = 1; $g <= 10; $g++ ) {
+			$this->db->insert(
+				$table_groups,
+				[
+					'name'       => "Benchmark Group {$g}",
+					'slug'       => "benchmark-group-{$g}",
+					'status'     => 'active',
+					'sort_order' => $g,
+					'created_at' => $now,
+					'updated_at' => $now,
+				]
+			);
+			$group_ids[] = (int) $this->db->insert_id;
+		}
+
+		// 2. Seed 100 products
+		$product_ids = [];
+		for ( $p = 1; $p <= 100; $p++ ) {
+			$this->db->insert(
+				$this->db->prefix . 'posts',
+				[
+					'post_title'  => "Benchmark Product {$p}",
+					'post_type'   => 'product',
+					'post_status' => 'publish',
+				]
+			);
+			$product_ids[] = (int) $this->db->insert_id;
+		}
+
+		// 3. Seed 500 rules in 5 chunks of 100
+		for ( $chunk = 0; $chunk < 5; $chunk++ ) {
+			$rule_placeholders = [];
+			$rule_values       = [];
+			for ( $k = 1; $k <= 100; $k++ ) {
+				$r            = $chunk * 100 + $k;
+				$target_group = $group_ids[ ( $r - 1 ) % 10 ];
+				if ( $r <= 10 ) {
+					$scope_type = 'global';
+					$scope_id   = 0;
+				} elseif ( $r <= 110 ) {
+					$scope_type = 'product';
+					$scope_id   = $product_ids[ $r - 11 ];
+				} else {
+					$scope_type = 'product';
+					$scope_id   = $product_ids[ ( $r - 1 ) % 100 ];
+				}
+
+				if ( $r > 110 ) {
+					$status              = 'inactive';
+					$rule_placeholders[] = '(%s, %d, %s, %d, %s, %s, %s, NULL, %s, %s)';
+					$rule_values[]       = 'group';
+					$rule_values[]       = $target_group;
+					$rule_values[]       = $scope_type;
+					$rule_values[]       = $scope_id;
+					$rule_values[]       = 'percentage';
+					$rule_values[]       = sprintf( '%02d.000000', ( $r % 50 ) + 1 );
+					$rule_values[]       = $status;
+					$rule_values[]       = $now;
+					$rule_values[]       = $now;
+				} else {
+					$status              = 'active';
+					$active_key          = sprintf( 'group:%d|%s:%d', $target_group, $scope_type, $scope_id );
+					$rule_placeholders[] = '(%s, %d, %s, %d, %s, %s, %s, %s, %s, %s)';
+					$rule_values[]       = 'group';
+					$rule_values[]       = $target_group;
+					$rule_values[]       = $scope_type;
+					$rule_values[]       = $scope_id;
+					$rule_values[]       = 'percentage';
+					$rule_values[]       = sprintf( '%02d.000000', ( $r % 50 ) + 1 );
+					$rule_values[]       = $status;
+					$rule_values[]       = $active_key;
+					$rule_values[]       = $now;
+					$rule_values[]       = $now;
+				}
+			}
+			$sql = "INSERT INTO {$table_rules} (target_type, target_id, scope_type, scope_id, pricing_type, value, status, active_key, created_at, updated_at) VALUES " . implode( ', ', $rule_placeholders );
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+			$res = $this->db->query( $this->db->prepare( $sql, ...$rule_values ) );
+			$this->assert( false !== $res, 'Seeding rules batch must succeed: ' . $this->db->last_error );
+		}
+
+		try {
+			$resolver      = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+			$trusted_group = $this->group_repo->find_by_id( $group_ids[0] );
+			$this->assert( null !== $trusted_group, 'Trusted group must exist.' );
+
+			// Benchmark resolution over 100 products
+			$start_time = microtime( true );
+			$q_before   = $this->db->num_queries;
+
+			for ( $i = 0; $i < 100; $i++ ) {
+				$context = new PricingContext(
+					product_id: $product_ids[ $i ],
+					base_price: Money::from( '100.00', 'USD' ),
+					customer_id: 1,
+					group: $trusted_group
+				);
+				$res = $resolver->resolve( $context );
+				$this->assert( ! $res->is_fallback(), 'Resolved rule must match.' );
+			}
+
+			$elapsed_ms    = ( microtime( true ) - $start_time ) * 1000;
+			$total_queries = $this->db->num_queries - $q_before;
+
+			$this->assert( 100 === $total_queries, 'Listing resolution of 100 products with trusted group must execute 100 rule queries.' );
+			$this->assert( $elapsed_ms < 5000, '100 product resolutions against 500 rules should complete comfortably in < 5000ms.' );
+		} finally {
+			// Clean up benchmark data
+			$this->db->query( "DELETE FROM {$table_rules} WHERE target_type = 'group' AND target_id IN (" . implode( ',', $group_ids ) . ')' );
+			$this->db->query( "DELETE FROM {$table_groups} WHERE id IN (" . implode( ',', $group_ids ) . ')' );
+			$this->db->query( "DELETE FROM {$this->db->prefix}posts WHERE ID IN (" . implode( ',', $product_ids ) . ')' );
+		}
 	}
 }
 

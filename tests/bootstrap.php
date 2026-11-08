@@ -154,6 +154,14 @@ if ( ! function_exists( 'get_option' ) ) {
 	}
 }
 
+if ( ! function_exists( 'delete_option' ) ) {
+	function delete_option( string $option ): bool {
+		global $wp_options;
+		unset( $wp_options[ $option ] );
+		return true;
+	}
+}
+
 if ( ! function_exists( '__' ) ) {
 	function __( string $text, string $domain = 'default' ): string {
 		return $text;
@@ -181,6 +189,199 @@ if ( ! function_exists( 'esc_html' ) ) {
 if ( ! function_exists( 'wp_die' ) ) {
 	function wp_die( string $message = '', string $title = '', $args = [] ): void {
 		throw new RuntimeException( "wp_die: $message" );
+	}
+}
+
+if ( ! defined( 'ARRAY_A' ) ) {
+	define( 'ARRAY_A', 'ARRAY_A' );
+}
+
+if ( ! class_exists( 'WP_User' ) ) {
+	class WP_User {
+		public int $ID = 0;
+
+		public function exists(): bool {
+			return $this->ID > 0;
+		}
+	}
+}
+
+if ( ! class_exists( 'wpdb' ) ) {
+	class wpdb {
+		public string $prefix = 'wp_';
+		public int $insert_id = 0;
+		public string $last_error = '';
+
+		public function get_charset_collate(): string {
+			return 'DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_520_ci';
+		}
+
+		/**
+		 * @param string $query
+		 * @param mixed ...$args
+		 */
+		public function prepare( string $query, ...$args ): string {
+			foreach ( $args as $arg ) {
+				$val   = is_string( $arg ) ? "'" . addslashes( $arg ) . "'" : (string) $arg;
+				$query = preg_replace( '/%[sddfF]/', $val, $query, 1 ) ?? $query;
+			}
+			return $query;
+		}
+
+		public function get_var( ?string $query = null ): mixed {
+			if ( null !== $query && str_contains( $query, 'SHOW TABLES LIKE' ) ) {
+				if ( preg_match( "/'([^']+)'/", $query, $matches ) ) {
+					return $matches[1];
+				}
+			}
+			return null;
+		}
+
+		/**
+		 * @return mixed
+		 */
+		public function get_row( ?string $query = null, string $output = ARRAY_A ): mixed {
+			return null;
+		}
+
+		/**
+		 * @return mixed
+		 */
+		public function get_results( ?string $query = null, string $output = ARRAY_A ): mixed {
+			if ( null !== $query && str_contains( $query, 'SHOW FULL COLUMNS' ) ) {
+				if ( str_contains( $query, 'tierza_groups' ) ) {
+					return [
+						[ 'Field' => 'id' ],
+						[ 'Field' => 'name' ],
+						[ 'Field' => 'slug' ],
+						[ 'Field' => 'description' ],
+						[ 'Field' => 'status' ],
+						[ 'Field' => 'sort_order' ],
+						[ 'Field' => 'created_at' ],
+						[ 'Field' => 'updated_at' ],
+					];
+				}
+				if ( str_contains( $query, 'tierza_rules' ) ) {
+					return [
+						[ 'Field' => 'id' ],
+						[ 'Field' => 'target_type' ],
+						[ 'Field' => 'target_id' ],
+						[ 'Field' => 'scope_type' ],
+						[ 'Field' => 'scope_id' ],
+						[ 'Field' => 'pricing_type' ],
+						[ 'Field' => 'value' ],
+						[ 'Field' => 'status' ],
+						[ 'Field' => 'active_key' ],
+						[ 'Field' => 'created_at' ],
+						[ 'Field' => 'updated_at' ],
+					];
+				}
+				if ( str_contains( $query, 'tierza_user_groups' ) ) {
+					return [
+						[ 'Field' => 'id' ],
+						[ 'Field' => 'user_id' ],
+						[ 'Field' => 'group_id' ],
+						[ 'Field' => 'created_at' ],
+						[ 'Field' => 'updated_at' ],
+					];
+				}
+			}
+
+			if ( null !== $query && str_contains( $query, 'SHOW INDEX' ) ) {
+				if ( str_contains( $query, 'tierza_groups' ) ) {
+					return [
+						[ 'Key_name' => 'PRIMARY', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'id' ],
+						[ 'Key_name' => 'uq_slug', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'slug' ],
+						[ 'Key_name' => 'idx_status_sort', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'status' ],
+						[ 'Key_name' => 'idx_status_sort', 'Non_unique' => 1, 'Seq_in_index' => 2, 'Column_name' => 'sort_order' ],
+					];
+				}
+				if ( str_contains( $query, 'tierza_rules' ) ) {
+					return [
+						[ 'Key_name' => 'PRIMARY', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'id' ],
+						[ 'Key_name' => 'uq_active_rule', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'active_key' ],
+						[ 'Key_name' => 'idx_target', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'target_type' ],
+						[ 'Key_name' => 'idx_target', 'Non_unique' => 1, 'Seq_in_index' => 2, 'Column_name' => 'target_id' ],
+						[ 'Key_name' => 'idx_target', 'Non_unique' => 1, 'Seq_in_index' => 3, 'Column_name' => 'status' ],
+						[ 'Key_name' => 'idx_scope', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'scope_type' ],
+						[ 'Key_name' => 'idx_scope', 'Non_unique' => 1, 'Seq_in_index' => 2, 'Column_name' => 'scope_id' ],
+						[ 'Key_name' => 'idx_scope', 'Non_unique' => 1, 'Seq_in_index' => 3, 'Column_name' => 'status' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'target_type' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 2, 'Column_name' => 'target_id' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 3, 'Column_name' => 'scope_type' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 4, 'Column_name' => 'scope_id' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 5, 'Column_name' => 'status' ],
+					];
+				}
+				if ( str_contains( $query, 'tierza_user_groups' ) ) {
+					return [
+						[ 'Key_name' => 'PRIMARY', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'id' ],
+						[ 'Key_name' => 'uq_user_id', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'user_id' ],
+						[ 'Key_name' => 'idx_group_id', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'group_id' ],
+					];
+				}
+			}
+
+			return [];
+		}
+
+		public function query( string $query ): int|bool {
+			return true;
+		}
+
+		/**
+		 * @param array<string, mixed> $data
+		 * @param array<string>|null $format
+		 */
+		public function insert( string $table, array $data, ?array $format = null ): int|bool {
+			$this->insert_id++;
+			return 1;
+		}
+
+		/**
+		 * @param array<string, mixed> $data
+		 * @param array<string, mixed> $where
+		 * @param array<string>|null $format
+		 * @param array<string>|null $where_format
+		 */
+		public function update( string $table, array $data, array $where, ?array $format = null, ?array $where_format = null ): int|bool {
+			return 1;
+		}
+
+		/**
+		 * @param array<string, mixed> $where
+		 * @param array<string>|null $where_format
+		 */
+		public function delete( string $table, array $where, ?array $where_format = null ): int|bool {
+			return 1;
+		}
+
+		public function esc_like( string $text ): string {
+			return addcslashes( $text, '_%\\' );
+		}
+
+		public function suppress_errors( bool $suppress = true ): bool {
+			return true;
+		}
+	}
+
+	global $wpdb;
+	$wpdb = new wpdb();
+}
+
+if ( ! function_exists( 'current_time' ) ) {
+	function current_time( string $type, bool $gmt = false ): string {
+		return gmdate( 'Y-m-d H:i:s' );
+	}
+}
+
+if ( ! function_exists( 'dbDelta' ) ) {
+	/**
+	 * @param string|array<string> $queries
+	 * @return array<string, string>
+	 */
+	function dbDelta( $queries = '', bool $execute = true ): array {
+		return [];
 	}
 }
 

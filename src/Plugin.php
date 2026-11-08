@@ -5,7 +5,14 @@ declare(strict_types=1);
 namespace Tierza;
 
 use Tierza\Admin\AdminMenu;
+use Tierza\Domain\Repositories\GroupRepositoryInterface;
+use Tierza\Domain\Repositories\RuleRepositoryInterface;
+use Tierza\Domain\Repositories\UserGroupRepositoryInterface;
+use Tierza\Infrastructure\Database\Schema;
 use Tierza\Infrastructure\Environment;
+use Tierza\Infrastructure\Repositories\WpGroupRepository;
+use Tierza\Infrastructure\Repositories\WpRuleRepository;
+use Tierza\Infrastructure\Repositories\WpUserGroupRepository;
 
 /**
  * Main Tierza plugin singleton coordinator.
@@ -21,6 +28,13 @@ final class Plugin {
 	 * Admin menu service.
 	 */
 	private ?AdminMenu $admin_menu = null;
+
+	/**
+	 * Repository instances.
+	 */
+	private ?GroupRepositoryInterface $group_repository          = null;
+	private ?RuleRepositoryInterface $rule_repository            = null;
+	private ?UserGroupRepositoryInterface $user_group_repository = null;
 
 	/**
 	 * Whether the plugin has been initialized.
@@ -89,6 +103,14 @@ final class Plugin {
 	 * Initialize plugin components and integrations.
 	 */
 	private function init_services(): void {
+		// Run idempotent database migrations if needed.
+		Schema::maybe_upgrade();
+
+		// Instantiate repositories.
+		$this->group_repository      = new WpGroupRepository();
+		$this->rule_repository       = new WpRuleRepository();
+		$this->user_group_repository = new WpUserGroupRepository();
+
 		if ( is_admin() ) {
 			$this->admin_menu = new AdminMenu();
 			$this->admin_menu->register();
@@ -152,6 +174,9 @@ final class Plugin {
 		// Perform safe activation tasks (e.g. record version).
 		update_option( 'tierza_version', TIERZA_VERSION );
 
+		// Install database tables and record schema version.
+		Schema::install();
+
 		/**
 		 * Action triggered on Tierza activation.
 		 */
@@ -174,6 +199,27 @@ final class Plugin {
 	 */
 	public function get_admin_menu(): ?AdminMenu {
 		return $this->admin_menu;
+	}
+
+	/**
+	 * Get group repository.
+	 */
+	public function get_group_repository(): ?GroupRepositoryInterface {
+		return $this->group_repository;
+	}
+
+	/**
+	 * Get rule repository.
+	 */
+	public function get_rule_repository(): ?RuleRepositoryInterface {
+		return $this->rule_repository;
+	}
+
+	/**
+	 * Get user group assignment repository.
+	 */
+	public function get_user_group_repository(): ?UserGroupRepositoryInterface {
+		return $this->user_group_repository;
 	}
 
 	/**

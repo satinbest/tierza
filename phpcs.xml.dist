@@ -36,5 +36,7 @@
         <!-- Allow SVG data URI base64 encoding -->
         <exclude name="WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode"/>
         <exclude name="Universal.NamingConventions.NoReservedKeywordParameterNames.classFound"/>
+        <!-- Domain and architecture exceptions are internal and not direct HTML output -->
+        <exclude name="WordPress.Security.EscapeOutput.ExceptionNotEscaped"/>
     </rule>
 </ruleset>

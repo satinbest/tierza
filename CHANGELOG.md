@@ -27,5 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Concurrency-safe active rule uniqueness key (`active_key` with `uq_active_rule` unique index) preventing duplicate active rules (TRZ-004).
 - Logical conflict resolution ensuring only one active rule exists per `target_type + target_id + scope_type + scope_id` regardless of pricing type (TRZ-004).
 - Failure-safe idempotent schema migrations with verification checks and `SchemaMigrationException` (TRZ-004).
+- Resumable pre-migration backfill algorithm detecting legacy active rule conflicts without data mutation (TRZ-004).
+- Hardened schema verification verifying index uniqueness and exact column sequences (TRZ-004).
 - Entity reference validation (`EntityReferenceValidator`) verifying users, groups, products, variations, and categories (TRZ-004).
-- 21 live database integration tests executed on WordPress & MariaDB Docker environment (TRZ-004).
+- 31 live database integration and legacy upgrade tests executed on WordPress & MariaDB Docker environment (TRZ-004).

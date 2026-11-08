@@ -239,12 +239,26 @@ Attempting to reference a non-existent entity raises `InvalidEntityReferenceExce
 
 - Current schema version is stored in the WordPress `options` table under option key **`tierza_db_version`**.
 - During plugin activation, `Schema::install()` is invoked.
-- On each plugin boot (`plugins_loaded`), `Schema::maybe_upgrade()` performs a lightweight version check against `Schema::CURRENT_DB_VERSION`.
-- If an update is required, `dbDelta()` applies idempotent DDL changes.
-- **Failure-Safe Schema Verification**:
-  1. Immediately following DDL execution, `Schema::verify_schema()` inspects the database to ensure all 3 tables exist, all expected columns are present, and essential unique keys (`uq_slug`, `uq_active_rule`, `uq_user_id`) exist.
-  2. If any discrepancy is found, `SchemaMigrationException` is thrown, and `tierza_db_version` is **not updated**.
-  3. Subsequent activations or admin loads can safely retry migration without data loss or partial state corruption.
+- On each plugin boot (`plugins_loaded`), `Schema::maybe_upgrade()` performs a lightweight version check against `Schema::CURRENT_DB_VERSION`. If versions match, **zero DDL or migration queries are executed on normal page loads**.
+- If an update is required, the hardened upgrade lifecycle executes in strict topological order:
+  1. **Pre-Migration Reconciliation & Conflict Detection (`prepare_and_backfill_rules`)**:
+     - Before unique indexes are added or enforced, Tierza scans `tierza_rules` for logical collisions among active rules (`target_type, target_id, scope_type, scope_id`).
+     - If duplicate active rules exist, the migration **halts immediately** with `SchemaMigrationException`, reporting the exact conflicting rule IDs, targets, and scopes.
+     - **Zero customer records are deleted, deactivated, or modified.** The previous schema version option is retained.
+     - Once an administrator resolves the conflict (e.g. deactivating the duplicate rule), the migration is completely resumable and safe to retry.
+  2. **Active Key Backfilling**:
+     - For non-conflicting active rules, `active_key` is backfilled atomically to `CONCAT(target_type, ':', target_id, '|', scope_type, ':', scope_id)`.
+     - Inactive historical rules are guaranteed to have `active_key = NULL`.
+  3. **Idempotent Schema Definition (`dbDelta`)**:
+     - Standard WordPress `dbDelta()` applies schema definitions across all 3 tables (`tierza_groups`, `tierza_rules`, `tierza_user_groups`).
+  4. **Guaranteed Unique Constraints (`ensure_unique_indexes`)**:
+     - Validates and enforces that `uq_active_rule` (`tierza_rules.active_key`), `uq_slug` (`tierza_groups.slug`), and `uq_user_id` (`tierza_user_groups.user_id`) exist and are strictly unique.
+  5. **Hardened Verification Gate (`verify_schema`)**:
+     - Confirms that all 3 tables exist.
+     - Confirms all essential columns exist (failing explicitly if metadata queries fail).
+     - Confirms required indexes exist, that `uq_active_rule`, `uq_slug`, and `uq_user_id` are actually UNIQUE (`Non_unique == 0`), and that index columns match the exact required sequence.
+  6. **Atomic Version Commitment**:
+     - `tierza_db_version` is updated **only after** all backfills, constraints, and verification checks pass with zero issues.
 
 ---
 

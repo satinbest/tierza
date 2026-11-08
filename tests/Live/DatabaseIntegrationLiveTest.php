@@ -87,6 +87,16 @@ class DatabaseIntegrationLiveTest {
 			'test_group_deletion_safeguards_with_users_and_rules',
 			'test_group_deletion_success_when_isolated',
 			'test_repeated_migrations_preserve_existing_records',
+			'test_legacy_upgrade_with_no_existing_rules',
+			'test_legacy_upgrade_with_active_percentage_rules',
+			'test_legacy_upgrade_with_active_fixed_price_rules',
+			'test_legacy_upgrade_with_inactive_historical_rules',
+			'test_legacy_upgrade_with_conflicting_active_rules_halts_safely',
+			'test_legacy_upgrade_failed_upgrade_retains_previous_schema_version',
+			'test_legacy_upgrade_successful_retry_after_resolving_conflict',
+			'test_legacy_upgrade_repeated_after_successful_backfill_is_idempotent',
+			'test_legacy_upgrade_existing_rule_ids_values_and_timestamps_preserved',
+			'test_legacy_upgrade_new_uniqueness_constraint_rejects_concurrent_duplicates',
 		];
 
 		foreach ( $methods as $method ) {
@@ -802,6 +812,367 @@ class DatabaseIntegrationLiveTest {
 		} finally {
 			$this->group_repo->delete( $group_id );
 		}
+	}
+
+	private function create_legacy_rules_table(): void {
+		$table_rules     = Schema::rules_table( $this->db );
+		$charset_collate = $this->db->get_charset_collate();
+
+		// Drop current rules table to establish pre-migration baseline.
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$this->db->query( "DROP TABLE IF EXISTS {$table_rules}" );
+
+		// Create legacy schema without active_key column and without uq_active_rule.
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$this->db->query(
+			"CREATE TABLE {$table_rules} (
+  id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+  target_type varchar(20) NOT NULL,
+  target_id bigint(20) unsigned NOT NULL,
+  scope_type varchar(20) NOT NULL,
+  scope_id bigint(20) unsigned NOT NULL DEFAULT 0,
+  pricing_type varchar(20) NOT NULL,
+  value decimal(20,6) NOT NULL DEFAULT 0.000000,
+  status varchar(20) NOT NULL DEFAULT 'active',
+  created_at datetime NOT NULL,
+  updated_at datetime NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_target (target_type, target_id, status),
+  KEY idx_scope (scope_type, scope_id, status),
+  KEY idx_lookup (target_type, target_id, scope_type, scope_id, status)
+) {$charset_collate};"
+		);
+
+		update_option( Schema::DB_VERSION_OPTION, '0.1.0' );
+	}
+
+	public function test_legacy_upgrade_with_no_existing_rules(): void {
+		$this->create_legacy_rules_table();
+
+		// Run upgrade on empty legacy table.
+		Schema::maybe_upgrade( $this->db );
+
+		$this->assert( '1.0.0' === get_option( Schema::DB_VERSION_OPTION ), 'DB version must be updated to 1.0.0.' );
+		$issues = Schema::verify_schema( $this->db );
+		$this->assert( empty( $issues ), 'Schema verification must pass after upgrading empty legacy table: ' . implode( ', ', $issues ) );
+	}
+
+	public function test_legacy_upgrade_with_active_percentage_rules(): void {
+		$this->create_legacy_rules_table();
+		$table_rules = Schema::rules_table( $this->db );
+
+		// Insert active percentage rule without active_key.
+		$this->db->insert(
+			$table_rules,
+			[
+				'target_type'  => 'group',
+				'target_id'    => 10,
+				'scope_type'   => 'global',
+				'scope_id'     => 0,
+				'pricing_type' => 'percentage',
+				'value'        => '15.000000',
+				'status'       => 'active',
+				'created_at'   => '2026-01-01 12:00:00',
+				'updated_at'   => '2026-01-01 12:00:00',
+			]
+		);
+		$rule_id = (int) $this->db->insert_id;
+
+		Schema::maybe_upgrade( $this->db );
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$row = $this->db->get_row( $this->db->prepare( "SELECT * FROM {$table_rules} WHERE id = %d", $rule_id ), ARRAY_A );
+		$this->assert( is_array( $row ), 'Rule must exist after upgrade.' );
+		$this->assert( 'group:10|global:0' === ( $row['active_key'] ?? '' ), 'Active percentage rule must be backfilled with logical active_key.' );
+		$this->assert( '15.000000' === ( $row['value'] ?? '' ), 'Rule value must be preserved.' );
+		$this->assert( 'percentage' === ( $row['pricing_type'] ?? '' ), 'Pricing type must be percentage.' );
+		$this->assert( '1.0.0' === get_option( Schema::DB_VERSION_OPTION ), 'DB version must be 1.0.0.' );
+	}
+
+	public function test_legacy_upgrade_with_active_fixed_price_rules(): void {
+		$this->create_legacy_rules_table();
+		$table_rules = Schema::rules_table( $this->db );
+
+		// Insert active fixed-price rule without active_key.
+		$this->db->insert(
+			$table_rules,
+			[
+				'target_type'  => 'group',
+				'target_id'    => 20,
+				'scope_type'   => 'product',
+				'scope_id'     => 555,
+				'pricing_type' => 'fixed',
+				'value'        => '450000.000000',
+				'status'       => 'active',
+				'created_at'   => '2026-02-01 15:30:00',
+				'updated_at'   => '2026-02-01 15:30:00',
+			]
+		);
+		$rule_id = (int) $this->db->insert_id;
+
+		Schema::maybe_upgrade( $this->db );
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$row = $this->db->get_row( $this->db->prepare( "SELECT * FROM {$table_rules} WHERE id = %d", $rule_id ), ARRAY_A );
+		$this->assert( is_array( $row ), 'Fixed-price rule must exist after upgrade.' );
+		$this->assert( 'group:20|product:555' === ( $row['active_key'] ?? '' ), 'Active fixed rule must be backfilled with product active_key.' );
+		$this->assert( '450000.000000' === ( $row['value'] ?? '' ), 'Fixed amount must be preserved.' );
+		$this->assert( 'fixed' === ( $row['pricing_type'] ?? '' ), 'Pricing type must be fixed.' );
+	}
+
+	public function test_legacy_upgrade_with_inactive_historical_rules(): void {
+		$this->create_legacy_rules_table();
+		$table_rules = Schema::rules_table( $this->db );
+
+		// Insert 2 inactive historical rules for the same target & scope.
+		$this->db->insert(
+			$table_rules,
+			[
+				'target_type'  => 'group',
+				'target_id'    => 30,
+				'scope_type'   => 'global',
+				'scope_id'     => 0,
+				'pricing_type' => 'percentage',
+				'value'        => '10.000000',
+				'status'       => 'inactive',
+				'created_at'   => '2026-01-01 10:00:00',
+				'updated_at'   => '2026-01-01 10:00:00',
+			]
+		);
+		$id1 = (int) $this->db->insert_id;
+
+		$this->db->insert(
+			$table_rules,
+			[
+				'target_type'  => 'group',
+				'target_id'    => 30,
+				'scope_type'   => 'global',
+				'scope_id'     => 0,
+				'pricing_type' => 'percentage',
+				'value'        => '20.000000',
+				'status'       => 'inactive',
+				'created_at'   => '2026-01-02 10:00:00',
+				'updated_at'   => '2026-01-02 10:00:00',
+			]
+		);
+		$id2 = (int) $this->db->insert_id;
+
+		Schema::maybe_upgrade( $this->db );
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$row1 = $this->db->get_row( $this->db->prepare( "SELECT * FROM {$table_rules} WHERE id = %d", $id1 ), ARRAY_A );
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$row2 = $this->db->get_row( $this->db->prepare( "SELECT * FROM {$table_rules} WHERE id = %d", $id2 ), ARRAY_A );
+
+		$this->assert( is_null( $row1['active_key'] ), 'Inactive historical rule 1 must have active_key = NULL.' );
+		$this->assert( is_null( $row2['active_key'] ), 'Inactive historical rule 2 must have active_key = NULL.' );
+		$this->assert( '1.0.0' === get_option( Schema::DB_VERSION_OPTION ), 'DB version must be 1.0.0.' );
+	}
+
+	public function test_legacy_upgrade_with_conflicting_active_rules_halts_safely(): void {
+		$this->create_legacy_rules_table();
+		$table_rules = Schema::rules_table( $this->db );
+
+		// Insert 2 active conflicting rules on the same target and scope.
+		$this->db->insert(
+			$table_rules,
+			[
+				'target_type'  => 'group',
+				'target_id'    => 40,
+				'scope_type'   => 'product',
+				'scope_id'     => 888,
+				'pricing_type' => 'percentage',
+				'value'        => '12.000000',
+				'status'       => 'active',
+				'created_at'   => '2026-01-01 00:00:00',
+				'updated_at'   => '2026-01-01 00:00:00',
+			]
+		);
+		$id1 = (int) $this->db->insert_id;
+
+		$this->db->insert(
+			$table_rules,
+			[
+				'target_type'  => 'group',
+				'target_id'    => 40,
+				'scope_type'   => 'product',
+				'scope_id'     => 888,
+				'pricing_type' => 'fixed',
+				'value'        => '50000.000000',
+				'status'       => 'active',
+				'created_at'   => '2026-01-02 00:00:00',
+				'updated_at'   => '2026-01-02 00:00:00',
+			]
+		);
+		$id2 = (int) $this->db->insert_id;
+
+		$caught     = false;
+		$caught_msg = '';
+		try {
+			Schema::maybe_upgrade( $this->db );
+		} catch ( SchemaMigrationException $e ) {
+			$caught     = true;
+			$caught_msg = $e->getMessage();
+		}
+
+		$this->assert( $caught, 'Upgrade must throw SchemaMigrationException when active rule conflicts exist.' );
+		$this->assert( str_contains( $caught_msg, 'conflicting active pricing rule' ), 'Exception must explain active rule conflict.' );
+		$this->assert( str_contains( $caught_msg, (string) $id1 ) && str_contains( $caught_msg, (string) $id2 ), 'Exception message must list conflicting rule IDs.' );
+
+		// Verify that all data was preserved and no rules were deleted.
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$count = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$table_rules}" );
+		$this->assert( 2 === $count, 'All conflicting rules must remain untouched in the database.' );
+	}
+
+	public function test_legacy_upgrade_failed_upgrade_retains_previous_schema_version(): void {
+		$this->create_legacy_rules_table();
+		$table_rules = Schema::rules_table( $this->db );
+
+		// Duplicate active rules causing failure.
+		$this->db->insert( $table_rules, [ 'target_type' => 'group', 'target_id' => 45, 'scope_type' => 'global', 'scope_id' => 0, 'pricing_type' => 'percentage', 'value' => '10', 'status' => 'active', 'created_at' => current_time( 'mysql' ), 'updated_at' => current_time( 'mysql' ) ] );
+		$this->db->insert( $table_rules, [ 'target_type' => 'group', 'target_id' => 45, 'scope_type' => 'global', 'scope_id' => 0, 'pricing_type' => 'fixed', 'value' => '20', 'status' => 'active', 'created_at' => current_time( 'mysql' ), 'updated_at' => current_time( 'mysql' ) ] );
+
+		try {
+			Schema::maybe_upgrade( $this->db );
+		} catch ( SchemaMigrationException $e ) {
+			// Expected.
+		}
+
+		// Version must STILL be 0.1.0!
+		$version = get_option( Schema::DB_VERSION_OPTION );
+		$this->assert( '0.1.0' === $version, 'Failed upgrade must retain the previous database version (0.1.0).' );
+	}
+
+	public function test_legacy_upgrade_successful_retry_after_resolving_conflict(): void {
+		$this->create_legacy_rules_table();
+		$table_rules = Schema::rules_table( $this->db );
+
+		// Conflicting rules.
+		$this->db->insert( $table_rules, [ 'target_type' => 'group', 'target_id' => 50, 'scope_type' => 'global', 'scope_id' => 0, 'pricing_type' => 'percentage', 'value' => '10', 'status' => 'active', 'created_at' => current_time( 'mysql' ), 'updated_at' => current_time( 'mysql' ) ] );
+		$id1 = (int) $this->db->insert_id;
+
+		$this->db->insert( $table_rules, [ 'target_type' => 'group', 'target_id' => 50, 'scope_type' => 'global', 'scope_id' => 0, 'pricing_type' => 'fixed', 'value' => '20', 'status' => 'active', 'created_at' => current_time( 'mysql' ), 'updated_at' => current_time( 'mysql' ) ] );
+		$id2 = (int) $this->db->insert_id;
+
+		// First attempt fails.
+		$failed = false;
+		try {
+			Schema::maybe_upgrade( $this->db );
+		} catch ( SchemaMigrationException $e ) {
+			$failed = true;
+		}
+		$this->assert( $failed, 'First migration attempt must halt.' );
+
+		// Administrator resolves conflict by deactivating rule 2.
+		$this->db->update( $table_rules, [ 'status' => 'inactive' ], [ 'id' => $id2 ] );
+
+		// Retry migration.
+		Schema::maybe_upgrade( $this->db );
+
+		$this->assert( '1.0.0' === get_option( Schema::DB_VERSION_OPTION ), 'Version must update to 1.0.0 after conflict resolution.' );
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$row1 = $this->db->get_row( $this->db->prepare( "SELECT * FROM {$table_rules} WHERE id = %d", $id1 ), ARRAY_A );
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$row2 = $this->db->get_row( $this->db->prepare( "SELECT * FROM {$table_rules} WHERE id = %d", $id2 ), ARRAY_A );
+
+		$this->assert( 'group:50|global:0' === ( $row1['active_key'] ?? '' ), 'Active rule 1 must receive active_key.' );
+		$this->assert( is_null( $row2['active_key'] ), 'Deactivated rule 2 must have NULL active_key.' );
+	}
+
+	public function test_legacy_upgrade_repeated_after_successful_backfill_is_idempotent(): void {
+		$this->create_legacy_rules_table();
+		$table_rules = Schema::rules_table( $this->db );
+
+		$this->db->insert( $table_rules, [ 'target_type' => 'group', 'target_id' => 60, 'scope_type' => 'global', 'scope_id' => 0, 'pricing_type' => 'percentage', 'value' => '15', 'status' => 'active', 'created_at' => current_time( 'mysql' ), 'updated_at' => current_time( 'mysql' ) ] );
+
+		// First upgrade.
+		Schema::maybe_upgrade( $this->db );
+		$this->assert( '1.0.0' === get_option( Schema::DB_VERSION_OPTION ), 'First upgrade must reach 1.0.0.' );
+
+		// Repeated upgrade calls must be completely safe and no-op.
+		Schema::maybe_upgrade( $this->db );
+		Schema::maybe_upgrade( $this->db );
+
+		$this->assert( '1.0.0' === get_option( Schema::DB_VERSION_OPTION ), 'DB version must remain 1.0.0.' );
+		$issues = Schema::verify_schema( $this->db );
+		$this->assert( empty( $issues ), 'Schema must remain verified after repeated upgrades.' );
+	}
+
+	public function test_legacy_upgrade_existing_rule_ids_values_and_timestamps_preserved(): void {
+		$this->create_legacy_rules_table();
+		$table_rules = Schema::rules_table( $this->db );
+
+		$timestamp = '2026-03-15 08:45:22';
+		$value     = '123456789.987654';
+
+		$this->db->insert(
+			$table_rules,
+			[
+				'target_type'  => 'group',
+				'target_id'    => 70,
+				'scope_type'   => 'product',
+				'scope_id'     => 999,
+				'pricing_type' => 'fixed',
+				'value'        => $value,
+				'status'       => 'active',
+				'created_at'   => $timestamp,
+				'updated_at'   => $timestamp,
+			]
+		);
+		$rule_id = (int) $this->db->insert_id;
+
+		Schema::maybe_upgrade( $this->db );
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$row = $this->db->get_row( $this->db->prepare( "SELECT * FROM {$table_rules} WHERE id = %d", $rule_id ), ARRAY_A );
+		$this->assert( is_array( $row ), 'Rule row must exist.' );
+		$this->assert( $rule_id === (int) $row['id'], 'Primary key ID must be exactly preserved.' );
+		$this->assert( $value === $row['value'], 'Exact decimal precision value must be preserved.' );
+		$this->assert( $timestamp === $row['created_at'], 'Created timestamp must be preserved.' );
+		$this->assert( $timestamp === $row['updated_at'], 'Updated timestamp must be preserved.' );
+	}
+
+	public function test_legacy_upgrade_new_uniqueness_constraint_rejects_concurrent_duplicates(): void {
+		$this->create_legacy_rules_table();
+		$table_rules = Schema::rules_table( $this->db );
+
+		// Seed active rule.
+		$this->db->insert( $table_rules, [ 'target_type' => 'group', 'target_id' => 80, 'scope_type' => 'global', 'scope_id' => 0, 'pricing_type' => 'percentage', 'value' => '10', 'status' => 'active', 'created_at' => current_time( 'mysql' ), 'updated_at' => current_time( 'mysql' ) ] );
+
+		// Upgrade.
+		Schema::maybe_upgrade( $this->db );
+
+		// Now attempt direct insert of a second active rule with same target & scope.
+		$suppress = $this->db->suppress_errors( true );
+		$res      = $this->db->insert(
+			$table_rules,
+			[
+				'target_type'  => 'group',
+				'target_id'    => 80,
+				'scope_type'   => 'global',
+				'scope_id'     => 0,
+				'pricing_type' => 'fixed',
+				'value'        => '20000',
+				'status'       => 'active',
+				'active_key'   => 'group:80|global:0',
+				'created_at'   => current_time( 'mysql' ),
+				'updated_at'   => current_time( 'mysql' ),
+			]
+		);
+		$last_error = $this->db->last_error;
+		$this->db->suppress_errors( $suppress );
+
+		$this->assert( false === $res, 'New database constraint must reject concurrent duplicate active rules.' );
+		$this->assert(
+			str_contains( strtolower( $last_error ), 'duplicate' ) || str_contains( strtolower( $last_error ), 'uq_active_rule' ),
+			'Database engine error must report duplicate entry for uq_active_rule.'
+		);
+
+		// Restore clean 1.0.0 schema at end of upgrade tests.
+		Schema::install( $this->db );
+		$this->clean_tables();
 	}
 }
 

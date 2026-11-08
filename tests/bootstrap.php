@@ -290,25 +290,34 @@ if ( ! class_exists( 'wpdb' ) ) {
 			if ( null !== $query && str_contains( $query, 'SHOW INDEX' ) ) {
 				if ( str_contains( $query, 'tierza_groups' ) ) {
 					return [
-						[ 'Key_name' => 'PRIMARY' ],
-						[ 'Key_name' => 'uq_slug' ],
-						[ 'Key_name' => 'idx_status_sort' ],
+						[ 'Key_name' => 'PRIMARY', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'id' ],
+						[ 'Key_name' => 'uq_slug', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'slug' ],
+						[ 'Key_name' => 'idx_status_sort', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'status' ],
+						[ 'Key_name' => 'idx_status_sort', 'Non_unique' => 1, 'Seq_in_index' => 2, 'Column_name' => 'sort_order' ],
 					];
 				}
 				if ( str_contains( $query, 'tierza_rules' ) ) {
 					return [
-						[ 'Key_name' => 'PRIMARY' ],
-						[ 'Key_name' => 'uq_active_rule' ],
-						[ 'Key_name' => 'idx_target' ],
-						[ 'Key_name' => 'idx_scope' ],
-						[ 'Key_name' => 'idx_lookup' ],
+						[ 'Key_name' => 'PRIMARY', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'id' ],
+						[ 'Key_name' => 'uq_active_rule', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'active_key' ],
+						[ 'Key_name' => 'idx_target', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'target_type' ],
+						[ 'Key_name' => 'idx_target', 'Non_unique' => 1, 'Seq_in_index' => 2, 'Column_name' => 'target_id' ],
+						[ 'Key_name' => 'idx_target', 'Non_unique' => 1, 'Seq_in_index' => 3, 'Column_name' => 'status' ],
+						[ 'Key_name' => 'idx_scope', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'scope_type' ],
+						[ 'Key_name' => 'idx_scope', 'Non_unique' => 1, 'Seq_in_index' => 2, 'Column_name' => 'scope_id' ],
+						[ 'Key_name' => 'idx_scope', 'Non_unique' => 1, 'Seq_in_index' => 3, 'Column_name' => 'status' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'target_type' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 2, 'Column_name' => 'target_id' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 3, 'Column_name' => 'scope_type' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 4, 'Column_name' => 'scope_id' ],
+						[ 'Key_name' => 'idx_lookup', 'Non_unique' => 1, 'Seq_in_index' => 5, 'Column_name' => 'status' ],
 					];
 				}
 				if ( str_contains( $query, 'tierza_user_groups' ) ) {
 					return [
-						[ 'Key_name' => 'PRIMARY' ],
-						[ 'Key_name' => 'uq_user_id' ],
-						[ 'Key_name' => 'idx_group_id' ],
+						[ 'Key_name' => 'PRIMARY', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'id' ],
+						[ 'Key_name' => 'uq_user_id', 'Non_unique' => 0, 'Seq_in_index' => 1, 'Column_name' => 'user_id' ],
+						[ 'Key_name' => 'idx_group_id', 'Non_unique' => 1, 'Seq_in_index' => 1, 'Column_name' => 'group_id' ],
 					];
 				}
 			}

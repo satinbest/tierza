@@ -126,6 +126,46 @@ class DatabaseIntegrationLiveTest {
 			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			$this->db->query( "TRUNCATE TABLE {$table_groups}" );
 		}
+
+		if ( defined( 'WP_CONTENT_DIR' ) && file_exists( WP_CONTENT_DIR . '/debug.log' ) ) {
+			file_put_contents( WP_CONTENT_DIR . '/debug.log', '' );
+		}
+	}
+
+	private function create_test_user( string $login, string $email ): int {
+		if ( function_exists( 'wp_create_user' ) ) {
+			$created = wp_create_user( $login, 'TierzaPass!1234', $email );
+			if ( is_int( $created ) && $created > 0 ) {
+				return $created;
+			}
+		}
+
+		$this->db->insert(
+			$this->db->prefix . 'users',
+			[
+				'user_login'          => $login,
+				'user_pass'           => 'fakepass',
+				'user_nicename'       => $login,
+				'user_email'          => $email,
+				'user_url'            => '',
+				'user_registered'     => current_time( 'mysql', true ),
+				'user_activation_key' => '',
+				'user_status'         => 0,
+				'display_name'        => $login,
+			]
+		);
+		return (int) $this->db->insert_id;
+	}
+
+	private function delete_test_user( int $user_id ): void {
+		if ( $user_id <= 0 ) {
+			return;
+		}
+		if ( function_exists( 'wp_delete_user' ) ) {
+			wp_delete_user( $user_id );
+		} else {
+			$this->db->delete( $this->db->prefix . 'users', [ 'ID' => $user_id ] );
+		}
 	}
 
 	private function assert( bool $condition, string $message ): void {
@@ -524,6 +564,7 @@ class DatabaseIntegrationLiveTest {
 
 			// Thread 2 attempts simultaneous concurrent insert with identical active_key.
 			// Database engine UNIQUE KEY uq_active_rule MUST reject it.
+			$suppress = $this->db->suppress_errors( true );
 			$res2 = $this->db->insert(
 				$table_rules,
 				[
@@ -539,10 +580,12 @@ class DatabaseIntegrationLiveTest {
 					'updated_at'   => $now,
 				]
 			);
+			$last_error = $this->db->last_error;
+			$this->db->suppress_errors( $suppress );
 
 			$this->assert( false === $res2, 'Thread 2 concurrent duplicate insert must be rejected by database engine.' );
 			$this->assert(
-				str_contains( strtolower( $this->db->last_error ), 'duplicate' ) || str_contains( strtolower( $this->db->last_error ), 'uq_active_rule' ),
+				str_contains( strtolower( $last_error ), 'duplicate' ) || str_contains( strtolower( $last_error ), 'uq_active_rule' ),
 				'Database error must indicate unique constraint violation on uq_active_rule.'
 			);
 
@@ -638,16 +681,7 @@ class DatabaseIntegrationLiveTest {
 		$group_b = $this->group_repo->save( new PricingGroup( 'Test Group B', 'test-group-b' ) );
 
 		// Create a test user in wp_users for reference validation.
-		$this->db->insert(
-			$this->db->prefix . 'users',
-			[
-				'user_login'    => 'tierza_test_user_assignment',
-				'user_pass'     => 'fakepass',
-				'user_nicename' => 'tierza_test',
-				'user_email'    => 'test_assignment@tierza.org',
-			]
-		);
-		$user_id = (int) $this->db->insert_id;
+		$user_id = $this->create_test_user( 'tierza_test_user_assignment', 'test_assignment@tierza.org' );
 
 		try {
 			// Assign to group A.
@@ -681,7 +715,7 @@ class DatabaseIntegrationLiveTest {
 		} finally {
 			$this->group_repo->delete( (int) $group_a->id() );
 			$this->group_repo->delete( (int) $group_b->id() );
-			$this->db->delete( $this->db->prefix . 'users', [ 'ID' => $user_id ] );
+			$this->delete_test_user( $user_id );
 		}
 	}
 
@@ -701,11 +735,7 @@ class DatabaseIntegrationLiveTest {
 		$group_id = (int) $group->id();
 
 		// Create mock user.
-		$this->db->insert(
-			$this->db->prefix . 'users',
-			[ 'user_login' => 'user_protected_del', 'user_pass' => 'pass', 'user_email' => 'prot_del@tierza.org' ]
-		);
-		$user_id = (int) $this->db->insert_id;
+		$user_id = $this->create_test_user( 'user_protected_del', 'prot_del@tierza.org' );
 
 		try {
 			$this->user_group_repo->assign( $user_id, $group_id );
@@ -747,7 +777,7 @@ class DatabaseIntegrationLiveTest {
 			$deleted = $this->group_repo->delete( $group_id );
 			$this->assert( $deleted, 'Group delete must succeed once users and rules are removed.' );
 		} finally {
-			$this->db->delete( $this->db->prefix . 'users', [ 'ID' => $user_id ] );
+			$this->delete_test_user( $user_id );
 		}
 	}
 

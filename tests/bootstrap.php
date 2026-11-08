@@ -350,6 +350,10 @@ if ( ! class_exists( 'wpdb' ) ) {
 		public function esc_like( string $text ): string {
 			return addcslashes( $text, '_%\\' );
 		}
+
+		public function suppress_errors( bool $suppress = true ): bool {
+			return true;
+		}
 	}
 
 	global $wpdb;

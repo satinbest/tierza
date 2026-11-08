@@ -61,7 +61,8 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 
 		if ( null === $rule_id ) {
 			// Insert new record with database-enforced unique active_key.
-			$inserted = $this->db->insert(
+			$suppress   = $this->db->suppress_errors( true );
+			$inserted   = $this->db->insert(
 				$this->table_rules,
 				[
 					'target_type'  => $rule->target()->type(),
@@ -77,9 +78,11 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 				],
 				[ '%s', '%d', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s' ]
 			);
+			$last_error = $this->db->last_error;
+			$this->db->suppress_errors( $suppress );
 
 			if ( false === $inserted ) {
-				if ( ! empty( $this->db->last_error ) && preg_match( '/uq_active_rule|duplicate/i', $this->db->last_error ) ) {
+				if ( ! empty( $last_error ) && preg_match( '/uq_active_rule|duplicate/i', $last_error ) ) {
 					throw new DuplicateRuleException(
 						sprintf(
 							'Concurrent active rule conflict detected at database engine level for target %s:%d and scope %s:%d.',
@@ -90,7 +93,7 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 						)
 					);
 				}
-				throw new RuntimeException( sprintf( 'Failed to insert rule: %s', $this->db->last_error ) );
+				throw new RuntimeException( sprintf( 'Failed to insert rule: %s', $last_error ) );
 			}
 
 			$insert_id = (int) $this->db->insert_id;
@@ -98,7 +101,8 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 		}
 
 		// Update existing record.
-		$updated = $this->db->update(
+		$suppress   = $this->db->suppress_errors( true );
+		$updated    = $this->db->update(
 			$this->table_rules,
 			[
 				'target_type'  => $rule->target()->type(),
@@ -115,8 +119,10 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			[ '%s', '%d', '%s', '%d', '%s', '%s', '%s', '%s', '%s' ],
 			[ '%d' ]
 		);
+		$last_error = $this->db->last_error;
+		$this->db->suppress_errors( $suppress );
 
-		if ( false === $updated && ! empty( $this->db->last_error ) && preg_match( '/uq_active_rule|duplicate/i', $this->db->last_error ) ) {
+		if ( false === $updated && ! empty( $last_error ) && preg_match( '/uq_active_rule|duplicate/i', $last_error ) ) {
 			throw new DuplicateRuleException(
 				sprintf(
 					'Concurrent active rule conflict detected on update for target %s:%d and scope %s:%d.',

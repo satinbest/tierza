@@ -9,6 +9,7 @@ use Tierza\Domain\Entities\PricingGroup;
 use Tierza\Domain\Exceptions\CurrencyMismatchException;
 use Tierza\Domain\Exceptions\InvalidPricingContextException;
 use Tierza\Domain\Exceptions\InvalidProductVariationException;
+use Tierza\Domain\Exceptions\MissingBasePriceException;
 use Tierza\Domain\Pricing\PricingContext;
 use Tierza\Domain\ValueObjects\GroupSlug;
 use Tierza\Domain\ValueObjects\Money;
@@ -221,5 +222,96 @@ final class PricingContextTest extends TestCase {
 		$this->assertSame( 1, $context->quantity() );
 		$this->assertSame( 5, $updated->quantity() );
 		$this->assertSame( $context->product_id(), $updated->product_id() );
+	}
+
+	public function test_currency_decimals_default_and_custom(): void {
+		$context_default = new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '50.00', 'USD' )
+		);
+		$this->assertSame( 2, $context_default->currency_decimals() );
+
+		$context_custom = new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '50.00', 'USD' ),
+			currency_decimals: 3
+		);
+		$this->assertSame( 3, $context_custom->currency_decimals() );
+
+		$context_modified = $context_default->with_currency_decimals( 0 );
+		$this->assertSame( 0, $context_modified->currency_decimals() );
+		$this->assertSame( 2, $context_default->currency_decimals() );
+	}
+
+	public function test_currency_decimals_bounds_validation(): void {
+		$this->expectException( InvalidPricingContextException::class );
+		$this->expectExceptionMessage( 'Currency decimals must be between 0 and 6, got 7.' );
+
+		new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '50.00', 'USD' ),
+			currency_decimals: 7
+		);
+	}
+
+	public function test_currency_decimals_8_is_explicitly_rejected(): void {
+		$this->expectException( InvalidPricingContextException::class );
+		$this->expectExceptionMessage( 'Currency decimals must be between 0 and 6, got 8.' );
+
+		new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '50.00', 'USD' ),
+			currency_decimals: 8
+		);
+	}
+
+	public function test_missing_base_price_throws_missing_base_price_exception(): void {
+		$this->expectException( MissingBasePriceException::class );
+		$this->expectExceptionMessage( 'Active base price is required and cannot be null or omitted.' );
+
+		new PricingContext(
+			product_id: 10,
+			base_price: null
+		);
+	}
+
+	public function test_is_sale_active_detection_requires_explicit_confirmation(): void {
+		// Numerical equality alone must NOT trigger is_sale_active() when unconfirmed (null)
+		$context_unconfirmed = new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '80.00', 'USD' ),
+			regular_price: Money::from( '100.00', 'USD' ),
+			sale_price: Money::from( '80.00', 'USD' ),
+			is_on_sale: null
+		);
+		$this->assertNull( $context_unconfirmed->is_on_sale() );
+		$this->assertFalse( $context_unconfirmed->is_sale_active() );
+
+		// Explicit confirmation as true
+		$context_confirmed_sale = new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '80.00', 'USD' ),
+			regular_price: Money::from( '100.00', 'USD' ),
+			sale_price: Money::from( '80.00', 'USD' ),
+			is_on_sale: true
+		);
+		$this->assertTrue( $context_confirmed_sale->is_on_sale() );
+		$this->assertTrue( $context_confirmed_sale->is_sale_active() );
+
+		// Explicit confirmation as false
+		$context_confirmed_no_sale = new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '100.00', 'USD' ),
+			regular_price: Money::from( '100.00', 'USD' ),
+			sale_price: Money::from( '100.00', 'USD' ),
+			is_on_sale: false
+		);
+		$this->assertFalse( $context_confirmed_no_sale->is_on_sale() );
+		$this->assertFalse( $context_confirmed_no_sale->is_sale_active() );
+
+		// with_sale_active helper
+		$promoted = $context_unconfirmed->with_sale_active( true );
+		$this->assertTrue( $promoted->is_sale_active() );
+		$this->assertFalse( $context_unconfirmed->is_sale_active() );
 	}
 }

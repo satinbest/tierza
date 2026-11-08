@@ -15,6 +15,7 @@ use wpdb;
 use Throwable;
 use RuntimeException;
 
+use Tierza\Application\Pricing\AuthoritativePriceCalculator;
 use Tierza\Application\Pricing\DeterministicRuleResolver;
 use Tierza\Domain\Entities\PricingGroup;
 use Tierza\Domain\Entities\PricingRule;
@@ -30,6 +31,7 @@ use Tierza\Domain\Pricing\Enums\PrecedenceLevel;
 use Tierza\Domain\Pricing\Enums\PricingReasonCode;
 use Tierza\Domain\Pricing\Enums\PricingSource;
 use Tierza\Domain\Pricing\PricingContext;
+use Tierza\Domain\Pricing\PricingResult;
 use Tierza\Domain\ValueObjects\Money;
 use Tierza\Domain\ValueObjects\GroupSlug;
 use Tierza\Domain\ValueObjects\GroupStatus;
@@ -111,6 +113,7 @@ class DatabaseIntegrationLiveTest {
 			'test_rule_resolver_real_database_read_failure_produces_exception_not_fallback',
 			'test_rule_resolver_query_counts_on_real_mariadb',
 			'test_rule_resolver_benchmark_fixtures_and_execution_time',
+			'test_authoritative_price_calculator_end_to_end_data_flow_in_mariadb',
 		];
 
 		foreach ( $methods as $method ) {
@@ -1526,6 +1529,195 @@ class DatabaseIntegrationLiveTest {
 			$this->db->query( "DELETE FROM {$table_rules} WHERE target_type = 'group' AND target_id IN (" . implode( ',', $group_ids ) . ')' );
 			$this->db->query( "DELETE FROM {$table_groups} WHERE id IN (" . implode( ',', $group_ids ) . ')' );
 			$this->db->query( "DELETE FROM {$this->db->prefix}posts WHERE ID IN (" . implode( ',', $product_ids ) . ')' );
+		}
+	}
+
+	public function test_authoritative_price_calculator_end_to_end_data_flow_in_mariadb(): void {
+		$resolver   = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+		$calculator = new AuthoritativePriceCalculator();
+
+		// 1. Create test group and user
+		$group = $this->group_repo->save( new PricingGroup( 'Calc Flow Group', 'calc-flow-group' ) );
+		$group_id = (int) $group->id();
+		$customer_id = 1; // existing admin user
+
+		// 2. Create products in wp_posts
+		// Simple product
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'TRZ-007 Simple Product', 'post_type' => 'product', 'post_status' => 'publish' ] );
+		$simple_pid = (int) $this->db->insert_id;
+
+		// Variable parent and child variation
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'TRZ-007 Variable Parent', 'post_type' => 'product', 'post_status' => 'publish' ] );
+		$variable_pid = (int) $this->db->insert_id;
+
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'TRZ-007 Variation A', 'post_type' => 'product_variation', 'post_status' => 'publish', 'post_parent' => $variable_pid ] );
+		$variation_id = (int) $this->db->insert_id;
+
+		// Product on Sale
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'TRZ-007 Sale Product', 'post_type' => 'product', 'post_status' => 'publish' ] );
+		$sale_pid = (int) $this->db->insert_id;
+
+		// Product in Category
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'TRZ-007 Category Product', 'post_type' => 'product', 'post_status' => 'publish' ] );
+		$cat_pid = (int) $this->db->insert_id;
+
+		// Create category in wp_terms & wp_term_taxonomy
+		$this->db->insert( $this->db->prefix . 'terms', [ 'name' => 'TRZ-007 Category', 'slug' => 'trz-007-category' ] );
+		$cat_id = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $cat_id, 'taxonomy' => 'product_cat', 'count' => 1 ] );
+
+		// 3. Insert real rules into MariaDB
+		// Customer percentage rule on simple product: 20%
+		$rule_simple = $this->rule_repo->save( new PricingRule(
+			target: RuleTarget::user( $customer_id ),
+			scope: RuleScope::product( $simple_pid ),
+			pricing_value: PricingValue::percentage( '20.000000' )
+		) );
+
+		// Group percentage rule on variation: 25%
+		$rule_variation = $this->rule_repo->save( new PricingRule(
+			target: RuleTarget::group( $group_id ),
+			scope: RuleScope::variation( $variation_id ),
+			pricing_value: PricingValue::percentage( '25.000000' )
+		) );
+
+		// Group percentage rule on category: 15%
+		$rule_category = $this->rule_repo->save( new PricingRule(
+			target: RuleTarget::group( $group_id ),
+			scope: RuleScope::category( $cat_id ),
+			pricing_value: PricingValue::percentage( '15.000000' )
+		) );
+
+		// Customer fixed price rule on sale product: 85.00
+		$rule_fixed = $this->rule_repo->save( new PricingRule(
+			target: RuleTarget::user( $customer_id ),
+			scope: RuleScope::product( $sale_pid ),
+			pricing_value: PricingValue::fixed( '85.000000' )
+		) );
+
+		try {
+			// Case A: Real DB Rule -> Resolver -> Calculator (Customer Percentage on Simple Product)
+			$context_simple = new PricingContext(
+				product_id: $simple_pid,
+				base_price: Money::from( '100.00', 'USD' ),
+				customer_id: $customer_id,
+				group: $group
+			);
+			$res_simple  = $resolver->resolve( $context_simple );
+			$calc_simple = $calculator->calculate( $context_simple, $res_simple );
+
+			$this->assert( $calc_simple->is_rule_applied(), 'Rule must be applied for simple product.' );
+			$this->assert( '80.000000' === $calc_simple->final_price()->amount(), '20% on 100.00 must produce 80.00.' );
+			$this->assert( '80.00' === $calc_simple->formatted_final_price(), 'Formatted price must be 80.00.' );
+			$this->assert( $calc_simple->is_discounted(), 'Result must be discounted.' );
+			$this->assert( '20.000000' === $calc_simple->discount_amount()->amount(), 'Discount amount must be 20.00.' );
+			$this->assert( $rule_simple->id() === $calc_simple->applied_rule_id(), 'Applied rule ID must match DB rule.' );
+
+			// Case B: Real DB Rule -> Resolver -> Calculator (Group Percentage on Variation)
+			$context_var = new PricingContext(
+				product_id: $variable_pid,
+				base_price: Money::from( '160.00', 'USD' ),
+				customer_id: 2, // Another user in the group
+				group: $group,
+				variation_id: $variation_id
+			);
+			$res_var  = $resolver->resolve( $context_var );
+			$calc_var = $calculator->calculate( $context_var, $res_var );
+
+			$this->assert( $calc_var->is_rule_applied(), 'Group variation rule must apply.' );
+			$this->assert( '120.000000' === $calc_var->final_price()->amount(), '25% on 160.00 must produce 120.00.' );
+			$this->assert( PrecedenceLevel::GROUP_VARIATION === $calc_var->precedence_level(), 'Precedence level must be GROUP_VARIATION.' );
+			$this->assert( $rule_variation->id() === $calc_var->applied_rule_id(), 'Applied rule ID must match variation rule.' );
+
+			// Case C: Active Sale Price (Active price used as discount base, regular price untouched)
+			// Product has regular = 150.00, active sale = 120.00. Rule gives 10% group discount.
+			// Rule Target = group, scope = product($sale_pid), value = 10%
+			$rule_sale_percent = $this->rule_repo->save( new PricingRule(
+				target: RuleTarget::group( $group_id ),
+				scope: RuleScope::product( $sale_pid ),
+				pricing_value: PricingValue::percentage( '10.000000' )
+			) );
+
+			$context_sale = new PricingContext(
+				product_id: $sale_pid,
+				base_price: Money::from( '120.00', 'USD' ), // Active price is sale price
+				customer_id: 2, // Group member (not user 1 so rule_fixed won't match)
+				group: $group,
+				regular_price: Money::from( '150.00', 'USD' ),
+				sale_price: Money::from( '120.00', 'USD' ),
+				quantity: 1,
+				group_id: null,
+				currency_decimals: 2,
+				is_on_sale: true
+			);
+			$res_sale  = $resolver->resolve( $context_sale );
+			$calc_sale = $calculator->calculate( $context_sale, $res_sale );
+
+			$this->assert( $calc_sale->is_rule_applied(), 'Sale product group rule must apply.' );
+			$this->assert( '108.000000' === $calc_sale->final_price()->amount(), '10% on active sale price 120.00 must produce 108.00.' );
+			$this->assert( 'confirmed_sale_price' === $calc_sale->diagnostic_metadata()['base_price_type'], 'Diagnostics must record confirmed_sale_price as base.' );
+
+			$this->rule_repo->delete( (int) $rule_sale_percent->id() );
+
+			// Case D: Customer Fixed Product Price on Sale Product
+			$context_fixed = new PricingContext(
+				product_id: $sale_pid,
+				base_price: Money::from( '120.00', 'USD' ),
+				customer_id: $customer_id, // User 1
+				group: $group,
+				regular_price: Money::from( '150.00', 'USD' ),
+				sale_price: Money::from( '120.00', 'USD' )
+			);
+			$res_fixed  = $resolver->resolve( $context_fixed );
+			$calc_fixed = $calculator->calculate( $context_fixed, $res_fixed );
+
+			$this->assert( '85.000000' === $calc_fixed->final_price()->amount(), 'Fixed price of 85.00 must be applied directly.' );
+			$this->assert( 'fixed' === $calc_fixed->pricing_type(), 'Pricing type must be fixed.' );
+			$this->assert( $rule_fixed->id() === $calc_fixed->applied_rule_id(), 'Rule ID must match fixed rule.' );
+
+			// Case E: Category Percentage Rule on Group
+			$context_cat = new PricingContext(
+				product_id: $cat_pid,
+				base_price: Money::from( '50.00', 'USD' ),
+				customer_id: 2,
+				group: $group,
+				category_ids: [ $cat_id ]
+			);
+			$res_cat  = $resolver->resolve( $context_cat );
+			$calc_cat = $calculator->calculate( $context_cat, $res_cat );
+
+			$this->assert( '42.500000' === $calc_cat->final_price()->amount(), '15% on 50.00 category product must produce 42.50.' );
+			$this->assert( PrecedenceLevel::GROUP_CATEGORY === $calc_cat->precedence_level(), 'Precedence level must be GROUP_CATEGORY.' );
+
+			// Case F: Fallback without matching rule (Anonymous guest)
+			$context_guest = new PricingContext(
+				product_id: $simple_pid,
+				base_price: Money::from( '100.00', 'USD' ),
+				customer_id: 0 // Guest
+			);
+			$res_guest  = $resolver->resolve( $context_guest );
+			$calc_guest = $calculator->calculate( $context_guest, $res_guest );
+
+			$this->assert( ! $calc_guest->is_rule_applied(), 'Fallback result must not be reported as applied rule.' );
+			$this->assert( '100.000000' === $calc_guest->final_price()->amount(), 'Fallback final price must match original base price unaltered.' );
+			$this->assert( null === $calc_guest->applied_rule_id(), 'Applied rule ID must be null on fallback.' );
+			$this->assert( PricingReasonCode::FALLBACK_ANONYMOUS_NO_RULE->value === $calc_guest->reason_code(), 'Reason code must indicate anonymous fallback.' );
+		} finally {
+			// Clean up fixtures reliably
+			$this->rule_repo->delete( (int) $rule_simple->id() );
+			$this->rule_repo->delete( (int) $rule_variation->id() );
+			$this->rule_repo->delete( (int) $rule_category->id() );
+			$this->rule_repo->delete( (int) $rule_fixed->id() );
+			$this->group_repo->delete( $group_id );
+
+			$this->db->delete( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $cat_id ] );
+			$this->db->delete( $this->db->prefix . 'terms', [ 'term_id' => $cat_id ] );
+
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $simple_pid ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $variation_id ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $variable_pid ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $sale_pid ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $cat_pid ] );
 		}
 	}
 }

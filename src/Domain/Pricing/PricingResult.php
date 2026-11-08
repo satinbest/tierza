@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tierza\Domain\Pricing;
 
 use Tierza\Domain\Exceptions\CurrencyMismatchException;
+use Tierza\Domain\Pricing\Enums\PrecedenceLevel;
 use Tierza\Domain\Pricing\Enums\PricingSource;
 use Tierza\Domain\ValueObjects\DecimalMath;
 use Tierza\Domain\ValueObjects\Money;
@@ -115,6 +116,21 @@ final class PricingResult {
 
 	public function reason_code(): string {
 		return $this->reason_code;
+	}
+
+	public function precedence_level(): ?PrecedenceLevel {
+		$level = $this->diagnostic_metadata['precedence_level'] ?? null;
+		return is_int( $level ) ? PrecedenceLevel::tryFrom( $level ) : null;
+	}
+
+	public function formatted_final_price( ?int $decimals = null ): string {
+		$dec = $decimals ?? ( $this->diagnostic_metadata['currency_decimals'] ?? 2 );
+		return $this->final_price->format( (int) $dec );
+	}
+
+	public function formatted_original_price( ?int $decimals = null ): string {
+		$dec = $decimals ?? ( $this->diagnostic_metadata['currency_decimals'] ?? 2 );
+		return $this->original_price->format( (int) $dec );
 	}
 
 	/**

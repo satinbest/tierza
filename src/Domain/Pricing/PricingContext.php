@@ -8,6 +8,7 @@ use Tierza\Domain\Entities\PricingGroup;
 use Tierza\Domain\Exceptions\CurrencyMismatchException;
 use Tierza\Domain\Exceptions\InvalidPricingContextException;
 use Tierza\Domain\Exceptions\InvalidProductVariationException;
+use Tierza\Domain\Exceptions\MissingBasePriceException;
 use Tierza\Domain\ValueObjects\Money;
 
 /**
@@ -35,27 +36,32 @@ final class PricingContext {
 	private readonly ?Money $regular_price;
 	private readonly ?Money $sale_price;
 	private readonly int $quantity;
+	private readonly int $currency_decimals;
+	private readonly ?bool $is_on_sale;
 
 	/**
-	 * @param int                  $product_id      Mandatory product identifier (> 0).
-	 * @param Money                $base_price      Mandatory active base price.
-	 * @param int                  $customer_id     Customer identifier (0 represents anonymous/guest).
-	 * @param PricingGroup|null    $group           Assigned pricing group entity, if any.
-	 * @param int|null             $variation_id    Optional variation identifier (> 0).
-	 * @param array<mixed>        $category_ids    Product category identifiers.
-	 * @param array<mixed, mixed> $category_depths Category hierarchy depth mapping (category_id => depth).
-	 * @param Money|null           $regular_price   Optional regular price metadata.
-	 * @param Money|null           $sale_price      Optional sale price metadata.
-	 * @param int                  $quantity        Item quantity (>= 1, reserved for future quantity pricing).
-	 * @param int|null             $group_id        Optional pricing group identifier fallback.
+	 * @param int                  $product_id        Mandatory product identifier (> 0).
+	 * @param Money|null           $base_price        Mandatory active base price.
+	 * @param int                  $customer_id       Customer identifier (0 represents anonymous/guest).
+	 * @param PricingGroup|null    $group             Assigned pricing group entity, if any.
+	 * @param int|null             $variation_id      Optional variation identifier (> 0).
+	 * @param array<mixed>        $category_ids      Product category identifiers.
+	 * @param array<mixed, mixed> $category_depths   Category hierarchy depth mapping (category_id => depth).
+	 * @param Money|null           $regular_price     Optional regular price metadata.
+	 * @param Money|null           $sale_price        Optional sale price metadata.
+	 * @param int                  $quantity          Item quantity (>= 1, reserved for future quantity pricing).
+	 * @param int|null             $group_id          Optional pricing group identifier fallback.
+	 * @param int                  $currency_decimals Store currency decimal precision (0 to 6, defaults to 2).
+	 * @param bool|null            $is_on_sale        Optional explicit promotional sale state confirmed by store.
 	 *
+	 * @throws MissingBasePriceException
 	 * @throws InvalidPricingContextException
 	 * @throws InvalidProductVariationException
 	 * @throws CurrencyMismatchException
 	 */
 	public function __construct(
 		int $product_id,
-		Money $base_price,
+		?Money $base_price = null,
 		int $customer_id = 0,
 		?PricingGroup $group = null,
 		?int $variation_id = null,
@@ -64,8 +70,14 @@ final class PricingContext {
 		?Money $regular_price = null,
 		?Money $sale_price = null,
 		int $quantity = 1,
-		?int $group_id = null
+		?int $group_id = null,
+		int $currency_decimals = 2,
+		?bool $is_on_sale = null
 	) {
+		if ( null === $base_price ) {
+			throw new MissingBasePriceException( 'Active base price is required and cannot be null or omitted.' );
+		}
+
 		if ( $product_id <= 0 ) {
 			throw new InvalidPricingContextException(
 				sprintf( 'Product ID must be greater than zero, got %d.', $product_id )
@@ -75,6 +87,17 @@ final class PricingContext {
 		if ( $customer_id < 0 ) {
 			throw new InvalidPricingContextException(
 				sprintf( 'Customer ID cannot be negative, got %d.', $customer_id )
+			);
+		}
+
+		if ( $currency_decimals < 0 || $currency_decimals > Money::DEFAULT_SCALE ) {
+			throw new InvalidPricingContextException(
+				sprintf(
+					'Currency decimals must be between 0 and %d, got %d. Tierza v1 supports a maximum of %d decimal places.',
+					Money::DEFAULT_SCALE,
+					$currency_decimals,
+					Money::DEFAULT_SCALE
+				)
 			);
 		}
 
@@ -167,18 +190,20 @@ final class PricingContext {
 			$resolved_group_id = $group_id;
 		}
 
-		$this->product_id      = $product_id;
-		$this->base_price      = $base_price;
-		$this->customer_id     = $customer_id;
-		$this->group           = $group;
-		$this->group_id        = $resolved_group_id;
-		$this->variation_id    = $variation_id;
-		$this->category_ids    = $clean_categories;
-		$this->category_depths = $clean_depths;
-		$this->regular_price   = $regular_price;
-		$this->sale_price      = $sale_price;
-		$this->quantity        = $quantity;
-		$this->currency        = $currency;
+		$this->product_id        = $product_id;
+		$this->base_price        = $base_price;
+		$this->customer_id       = $customer_id;
+		$this->group             = $group;
+		$this->group_id          = $resolved_group_id;
+		$this->variation_id      = $variation_id;
+		$this->category_ids      = $clean_categories;
+		$this->category_depths   = $clean_depths;
+		$this->regular_price     = $regular_price;
+		$this->sale_price        = $sale_price;
+		$this->quantity          = $quantity;
+		$this->currency          = $currency;
+		$this->currency_decimals = $currency_decimals;
+		$this->is_on_sale        = $is_on_sale;
 	}
 
 	public function product_id(): int {
@@ -259,6 +284,54 @@ final class PricingContext {
 		return $this->quantity;
 	}
 
+	public function currency_decimals(): int {
+		return $this->currency_decimals;
+	}
+
+	public function is_on_sale(): ?bool {
+		return $this->is_on_sale;
+	}
+
+	public function is_sale_active(): bool {
+		return true === $this->is_on_sale;
+	}
+
+	public function with_sale_active( bool $is_on_sale ): self {
+		return new self(
+			$this->product_id,
+			$this->base_price,
+			$this->customer_id,
+			$this->group,
+			$this->variation_id,
+			$this->category_ids,
+			$this->category_depths,
+			$this->regular_price,
+			$this->sale_price,
+			$this->quantity,
+			$this->group_id,
+			$this->currency_decimals,
+			$is_on_sale
+		);
+	}
+
+	public function with_currency_decimals( int $currency_decimals ): self {
+		return new self(
+			$this->product_id,
+			$this->base_price,
+			$this->customer_id,
+			$this->group,
+			$this->variation_id,
+			$this->category_ids,
+			$this->category_depths,
+			$this->regular_price,
+			$this->sale_price,
+			$this->quantity,
+			$this->group_id,
+			$currency_decimals,
+			$this->is_on_sale
+		);
+	}
+
 	public function with_quantity( int $quantity ): self {
 		return new self(
 			$this->product_id,
@@ -271,7 +344,9 @@ final class PricingContext {
 			$this->regular_price,
 			$this->sale_price,
 			$quantity,
-			$this->group_id
+			$this->group_id,
+			$this->currency_decimals,
+			$this->is_on_sale
 		);
 	}
 }

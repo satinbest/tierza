@@ -16,10 +16,24 @@ use InvalidArgumentException;
 final class DecimalMath {
 
 	public const DEFAULT_SCALE = 6;
+	public const MAX_SCALE     = 20;
 
 	public const DRIVER_AUTO   = 'auto';
 	public const DRIVER_BCMATH = 'bcmath';
 	public const DRIVER_PHP    = 'php';
+
+	/**
+	 * Validates scale argument across all public arithmetic methods.
+	 *
+	 * @throws InvalidArgumentException If scale is negative or exceeds MAX_SCALE.
+	 */
+	private static function validate_scale( int $scale ): void {
+		if ( $scale < 0 || $scale > self::MAX_SCALE ) {
+			throw new InvalidArgumentException(
+				sprintf( 'Scale must be an integer between 0 and %d, %d given.', self::MAX_SCALE, $scale )
+			);
+		}
+	}
 
 	/**
 	 * Resolves active arithmetic driver.
@@ -46,6 +60,24 @@ final class DecimalMath {
 	}
 
 	/**
+	 * Checks if a numeric string evaluates to exact mathematical zero, regardless of scale.
+	 *
+	 * Returns true for '0', '+0', '-0', '0.0', '0.000000', '-0.000000000000'.
+	 * Returns false for nonzero values such as '0.0000001', '-0.0000001', '1', or invalid strings.
+	 */
+	public static function is_zero( string $val ): bool {
+		$trimmed = trim( $val );
+		if ( ! self::is_valid( $trimmed ) ) {
+			return false;
+		}
+
+		$unsigned    = ltrim( $trimmed, '+-' );
+		$digits_only = str_replace( '.', '', $unsigned );
+
+		return '' === ltrim( $digits_only, '0' );
+	}
+
+	/**
 	 * Normalizes a numeric string to a fixed decimal scale without floating point casting.
 	 * Guarantees that canonical zero never retains a negative sign.
 	 *
@@ -55,6 +87,8 @@ final class DecimalMath {
 	 * @return numeric-string
 	 */
 	public static function normalize( string $val, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
+		self::validate_scale( $scale );
+
 		$val = trim( $val );
 		if ( ! self::is_valid( $val ) ) {
 			throw new InvalidArgumentException( sprintf( 'Invalid decimal string "%s".', $val ) );
@@ -85,6 +119,8 @@ final class DecimalMath {
 	 * @param string|null $driver
 	 */
 	public static function comp( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): int {
+		self::validate_scale( $scale );
+
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -119,6 +155,8 @@ final class DecimalMath {
 	 * @return numeric-string
 	 */
 	public static function add( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
+		self::validate_scale( $scale );
+
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -155,6 +193,8 @@ final class DecimalMath {
 	 * @return numeric-string
 	 */
 	public static function sub( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
+		self::validate_scale( $scale );
+
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -191,6 +231,8 @@ final class DecimalMath {
 	 * @return numeric-string
 	 */
 	public static function mul( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
+		self::validate_scale( $scale );
+
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -227,6 +269,8 @@ final class DecimalMath {
 	 * @return numeric-string
 	 */
 	public static function div( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
+		self::validate_scale( $scale );
+
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -241,7 +285,7 @@ final class DecimalMath {
 			$b = substr( $b, 1 );
 		}
 
-		if ( self::comp( $b, '0', $scale, $driver ) === 0 ) {
+		if ( self::is_zero( $b ) ) {
 			throw new DivisionByZeroError( 'Division by zero in DecimalMath::div().' );
 		}
 
@@ -273,6 +317,18 @@ final class DecimalMath {
 			throw new InvalidArgumentException( sprintf( 'Invalid decimal string for rounding "%s".', $val ) );
 		}
 
+		if ( $precision < 0 || $precision > self::MAX_SCALE ) {
+			throw new InvalidArgumentException(
+				sprintf( 'Precision must be an integer between 0 and %d, %d given.', self::MAX_SCALE, $precision )
+			);
+		}
+
+		if ( PHP_ROUND_HALF_UP !== $mode ) {
+			throw new InvalidArgumentException(
+				sprintf( 'Unsupported rounding mode "%d". Only PHP_ROUND_HALF_UP is supported.', $mode )
+			);
+		}
+
 		if ( str_starts_with( $val, '+' ) ) {
 			$val = substr( $val, 1 );
 		}
@@ -280,27 +336,24 @@ final class DecimalMath {
 		$is_negative = str_starts_with( $val, '-' );
 		$unsigned    = $is_negative ? substr( $val, 1 ) : $val;
 
-		// Pad to at least precision + 4 digits to inspect the rounding check digit.
-		$extra_scale = $precision + 4;
-		$normalized  = self::normalize( $unsigned, $extra_scale, $driver );
-
-		$parts    = explode( '.', $normalized );
-		$integer  = $parts[0];
-		$fraction = $parts[1] ?? str_repeat( '0', $extra_scale );
+		$parts   = explode( '.', $unsigned );
+		$integer = ltrim( $parts[0], '0' );
+		if ( '' === $integer ) {
+			$integer = '0';
+		}
+		$fraction = $parts[1] ?? '';
 
 		$check_digit = (int) ( $fraction[ $precision ] ?? '0' );
-		$main_frac   = substr( $fraction, 0, $precision );
+		$main_frac   = str_pad( substr( $fraction, 0, $precision ), $precision, '0', STR_PAD_RIGHT );
 
-		$should_round_up = false;
-		if ( PHP_ROUND_HALF_UP === $mode ) {
-			$should_round_up = $check_digit >= 5;
-		}
+		$should_round_up = ( $check_digit >= 5 );
 
 		if ( ! $should_round_up ) {
 			$res     = $precision > 0 ? $integer . '.' . $main_frac : $integer;
 			$is_zero = ( '0' === $integer && ( '' === $main_frac || 1 === preg_match( '/^0+$/', $main_frac ) ) );
-			/** @var numeric-string */
-			return ( $is_negative && ! $is_zero ) ? '-' . $res : $res;
+			$final   = ( $is_negative && ! $is_zero ) ? '-' . $res : $res;
+			assert( is_numeric( $final ) );
+			return $final;
 		}
 
 		// Add 1 to the least significant place
@@ -313,8 +366,9 @@ final class DecimalMath {
 		$rounded   = self::add( $truncated, $increment, $precision, $driver );
 
 		$is_zero = ( '0' === $rounded || '0.' . str_repeat( '0', $precision ) === $rounded );
-		/** @var numeric-string */
-		return ( $is_negative && ! $is_zero ) ? '-' . $rounded : $rounded;
+		$final   = ( $is_negative && ! $is_zero ) ? '-' . $rounded : $rounded;
+		assert( is_numeric( $final ) );
+		return $final;
 	}
 
 	// --------------------------------------------------------------------------
@@ -429,34 +483,49 @@ final class DecimalMath {
 	}
 
 	/**
+	 * Splits a signed decimal string into its sign, integer part, and fractional part.
+	 *
+	 * @return array{0: bool, 1: string, 2: string} [is_negative, integer_part, fractional_part]
+	 */
+	private static function split_parts( string $val ): array {
+		$is_neg = str_starts_with( $val, '-' );
+		$clean  = $is_neg ? substr( $val, 1 ) : $val;
+		$parts  = explode( '.', $clean );
+
+		$int_part = ltrim( $parts[0], '0' );
+		if ( '' === $int_part ) {
+			$int_part = '0';
+		}
+
+		$frac_part = $parts[1] ?? '';
+
+		return [ $is_neg, $int_part, $frac_part ];
+	}
+
+	/**
 	 * @return numeric-string
 	 */
 	private static function fallback_add( string $a, string $b, int $scale ): string {
-		$norm_a = self::fallback_normalize( $a, $scale );
-		$norm_b = self::fallback_normalize( $b, $scale );
+		[ $is_neg_a, $int_a, $frac_a ] = self::split_parts( $a );
+		[ $is_neg_b, $int_b, $frac_b ] = self::split_parts( $b );
 
-		$parts_a = explode( '.', $norm_a );
-		$parts_b = explode( '.', $norm_b );
+		$max_d = max( strlen( $frac_a ), strlen( $frac_b ) );
 
-		$is_neg_a = str_starts_with( $parts_a[0], '-' );
-		$is_neg_b = str_starts_with( $parts_b[0], '-' );
+		$padded_frac_a = str_pad( $frac_a, $max_d, '0', STR_PAD_RIGHT );
+		$padded_frac_b = str_pad( $frac_b, $max_d, '0', STR_PAD_RIGHT );
 
-		$clean_int_a = $is_neg_a ? substr( $parts_a[0], 1 ) : $parts_a[0];
-		$clean_int_b = $is_neg_b ? substr( $parts_b[0], 1 ) : $parts_b[0];
+		$int_str_a = ( $is_neg_a ? '-' : '' ) . $int_a . $padded_frac_a;
+		$int_str_b = ( $is_neg_b ? '-' : '' ) . $int_b . $padded_frac_b;
 
-		$digits_a = ( $is_neg_a ? '-' : '' ) . $clean_int_a . ( $parts_a[1] ?? '' );
-		$digits_b = ( $is_neg_b ? '-' : '' ) . $clean_int_b . ( $parts_b[1] ?? '' );
-
-		$sum = self::string_add( $digits_a, $digits_b );
-		return self::unscale_digits( $sum, $scale );
+		$sum = self::string_add( $int_str_a, $int_str_b );
+		return self::canonicalize_zero( self::unscale_digits( $sum, $max_d, $scale ), $scale );
 	}
 
 	/**
 	 * @return numeric-string
 	 */
 	private static function fallback_sub( string $a, string $b, int $scale ): string {
-		$norm_b = self::fallback_normalize( $b, $scale );
-		$neg_b  = str_starts_with( $norm_b, '-' ) ? substr( $norm_b, 1 ) : '-' . $norm_b;
+		$neg_b = str_starts_with( $b, '-' ) ? substr( $b, 1 ) : '-' . $b;
 		return self::fallback_add( $a, $neg_b, $scale );
 	}
 
@@ -464,47 +533,35 @@ final class DecimalMath {
 	 * @return numeric-string
 	 */
 	private static function fallback_mul( string $a, string $b, int $scale ): string {
-		$norm_a = self::fallback_normalize( $a, $scale );
-		$norm_b = self::fallback_normalize( $b, $scale );
+		[ $is_neg_a, $int_a, $frac_a ] = self::split_parts( $a );
+		[ $is_neg_b, $int_b, $frac_b ] = self::split_parts( $b );
 
-		$parts_a = explode( '.', $norm_a );
-		$parts_b = explode( '.', $norm_b );
+		$d_a = strlen( $frac_a );
+		$d_b = strlen( $frac_b );
 
-		$is_neg_a = str_starts_with( $parts_a[0], '-' );
-		$is_neg_b = str_starts_with( $parts_b[0], '-' );
-
-		$clean_int_a = $is_neg_a ? substr( $parts_a[0], 1 ) : $parts_a[0];
-		$clean_int_b = $is_neg_b ? substr( $parts_b[0], 1 ) : $parts_b[0];
-
-		$digits_a = ( $is_neg_a ? '-' : '' ) . $clean_int_a . ( $parts_a[1] ?? '' );
-		$digits_b = ( $is_neg_b ? '-' : '' ) . $clean_int_b . ( $parts_b[1] ?? '' );
+		$digits_a = ( $is_neg_a ? '-' : '' ) . $int_a . $frac_a;
+		$digits_b = ( $is_neg_b ? '-' : '' ) . $int_b . $frac_b;
 
 		$product = self::string_mul( $digits_a, $digits_b );
-
-		// Multiplication doubles the scale: unscale by $scale * 2, retaining $scale decimals
-		return self::unscale_digits( $product, $scale * 2, $scale );
+		return self::canonicalize_zero( self::unscale_digits( $product, $d_a + $d_b, $scale ), $scale );
 	}
 
 	/**
 	 * @return numeric-string
 	 */
 	private static function fallback_div( string $a, string $b, int $scale ): string {
-		$norm_a = self::fallback_normalize( $a, $scale );
-		$norm_b = self::fallback_normalize( $b, $scale );
+		[ $is_neg_a, $int_a, $frac_a ] = self::split_parts( $a );
+		[ $is_neg_b, $int_b, $frac_b ] = self::split_parts( $b );
 
-		$parts_a = explode( '.', $norm_a );
-		$parts_b = explode( '.', $norm_b );
+		$max_d = max( strlen( $frac_a ), strlen( $frac_b ) );
 
-		$is_neg_a = str_starts_with( $parts_a[0], '-' );
-		$is_neg_b = str_starts_with( $parts_b[0], '-' );
+		$padded_frac_a = str_pad( $frac_a, $max_d, '0', STR_PAD_RIGHT );
+		$padded_frac_b = str_pad( $frac_b, $max_d, '0', STR_PAD_RIGHT );
 
-		$clean_int_a = $is_neg_a ? substr( $parts_a[0], 1 ) : $parts_a[0];
-		$clean_int_b = $is_neg_b ? substr( $parts_b[0], 1 ) : $parts_b[0];
+		$int_str_a = ( $is_neg_a ? '-' : '' ) . $int_a . $padded_frac_a;
+		$int_str_b = ( $is_neg_b ? '-' : '' ) . $int_b . $padded_frac_b;
 
-		$digits_a = ( $is_neg_a ? '-' : '' ) . $clean_int_a . ( $parts_a[1] ?? '' );
-		$digits_b = ( $is_neg_b ? '-' : '' ) . $clean_int_b . ( $parts_b[1] ?? '' );
-
-		return self::string_div( $digits_a, $digits_b, $scale );
+		return self::canonicalize_zero( self::string_div( $int_str_a, $int_str_b, $scale ), $scale );
 	}
 
 	/**

@@ -72,10 +72,15 @@ IEEE-754 binary floating-point arithmetic (native PHP `float`) is explicitly rej
 - **Internal Scale**: 6 decimal places (`0.000000`), matching database storage `DECIMAL(20,6)`.
 - **Rounding Mode**: `PHP_ROUND_HALF_UP` (standard financial and e-commerce convention).
 - **Format / Display**: Clean formatting to 2, 4, or store-configured decimals without floating-point conversion.
+- **Precision Policy**: `DecimalMath` accepts arbitrary decimal strings with any number of fractional digits without truncation during intermediate arithmetic. Intermediate calculations (addition, subtraction, multiplication, division) preserve full precision of operands and format the final result to the requested `$scale` (defaulting to 6).
+- **Exact Mathematical Zero Detection**: Division-by-zero checking in `DecimalMath::div()` uses `DecimalMath::is_zero()` which checks exact mathematical zero across all digits, independently of output `$scale`. A nonzero sub-scale divisor (such as `0.0000001` or `0.0000000001`) is correctly recognized as nonzero and evaluates to the accurate mathematical quotient rather than falsely triggering a division-by-zero error.
+- **Argument Scale Bounds Validation**: All public arithmetic methods (`normalize`, `comp`, `add`, `sub`, `mul`, `div`, `round`) validate that `$scale` and `$precision` are integers between 0 and `MAX_SCALE = 20`. Negative scales or excessive scales (> 20) strictly throw `InvalidArgumentException`. Unsupported rounding modes in `round()` strictly throw `InvalidArgumentException`.
+- **Boundary Restriction**: `Money` restricts monetary amounts to 6 fractional decimal digits at the domain boundary upon instantiation via `DecimalMath::normalize( $amount, self::DEFAULT_SCALE )`.
 
 ### 3.3 Shared Hosting and BCMath Evaluation
 - On production environments with `ext-bcmath` enabled, `DecimalMath` leverages native C-level routines (`bcadd`, `bcsub`, `bcmul`, `bcdiv`, `bccomp`) for optimal execution speed.
 - In minimal shared hosting environments where `bcmath` is omitted, `DecimalMath` provides an algorithmic pure-PHP string arithmetic fallback.
+- **Parity Verification**: 100% parity across BCMath and Pure-PHP drivers is verified via automated differential testing (`DecimalMathDifferentialTest`), including negative signs, canonical zero representation, sub-scale precision preservation, and edge cases.
 - **Result**: Tierza introduces zero undocumented mandatory PHP extensions and guarantees 100% identical arithmetic behavior regardless of host configuration.
 
 ### 3.4 Multi-Currency, Explicit Store Currency & External Adapter Normalization

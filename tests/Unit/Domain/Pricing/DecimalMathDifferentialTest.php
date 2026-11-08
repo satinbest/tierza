@@ -113,7 +113,7 @@ final class DecimalMathDifferentialTest extends TestCase {
 	 * @dataProvider binary_operations_provider
 	 */
 	public function test_division_parity( string $a, string $b, int $scale ): void {
-		if ( DecimalMath::comp( $b, '0', $scale ) === 0 ) {
+		if ( DecimalMath::is_zero( $b ) ) {
 			$this->expectException( DivisionByZeroError::class );
 			DecimalMath::div( $a, $b, $scale, DecimalMath::DRIVER_PHP );
 			return;
@@ -125,22 +125,145 @@ final class DecimalMathDifferentialTest extends TestCase {
 	}
 
 	public function test_division_by_zero_throws_exception_on_both_drivers(): void {
-		$bcmath_threw = false;
-		try {
-			DecimalMath::div( '100', '0', 6, DecimalMath::DRIVER_BCMATH );
-		} catch ( DivisionByZeroError ) {
-			$bcmath_threw = true;
+		$zero_divisors = [ '0', '-0', '+0', '0.0', '0.000000', '-0.0000000000' ];
+
+		foreach ( $zero_divisors as $divisor ) {
+			$bcmath_threw = false;
+			try {
+				DecimalMath::div( '1', $divisor, 6, DecimalMath::DRIVER_BCMATH );
+			} catch ( DivisionByZeroError ) {
+				$bcmath_threw = true;
+			}
+
+			$php_threw = false;
+			try {
+				DecimalMath::div( '1', $divisor, 6, DecimalMath::DRIVER_PHP );
+			} catch ( DivisionByZeroError ) {
+				$php_threw = true;
+			}
+
+			$this->assertTrue( $bcmath_threw, sprintf( 'BCMath must throw DivisionByZeroError for divisor "%s"', $divisor ) );
+			$this->assertTrue( $php_threw, sprintf( 'Pure PHP driver must throw DivisionByZeroError for divisor "%s"', $divisor ) );
+		}
+	}
+
+	/**
+	 * Tests sub-scale divisors and division edge cases required by code review.
+	 */
+	public function test_sub_scale_divisors_and_division_edge_cases(): void {
+		$cases = [
+			// [ $a, $b, $scale, $expected ]
+			[ '1', '0.0000001', 6, '10000000.000000' ],
+			[ '1', '-0.0000001', 6, '-10000000.000000' ],
+			[ '0', '0.0000001', 6, '0.000000' ],
+			[ '1', '0.000001', 6, '1000000.000000' ],
+			[ '1', '0.0000000001', 6, '10000000000.000000' ],
+			[ '1.0000009', '2.0000009', 6, '0.500000' ],
+			[ '5.5', '0.0000001', 6, '55000000.000000' ],
+			[ '-5.5', '-0.0000001', 6, '55000000.000000' ],
+		];
+
+		foreach ( $cases as [ $a, $b, $scale, $expected ] ) {
+			$bc_res  = DecimalMath::div( $a, $b, $scale, DecimalMath::DRIVER_BCMATH );
+			$php_res = DecimalMath::div( $a, $b, $scale, DecimalMath::DRIVER_PHP );
+
+			$this->assertSame( $expected, $bc_res, sprintf( 'BCMath failed for %s / %s (scale %d)', $a, $b, $scale ) );
+			$this->assertSame( $expected, $php_res, sprintf( 'Pure PHP failed for %s / %s (scale %d)', $a, $b, $scale ) );
+			$this->assertSame( $bc_res, $php_res, sprintf( 'Parity mismatch for %s / %s (scale %d)', $a, $b, $scale ) );
+		}
+	}
+
+	public function test_is_zero_exact_mathematical_evaluation(): void {
+		$zeroes = [
+			'0',
+			'-0',
+			'+0',
+			'0.0',
+			'0.000000',
+			'-0.000000000000',
+			'+0.0000',
+			'000',
+			'-000.000',
+		];
+
+		foreach ( $zeroes as $val ) {
+			$this->assertTrue( DecimalMath::is_zero( $val ), sprintf( 'Expected is_zero("%s") to be true', $val ) );
 		}
 
-		$php_threw = false;
-		try {
-			DecimalMath::div( '100', '0', 6, DecimalMath::DRIVER_PHP );
-		} catch ( DivisionByZeroError ) {
-			$php_threw = true;
-		}
+		$non_zeroes = [
+			'0.0000001',
+			'-0.0000001',
+			'0.000001',
+			'0.0000000001',
+			'1',
+			'-1',
+			'0.00000000000000000001',
+			'abc',
+			'',
+		];
 
-		$this->assertTrue( $bcmath_threw, 'BCMath must throw DivisionByZeroError' );
-		$this->assertTrue( $php_threw, 'Pure PHP driver must throw DivisionByZeroError' );
+		foreach ( $non_zeroes as $val ) {
+			$this->assertFalse( DecimalMath::is_zero( $val ), sprintf( 'Expected is_zero("%s") to be false', $val ) );
+		}
+	}
+
+	public function test_sub_scale_inputs_preserve_precision_across_operations(): void {
+		// Addition preserving beyond scale 6 before truncating
+		$add_bc  = DecimalMath::add( '0.0000006', '0.0000006', 6, DecimalMath::DRIVER_BCMATH );
+		$add_php = DecimalMath::add( '0.0000006', '0.0000006', 6, DecimalMath::DRIVER_PHP );
+		$this->assertSame( '0.000001', $add_bc );
+		$this->assertSame( '0.000001', $add_php );
+
+		// Subtraction preserving beyond scale 6 before truncating
+		$sub_bc  = DecimalMath::sub( '1.0000012', '0.0000006', 6, DecimalMath::DRIVER_BCMATH );
+		$sub_php = DecimalMath::sub( '1.0000012', '0.0000006', 6, DecimalMath::DRIVER_PHP );
+		$this->assertSame( '1.000000', $sub_bc );
+		$this->assertSame( '1.000000', $sub_php );
+
+		// Multiplication preserving sub-scale divisor
+		$mul_bc  = DecimalMath::mul( '10000000', '0.0000001', 6, DecimalMath::DRIVER_BCMATH );
+		$mul_php = DecimalMath::mul( '10000000', '0.0000001', 6, DecimalMath::DRIVER_PHP );
+		$this->assertSame( '1.000000', $mul_bc );
+		$this->assertSame( '1.000000', $mul_php );
+	}
+
+	public function test_scale_arguments_validation(): void {
+		// Negative scale
+		$this->expectException( InvalidArgumentException::class );
+		DecimalMath::normalize( '1.0', -1 );
+	}
+
+	public function test_excessive_scale_arguments_validation(): void {
+		$this->expectException( InvalidArgumentException::class );
+		DecimalMath::normalize( '1.0', 21 );
+	}
+
+	public function test_all_public_arithmetic_methods_reject_invalid_scale(): void {
+		$methods = [
+			fn() => DecimalMath::comp( '1', '2', -1 ),
+			fn() => DecimalMath::comp( '1', '2', 25 ),
+			fn() => DecimalMath::add( '1', '2', -1 ),
+			fn() => DecimalMath::add( '1', '2', 25 ),
+			fn() => DecimalMath::sub( '1', '2', -1 ),
+			fn() => DecimalMath::sub( '1', '2', 25 ),
+			fn() => DecimalMath::mul( '1', '2', -1 ),
+			fn() => DecimalMath::mul( '1', '2', 25 ),
+			fn() => DecimalMath::div( '1', '2', -1 ),
+			fn() => DecimalMath::div( '1', '2', 25 ),
+			fn() => DecimalMath::round( '1.5', -1 ),
+			fn() => DecimalMath::round( '1.5', 25 ),
+			fn() => DecimalMath::round( '1.5', 2, 999 ),
+		];
+
+		foreach ( $methods as $idx => $invoker ) {
+			$threw = false;
+			try {
+				$invoker();
+			} catch ( InvalidArgumentException ) {
+				$threw = true;
+			}
+			$this->assertTrue( $threw, sprintf( 'Method check at index %d must throw InvalidArgumentException', $idx ) );
+		}
 	}
 
 	/**

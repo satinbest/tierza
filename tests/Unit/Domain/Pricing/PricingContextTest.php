@@ -155,6 +155,60 @@ final class PricingContextTest extends TestCase {
 		$this->assertSame( $group, $context->group() );
 	}
 
+	public function test_contradictory_group_entity_and_group_id_throws_exception(): void {
+		$group = new PricingGroup( 'VIP Wholesale', new GroupSlug( 'vip-wholesale' ), 7, 'VIP group', 'active' );
+
+		$this->expectException( InvalidPricingContextException::class );
+		$this->expectExceptionMessage( 'Group ID mismatch: entity group ID (7) does not match supplied group ID (12)' );
+
+		new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '50.00', 'USD' ),
+			group: $group,
+			group_id: 12
+		);
+	}
+
+	public function test_category_depth_mapping_for_missing_category_throws_exception(): void {
+		$this->expectException( InvalidPricingContextException::class );
+		$this->expectExceptionMessage( 'Category depth mapped for category ID 99, but this category is not in the product category IDs list' );
+
+		new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '50.00', 'USD' ),
+			category_ids: [ 5, 8 ],
+			category_depths: [
+				5  => 0,
+				99 => 1,
+			]
+		);
+	}
+
+	public function test_negative_category_depth_throws_exception(): void {
+		$this->expectException( InvalidPricingContextException::class );
+		$this->expectExceptionMessage( 'must be a non-negative integer' );
+
+		new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '50.00', 'USD' ),
+			category_ids: [ 5 ],
+			category_depths: [
+				5 => -1,
+			]
+		);
+	}
+
+	public function test_explicit_zero_base_price_is_supported_consistently(): void {
+		$zero_price = Money::zero( 'USD' );
+		$context    = new PricingContext(
+			product_id: 10,
+			base_price: $zero_price
+		);
+
+		$this->assertTrue( $context->base_price()->is_zero() );
+		$this->assertSame( '0.000000', $context->base_price()->amount() );
+	}
+
 	public function test_with_quantity_returns_immutable_copy(): void {
 		$context = new PricingContext(
 			product_id: 10,

@@ -78,33 +78,43 @@ IEEE-754 binary floating-point arithmetic (native PHP `float`) is explicitly rej
 - In minimal shared hosting environments where `bcmath` is omitted, `DecimalMath` provides an algorithmic pure-PHP string arithmetic fallback.
 - **Result**: Tierza introduces zero undocumented mandatory PHP extensions and guarantees 100% identical arithmetic behavior regardless of host configuration.
 
-### 3.4 Multi-Currency and Explicit Store Currency
+### 3.4 Multi-Currency, Explicit Store Currency & External Adapter Normalization
 - Every `Money` instance is bound to an explicit currency code (e.g. `'USD'`, `'EUR'`, `'IRR'`, `'IRT'`).
 - **Zero Automatic Conversion**: Tierza strictly does **not** assume or perform automatic currency conversions (e.g. 1 Toman = 10 Rials). The store's active currency is authoritative.
 - Operations across different currencies trigger a domain `CurrencyMismatchException`.
+- **Authoritative Types (`string|int`)**: `Money` strictly rejects binary floating-point numbers (`float`) and scientific notation (`1e5`) to prevent float-representation bugs in authoritative prices.
+- **WooCommerce Adapter Normalization**: In future integration tasks (TRZ-010 to TRZ-013), external WooCommerce data (such as `$product->get_price()` which may return float or string) will be sanitized at the adapter boundary using `wc_format_decimal( (string) $raw_price, wc_get_price_decimals() )` before instantiating `Money`. This keeps all float conversions strictly outside the pure domain layer.
 
 ---
 
-## 4. Rule Precedence Specification
+## 4. Rule Precedence Specification (PRD Policy)
 
-Tierza v1 enforces a strict 9-level precedence hierarchy. Rules do **not** stack in v1; exactly one winning rule (or the fallback) applies.
+Tierza v1 enforces a strict deterministic precedence policy:
+1. **Customer overrides Group**: Customer-specific rules take precedence over group-specific rules.
+2. **Variation overrides Product**: Specific variation rules take precedence over general product rules.
+3. **Product overrides Category**: Product rules take precedence over category rules.
+4. **Category overrides Global**: Category rules take precedence over storewide global rules.
+5. **Deeper Hierarchy Wins**: Within category rules, a rule on a deeper (child) category takes precedence over an ancestor (parent) category.
+6. **Lowest Final Price Wins (Equal Depth)**: When multiple category rules match at the same hierarchy depth, the rule producing the **lowest final price** wins (in v1, category rules are percentage-only, so the highest discount percentage wins).
+7. **Smallest Category ID (Deterministic Sibling Tie-Break)**: If the calculated final prices are equal at the same depth, the rule associated with the smaller category ID wins (`category_id ASC`).
+
+### Precedence Hierarchy Mapping:
 
 | Precedence | Level Identifier | Description | Source |
 | :---: | :--- | :--- | :--- |
 | **1** | `CUSTOMER_VARIATION` | Customer-specific rule applied to a product variation | `customer` |
 | **2** | `CUSTOMER_PRODUCT` | Customer-specific rule applied to a specific product | `customer` |
-| **3** | `CUSTOMER_CATEGORY` | Customer-specific rule applied to a product category | `customer` |
+| **3** | `CUSTOMER_CATEGORY` | Customer-specific rule applied to a product category (evaluated via steps 5-7) | `customer` |
 | **4** | `CUSTOMER_GLOBAL` | Customer-specific storewide rule | `customer` |
 | **5** | `GROUP_VARIATION` | Group-specific rule applied to a product variation | `group` |
 | **6** | `GROUP_PRODUCT` | Group-specific rule applied to a specific product | `group` |
-| **7** | `GROUP_CATEGORY` | Group-specific rule applied to a product category | `group` |
+| **7** | `GROUP_CATEGORY` | Group-specific rule applied to a product category (evaluated via steps 5-7) | `group` |
 | **8** | `GROUP_GLOBAL` | Group-specific storewide rule | `group` |
 | **9** | `WOOCOMMERCE_FALLBACK` | Default WooCommerce base / catalog price | `woocommerce` |
 
-### 4.1 Category Hierarchy Tie-Breaking
-When a product belongs to multiple categories or a category tree:
-1. **Hierarchy Depth**: A rule on a deeper (child) category takes precedence over an ancestor (parent) category.
-2. **Deterministic Sibling Tie-Break**: If multiple matching categories share the same hierarchy depth, the conflict is deterministically resolved by lowest category ID (`category_id ASC`). Conflicting rules are never chosen randomly.
+### 4.1 Category Rule Constraints (v1)
+- Category pricing rules are **percentage-based only** in v1 (fixed pricing on categories is disallowed by `PricingRule` invariants).
+- Consequently, step 6 ("lowest final price wins") is directly determined by comparing discount percentages without requiring product price lookups during tier candidate sorting.
 
 ### 4.2 Explicit 0% Rules vs. Missing Rules
 - An active rule with a 0% discount is valid and authoritative. If a customer has a 0% product rule (Level 2), it overrides any group-level discount (e.g., a 20% group rule at Level 6).

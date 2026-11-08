@@ -77,6 +77,90 @@ final class ResolutionResultTest extends TestCase {
 		$this->assertFalse( $result->is_fallback() );
 	}
 
+	public function test_matched_rule_with_fallback_precedence_throws_exception(): void {
+		$rule = new PricingRule(
+			RuleTarget::customer( 15 ),
+			RuleScope::product( 42 ),
+			PricingValue::percentage( 20 ),
+			101
+		);
+
+		$this->expectException( \Tierza\Domain\Exceptions\RuleResolutionException::class );
+		$this->expectExceptionMessage( 'A matched rule cannot have WOOCOMMERCE_FALLBACK precedence' );
+
+		new ResolutionResult(
+			$rule,
+			PrecedenceLevel::WOOCOMMERCE_FALLBACK,
+			PricingSource::WOOCOMMERCE_FALLBACK,
+			'INVALID'
+		);
+	}
+
+	public function test_null_rule_with_non_fallback_precedence_throws_exception(): void {
+		$this->expectException( \Tierza\Domain\Exceptions\RuleResolutionException::class );
+		$this->expectExceptionMessage( 'Null rule result must have WOOCOMMERCE_FALLBACK precedence' );
+
+		new ResolutionResult(
+			null,
+			PrecedenceLevel::CUSTOMER_PRODUCT,
+			PricingSource::CUSTOMER,
+			'INVALID'
+		);
+	}
+
+	public function test_matched_result_with_inactive_rule_throws_exception(): void {
+		$inactive_rule = new PricingRule(
+			RuleTarget::customer( 15 ),
+			RuleScope::product( 42 ),
+			PricingValue::percentage( 20 ),
+			101,
+			status: 'inactive'
+		);
+
+		$this->expectException( \Tierza\Domain\Exceptions\RuleResolutionException::class );
+		$this->expectExceptionMessage( 'Cannot create ResolutionResult with an inactive rule' );
+
+		ResolutionResult::matched( $inactive_rule, PrecedenceLevel::CUSTOMER_PRODUCT );
+	}
+
+	public function test_customer_precedence_with_group_source_throws_exception(): void {
+		$rule = new PricingRule(
+			RuleTarget::customer( 15 ),
+			RuleScope::product( 42 ),
+			PricingValue::percentage( 20 ),
+			101
+		);
+
+		$this->expectException( \Tierza\Domain\Exceptions\RuleResolutionException::class );
+		$this->expectExceptionMessage( 'Customer precedence level must have CUSTOMER pricing source' );
+
+		new ResolutionResult(
+			$rule,
+			PrecedenceLevel::CUSTOMER_PRODUCT,
+			PricingSource::GROUP,
+			'INVALID'
+		);
+	}
+
+	public function test_group_precedence_with_customer_source_throws_exception(): void {
+		$rule = new PricingRule(
+			RuleTarget::group( 5 ),
+			RuleScope::category( 12 ),
+			PricingValue::percentage( 10 ),
+			102
+		);
+
+		$this->expectException( \Tierza\Domain\Exceptions\RuleResolutionException::class );
+		$this->expectExceptionMessage( 'Group precedence level must have GROUP pricing source' );
+
+		new ResolutionResult(
+			$rule,
+			PrecedenceLevel::GROUP_CATEGORY,
+			PricingSource::CUSTOMER,
+			'INVALID'
+		);
+	}
+
 	public function test_fallback_when_no_rules_match(): void {
 		$result = ResolutionResult::fallback(
 			PricingReasonCode::FALLBACK_NO_MATCHING_RULE->value,

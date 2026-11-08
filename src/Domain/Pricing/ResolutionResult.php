@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tierza\Domain\Pricing;
 
 use Tierza\Domain\Entities\PricingRule;
+use Tierza\Domain\Exceptions\RuleResolutionException;
 use Tierza\Domain\Pricing\Enums\PrecedenceLevel;
 use Tierza\Domain\Pricing\Enums\PricingReasonCode;
 use Tierza\Domain\Pricing\Enums\PricingSource;
@@ -31,6 +32,7 @@ final class ResolutionResult {
 	 * @param PricingSource        $source
 	 * @param string               $reason_code
 	 * @param array<string, mixed> $diagnostic_metadata
+	 * @throws RuleResolutionException If an inconsistent result state is provided.
 	 */
 	public function __construct(
 		?PricingRule $rule,
@@ -39,6 +41,41 @@ final class ResolutionResult {
 		string $reason_code,
 		array $diagnostic_metadata = []
 	) {
+		if ( null !== $rule ) {
+			if ( PrecedenceLevel::WOOCOMMERCE_FALLBACK === $precedence_level ) {
+				throw new RuleResolutionException( 'A matched rule cannot have WOOCOMMERCE_FALLBACK precedence.' );
+			}
+
+			if ( ! $rule->status()->is_active() ) {
+				throw new RuleResolutionException(
+					sprintf( 'Cannot create ResolutionResult with an inactive rule (rule ID %s has status "%s").', (string) $rule->id(), $rule->status()->value() )
+				);
+			}
+
+			if ( $precedence_level->is_customer() ) {
+				if ( PricingSource::CUSTOMER !== $source ) {
+					throw new RuleResolutionException( 'Customer precedence level must have CUSTOMER pricing source.' );
+				}
+				if ( ! $rule->target()->is_user() ) {
+					throw new RuleResolutionException( 'Customer precedence level requires a user/customer-targeted rule.' );
+				}
+			} elseif ( $precedence_level->is_group() ) {
+				if ( PricingSource::GROUP !== $source ) {
+					throw new RuleResolutionException( 'Group precedence level must have GROUP pricing source.' );
+				}
+				if ( ! $rule->target()->is_group() ) {
+					throw new RuleResolutionException( 'Group precedence level requires a group-targeted rule.' );
+				}
+			}
+		} else {
+			if ( PrecedenceLevel::WOOCOMMERCE_FALLBACK !== $precedence_level ) {
+				throw new RuleResolutionException( 'Null rule result must have WOOCOMMERCE_FALLBACK precedence.' );
+			}
+			if ( PricingSource::WOOCOMMERCE_FALLBACK !== $source ) {
+				throw new RuleResolutionException( 'Null rule result must have WOOCOMMERCE_FALLBACK pricing source.' );
+			}
+		}
+
 		$this->rule                = $rule;
 		$this->precedence_level    = $precedence_level;
 		$this->source              = $source;

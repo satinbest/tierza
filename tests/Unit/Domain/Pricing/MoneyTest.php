@@ -145,6 +145,18 @@ final class MoneyTest extends TestCase {
 		$this->assertTrue( $a->is_greater_than_or_equal( $c ) );
 	}
 
+	public function test_scientific_notation_string_is_rejected(): void {
+		$this->expectException( InvalidMoneyException::class );
+		$this->expectExceptionMessage( 'without scientific notation' );
+		Money::from( '1e5', 'USD' );
+	}
+
+	public function test_float_input_is_rejected_under_strict_types(): void {
+		$this->expectException( \TypeError::class );
+		/** @phpstan-ignore-next-line */
+		Money::from( 12.50, 'USD' );
+	}
+
 	public function test_round_and_format(): void {
 		$money = Money::from( '12.345678', 'USD' );
 		$this->assertSame( '12.35', $money->format( 2 ) );

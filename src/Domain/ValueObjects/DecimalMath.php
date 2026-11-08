@@ -17,30 +17,59 @@ final class DecimalMath {
 
 	public const DEFAULT_SCALE = 6;
 
+	public const DRIVER_AUTO   = 'auto';
+	public const DRIVER_BCMATH = 'bcmath';
+	public const DRIVER_PHP    = 'php';
+
+	/**
+	 * Resolves active arithmetic driver.
+	 */
+	public static function resolve_driver( ?string $driver = null ): string {
+		if ( self::DRIVER_BCMATH === $driver || self::DRIVER_PHP === $driver ) {
+			return $driver;
+		}
+
+		return extension_loaded( 'bcmath' ) ? self::DRIVER_BCMATH : self::DRIVER_PHP;
+	}
+
 	/**
 	 * Checks if a string is a valid non-empty decimal representation.
+	 * Explicitly rejects scientific notation (e.g. 1e5, 1.5E2).
 	 */
 	public static function is_valid( string $val ): bool {
-		return 1 === preg_match( '/^-?[0-9]+(\.[0-9]+)?$/', trim( $val ) );
+		$trimmed = trim( $val );
+		if ( '' === $trimmed || 1 === preg_match( '/[eE]/', $trimmed ) ) {
+			return false;
+		}
+
+		return 1 === preg_match( '/^[+-]?[0-9]+(\.[0-9]+)?$/', $trimmed );
 	}
 
 	/**
 	 * Normalizes a numeric string to a fixed decimal scale without floating point casting.
+	 * Guarantees that canonical zero never retains a negative sign.
 	 *
-	 * @param string $val
-	 * @param int    $scale
+	 * @param string      $val
+	 * @param int         $scale
+	 * @param string|null $driver Explicit driver for testing ('bcmath'|'php'|null).
 	 * @return numeric-string
 	 */
-	public static function normalize( string $val, int $scale = self::DEFAULT_SCALE ): string {
+	public static function normalize( string $val, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
 		$val = trim( $val );
 		if ( ! self::is_valid( $val ) ) {
 			throw new InvalidArgumentException( sprintf( 'Invalid decimal string "%s".', $val ) );
 		}
 
-		/** @var numeric-string $val */
-		if ( extension_loaded( 'bcmath' ) ) {
-			/** @var numeric-string */
-			return bcadd( $val, '0', $scale );
+		if ( str_starts_with( $val, '+' ) ) {
+			$val = substr( $val, 1 );
+		}
+
+		$active_driver = self::resolve_driver( $driver );
+		if ( self::DRIVER_BCMATH === $active_driver ) {
+			/** @var numeric-string $val */
+			/** @var numeric-string $res */
+			$res = bcadd( $val, '0', $scale );
+			return self::canonicalize_zero( $res, $scale );
 		}
 
 		return self::fallback_normalize( $val, $scale );
@@ -49,8 +78,13 @@ final class DecimalMath {
 	/**
 	 * Compares two decimal strings.
 	 * Returns 0 if equal, 1 if $a > $b, -1 if $a < $b.
+	 *
+	 * @param string      $a
+	 * @param string      $b
+	 * @param int         $scale
+	 * @param string|null $driver
 	 */
-	public static function comp( string $a, string $b, int $scale = self::DEFAULT_SCALE ): int {
+	public static function comp( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): int {
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -58,9 +92,17 @@ final class DecimalMath {
 			throw new InvalidArgumentException( 'Invalid decimal values for comparison.' );
 		}
 
-		/** @var numeric-string $a */
-		/** @var numeric-string $b */
-		if ( extension_loaded( 'bcmath' ) ) {
+		if ( str_starts_with( $a, '+' ) ) {
+			$a = substr( $a, 1 );
+		}
+		if ( str_starts_with( $b, '+' ) ) {
+			$b = substr( $b, 1 );
+		}
+
+		$active_driver = self::resolve_driver( $driver );
+		if ( self::DRIVER_BCMATH === $active_driver ) {
+			/** @var numeric-string $a */
+			/** @var numeric-string $b */
 			return bccomp( $a, $b, $scale );
 		}
 
@@ -70,9 +112,13 @@ final class DecimalMath {
 	/**
 	 * Adds two decimal strings.
 	 *
+	 * @param string      $a
+	 * @param string      $b
+	 * @param int         $scale
+	 * @param string|null $driver
 	 * @return numeric-string
 	 */
-	public static function add( string $a, string $b, int $scale = self::DEFAULT_SCALE ): string {
+	public static function add( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -80,11 +126,20 @@ final class DecimalMath {
 			throw new InvalidArgumentException( 'Invalid decimal values for addition.' );
 		}
 
-		/** @var numeric-string $a */
-		/** @var numeric-string $b */
-		if ( extension_loaded( 'bcmath' ) ) {
-			/** @var numeric-string */
-			return bcadd( $a, $b, $scale );
+		if ( str_starts_with( $a, '+' ) ) {
+			$a = substr( $a, 1 );
+		}
+		if ( str_starts_with( $b, '+' ) ) {
+			$b = substr( $b, 1 );
+		}
+
+		$active_driver = self::resolve_driver( $driver );
+		if ( self::DRIVER_BCMATH === $active_driver ) {
+			/** @var numeric-string $a */
+			/** @var numeric-string $b */
+			/** @var numeric-string $res */
+			$res = bcadd( $a, $b, $scale );
+			return self::canonicalize_zero( $res, $scale );
 		}
 
 		return self::fallback_add( $a, $b, $scale );
@@ -93,9 +148,13 @@ final class DecimalMath {
 	/**
 	 * Subtracts $b from $a ($a - $b).
 	 *
+	 * @param string      $a
+	 * @param string      $b
+	 * @param int         $scale
+	 * @param string|null $driver
 	 * @return numeric-string
 	 */
-	public static function sub( string $a, string $b, int $scale = self::DEFAULT_SCALE ): string {
+	public static function sub( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -103,11 +162,20 @@ final class DecimalMath {
 			throw new InvalidArgumentException( 'Invalid decimal values for subtraction.' );
 		}
 
-		/** @var numeric-string $a */
-		/** @var numeric-string $b */
-		if ( extension_loaded( 'bcmath' ) ) {
-			/** @var numeric-string */
-			return bcsub( $a, $b, $scale );
+		if ( str_starts_with( $a, '+' ) ) {
+			$a = substr( $a, 1 );
+		}
+		if ( str_starts_with( $b, '+' ) ) {
+			$b = substr( $b, 1 );
+		}
+
+		$active_driver = self::resolve_driver( $driver );
+		if ( self::DRIVER_BCMATH === $active_driver ) {
+			/** @var numeric-string $a */
+			/** @var numeric-string $b */
+			/** @var numeric-string $res */
+			$res = bcsub( $a, $b, $scale );
+			return self::canonicalize_zero( $res, $scale );
 		}
 
 		return self::fallback_sub( $a, $b, $scale );
@@ -116,9 +184,13 @@ final class DecimalMath {
 	/**
 	 * Multiplies two decimal strings.
 	 *
+	 * @param string      $a
+	 * @param string      $b
+	 * @param int         $scale
+	 * @param string|null $driver
 	 * @return numeric-string
 	 */
-	public static function mul( string $a, string $b, int $scale = self::DEFAULT_SCALE ): string {
+	public static function mul( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -126,11 +198,20 @@ final class DecimalMath {
 			throw new InvalidArgumentException( 'Invalid decimal values for multiplication.' );
 		}
 
-		/** @var numeric-string $a */
-		/** @var numeric-string $b */
-		if ( extension_loaded( 'bcmath' ) ) {
-			/** @var numeric-string */
-			return bcmul( $a, $b, $scale );
+		if ( str_starts_with( $a, '+' ) ) {
+			$a = substr( $a, 1 );
+		}
+		if ( str_starts_with( $b, '+' ) ) {
+			$b = substr( $b, 1 );
+		}
+
+		$active_driver = self::resolve_driver( $driver );
+		if ( self::DRIVER_BCMATH === $active_driver ) {
+			/** @var numeric-string $a */
+			/** @var numeric-string $b */
+			/** @var numeric-string $res */
+			$res = bcmul( $a, $b, $scale );
+			return self::canonicalize_zero( $res, $scale );
 		}
 
 		return self::fallback_mul( $a, $b, $scale );
@@ -139,9 +220,13 @@ final class DecimalMath {
 	/**
 	 * Divides $a by $b ($a / $b).
 	 *
+	 * @param string      $a
+	 * @param string      $b
+	 * @param int         $scale
+	 * @param string|null $driver
 	 * @return numeric-string
 	 */
-	public static function div( string $a, string $b, int $scale = self::DEFAULT_SCALE ): string {
+	public static function div( string $a, string $b, int $scale = self::DEFAULT_SCALE, ?string $driver = null ): string {
 		$a = trim( $a );
 		$b = trim( $b );
 
@@ -149,15 +234,24 @@ final class DecimalMath {
 			throw new InvalidArgumentException( 'Invalid decimal values for division.' );
 		}
 
-		if ( self::comp( $b, '0', $scale ) === 0 ) {
+		if ( str_starts_with( $a, '+' ) ) {
+			$a = substr( $a, 1 );
+		}
+		if ( str_starts_with( $b, '+' ) ) {
+			$b = substr( $b, 1 );
+		}
+
+		if ( self::comp( $b, '0', $scale, $driver ) === 0 ) {
 			throw new DivisionByZeroError( 'Division by zero in DecimalMath::div().' );
 		}
 
-		/** @var numeric-string $a */
-		/** @var numeric-string $b */
-		if ( extension_loaded( 'bcmath' ) ) {
-			/** @var numeric-string */
-			return bcdiv( $a, $b, $scale );
+		$active_driver = self::resolve_driver( $driver );
+		if ( self::DRIVER_BCMATH === $active_driver ) {
+			/** @var numeric-string $a */
+			/** @var numeric-string $b */
+			/** @var numeric-string $res */
+			$res = bcdiv( $a, $b, $scale );
+			return self::canonicalize_zero( $res, $scale );
 		}
 
 		return self::fallback_div( $a, $b, $scale );
@@ -165,24 +259,30 @@ final class DecimalMath {
 
 	/**
 	 * Deterministically rounds a decimal string to the target decimal places (Half-Up).
+	 * Guarantees that canonical zero never retains a negative sign.
 	 *
-	 * @param string $val
-	 * @param int    $precision
-	 * @param int    $mode Currently PHP_ROUND_HALF_UP (default) is supported.
+	 * @param string      $val
+	 * @param int         $precision
+	 * @param int         $mode Currently PHP_ROUND_HALF_UP (default) is supported.
+	 * @param string|null $driver
 	 * @return numeric-string
 	 */
-	public static function round( string $val, int $precision = 2, int $mode = PHP_ROUND_HALF_UP ): string {
+	public static function round( string $val, int $precision = 2, int $mode = PHP_ROUND_HALF_UP, ?string $driver = null ): string {
 		$val = trim( $val );
 		if ( ! self::is_valid( $val ) ) {
 			throw new InvalidArgumentException( sprintf( 'Invalid decimal string for rounding "%s".', $val ) );
 		}
 
+		if ( str_starts_with( $val, '+' ) ) {
+			$val = substr( $val, 1 );
+		}
+
 		$is_negative = str_starts_with( $val, '-' );
 		$unsigned    = $is_negative ? substr( $val, 1 ) : $val;
 
-		// Pad to at least precision + 1 digits to inspect the rounding digit.
+		// Pad to at least precision + 4 digits to inspect the rounding check digit.
 		$extra_scale = $precision + 4;
-		$normalized  = self::normalize( $unsigned, $extra_scale );
+		$normalized  = self::normalize( $unsigned, $extra_scale, $driver );
 
 		$parts    = explode( '.', $normalized );
 		$integer  = $parts[0];
@@ -197,9 +297,10 @@ final class DecimalMath {
 		}
 
 		if ( ! $should_round_up ) {
-			$result = $precision > 0 ? $integer . '.' . $main_frac : $integer;
+			$res     = $precision > 0 ? $integer . '.' . $main_frac : $integer;
+			$is_zero = ( '0' === $integer && ( '' === $main_frac || 1 === preg_match( '/^0+$/', $main_frac ) ) );
 			/** @var numeric-string */
-			return $is_negative && self::comp( $result, '0', $precision ) !== 0 ? '-' . $result : $result;
+			return ( $is_negative && ! $is_zero ) ? '-' . $res : $res;
 		}
 
 		// Add 1 to the least significant place
@@ -209,20 +310,48 @@ final class DecimalMath {
 		}
 
 		$truncated = $precision > 0 ? $integer . '.' . $main_frac : $integer;
-		$rounded   = self::add( $truncated, $increment, $precision );
+		$rounded   = self::add( $truncated, $increment, $precision, $driver );
 
+		$is_zero = ( '0' === $rounded || '0.' . str_repeat( '0', $precision ) === $rounded );
 		/** @var numeric-string */
-		return $is_negative && self::comp( $rounded, '0', $precision ) !== 0 ? '-' . $rounded : $rounded;
+		return ( $is_negative && ! $is_zero ) ? '-' . $rounded : $rounded;
 	}
 
 	// --------------------------------------------------------------------------
-	// Pure PHP Fallback Algorithms (Zero Float Precision Loss)
+	// Canonical Zero & Pure PHP Fallback Algorithms
 	// --------------------------------------------------------------------------
+
+	/**
+	 * Ensures that any representation of numerical zero is unsigned.
+	 *
+	 * @return numeric-string
+	 */
+	private static function canonicalize_zero( string $val, int $scale ): string {
+		$is_neg = str_starts_with( $val, '-' );
+		$clean  = $is_neg ? substr( $val, 1 ) : $val;
+		$parts  = explode( '.', $clean );
+		$int    = ltrim( $parts[0], '0' );
+		$frac   = $parts[1] ?? '';
+
+		$is_zero = ( '' === $int || '0' === $int ) && ( '' === $frac || 1 === preg_match( '/^0+$/', $frac ) );
+		if ( $is_zero ) {
+			$zero_res = $scale > 0 ? '0.' . str_repeat( '0', $scale ) : '0';
+			assert( is_numeric( $zero_res ) );
+			return $zero_res;
+		}
+
+		/** @var numeric-string $val */
+		return $val;
+	}
 
 	/**
 	 * @return numeric-string
 	 */
 	private static function fallback_normalize( string $val, int $scale ): string {
+		if ( str_starts_with( $val, '+' ) ) {
+			$val = substr( $val, 1 );
+		}
+
 		$is_neg   = str_starts_with( $val, '-' );
 		$unsigned = $is_neg ? substr( $val, 1 ) : $val;
 
@@ -239,8 +368,15 @@ final class DecimalMath {
 			$frac_part = substr( $frac_part, 0, $scale );
 		}
 
+		$is_zero = ( '0' === $int_part && ( '' === $frac_part || 1 === preg_match( '/^0+$/', $frac_part ) ) );
+		if ( $is_zero ) {
+			$zero_res = $scale > 0 ? '0.' . str_repeat( '0', $scale ) : '0';
+			assert( is_numeric( $zero_res ) );
+			return $zero_res;
+		}
+
 		$res = $scale > 0 ? $int_part . '.' . $frac_part : $int_part;
-		if ( $is_neg && '0' !== $int_part ) {
+		if ( $is_neg ) {
 			$res = '-' . $res;
 		}
 
@@ -302,16 +438,16 @@ final class DecimalMath {
 		$parts_a = explode( '.', $norm_a );
 		$parts_b = explode( '.', $norm_b );
 
-		$digits_a = $parts_a[0] . ( $parts_a[1] ?? '' );
-		$digits_b = $parts_b[0] . ( $parts_b[1] ?? '' );
+		$is_neg_a = str_starts_with( $parts_a[0], '-' );
+		$is_neg_b = str_starts_with( $parts_b[0], '-' );
 
-		// For standard safe ranges (common e-commerce values), add using integer or string addition:
-		if ( function_exists( 'gmp_add' ) ) {
-			$sum = gmp_strval( gmp_add( $digits_a, $digits_b ) );
-		} else {
-			$sum = self::string_add( $digits_a, $digits_b );
-		}
+		$clean_int_a = $is_neg_a ? substr( $parts_a[0], 1 ) : $parts_a[0];
+		$clean_int_b = $is_neg_b ? substr( $parts_b[0], 1 ) : $parts_b[0];
 
+		$digits_a = ( $is_neg_a ? '-' : '' ) . $clean_int_a . ( $parts_a[1] ?? '' );
+		$digits_b = ( $is_neg_b ? '-' : '' ) . $clean_int_b . ( $parts_b[1] ?? '' );
+
+		$sum = self::string_add( $digits_a, $digits_b );
 		return self::unscale_digits( $sum, $scale );
 	}
 
@@ -319,7 +455,8 @@ final class DecimalMath {
 	 * @return numeric-string
 	 */
 	private static function fallback_sub( string $a, string $b, int $scale ): string {
-		$neg_b = str_starts_with( $b, '-' ) ? substr( $b, 1 ) : '-' . $b;
+		$norm_b = self::fallback_normalize( $b, $scale );
+		$neg_b  = str_starts_with( $norm_b, '-' ) ? substr( $norm_b, 1 ) : '-' . $norm_b;
 		return self::fallback_add( $a, $neg_b, $scale );
 	}
 
@@ -327,19 +464,24 @@ final class DecimalMath {
 	 * @return numeric-string
 	 */
 	private static function fallback_mul( string $a, string $b, int $scale ): string {
-		$parts_a = explode( '.', self::fallback_normalize( $a, $scale ) );
-		$parts_b = explode( '.', self::fallback_normalize( $b, $scale ) );
+		$norm_a = self::fallback_normalize( $a, $scale );
+		$norm_b = self::fallback_normalize( $b, $scale );
 
-		$digits_a = $parts_a[0] . ( $parts_a[1] ?? '' );
-		$digits_b = $parts_b[0] . ( $parts_b[1] ?? '' );
+		$parts_a = explode( '.', $norm_a );
+		$parts_b = explode( '.', $norm_b );
 
-		if ( function_exists( 'gmp_mul' ) ) {
-			$product = gmp_strval( gmp_mul( $digits_a, $digits_b ) );
-		} else {
-			$product = self::string_mul( $digits_a, $digits_b );
-		}
+		$is_neg_a = str_starts_with( $parts_a[0], '-' );
+		$is_neg_b = str_starts_with( $parts_b[0], '-' );
 
-		// Multiplication doubles the total scale ($scale * 2). We must adjust back to $scale.
+		$clean_int_a = $is_neg_a ? substr( $parts_a[0], 1 ) : $parts_a[0];
+		$clean_int_b = $is_neg_b ? substr( $parts_b[0], 1 ) : $parts_b[0];
+
+		$digits_a = ( $is_neg_a ? '-' : '' ) . $clean_int_a . ( $parts_a[1] ?? '' );
+		$digits_b = ( $is_neg_b ? '-' : '' ) . $clean_int_b . ( $parts_b[1] ?? '' );
+
+		$product = self::string_mul( $digits_a, $digits_b );
+
+		// Multiplication doubles the scale: unscale by $scale * 2, retaining $scale decimals
 		return self::unscale_digits( $product, $scale * 2, $scale );
 	}
 
@@ -347,21 +489,120 @@ final class DecimalMath {
 	 * @return numeric-string
 	 */
 	private static function fallback_div( string $a, string $b, int $scale ): string {
-		// Shift dividend by additional scale digits for division precision
-		$norm_a   = self::fallback_normalize( $a, $scale );
-		$norm_b   = self::fallback_normalize( $b, $scale );
-		$parts_a  = explode( '.', $norm_a );
-		$parts_b  = explode( '.', $norm_b );
-		$digits_a = $parts_a[0] . ( $parts_a[1] ?? '' ) . str_repeat( '0', $scale );
-		$digits_b = $parts_b[0] . ( $parts_b[1] ?? '' );
+		$norm_a = self::fallback_normalize( $a, $scale );
+		$norm_b = self::fallback_normalize( $b, $scale );
 
-		if ( function_exists( 'gmp_div_q' ) ) {
-			$quotient = gmp_strval( gmp_div_q( $digits_a, $digits_b ) );
-		} else {
-			$quotient = (string) intdiv( (int) $digits_a, (int) $digits_b );
+		$parts_a = explode( '.', $norm_a );
+		$parts_b = explode( '.', $norm_b );
+
+		$is_neg_a = str_starts_with( $parts_a[0], '-' );
+		$is_neg_b = str_starts_with( $parts_b[0], '-' );
+
+		$clean_int_a = $is_neg_a ? substr( $parts_a[0], 1 ) : $parts_a[0];
+		$clean_int_b = $is_neg_b ? substr( $parts_b[0], 1 ) : $parts_b[0];
+
+		$digits_a = ( $is_neg_a ? '-' : '' ) . $clean_int_a . ( $parts_a[1] ?? '' );
+		$digits_b = ( $is_neg_b ? '-' : '' ) . $clean_int_b . ( $parts_b[1] ?? '' );
+
+		return self::string_div( $digits_a, $digits_b, $scale );
+	}
+
+	/**
+	 * Arbitrary precision string division using schoolbook long division algorithm.
+	 *
+	 * @return numeric-string
+	 */
+	private static function string_div( string $dividend, string $divisor, int $scale ): string {
+		$clean_div = ltrim( str_replace( '-', '', $divisor ), '0' );
+		if ( '' === $clean_div ) {
+			throw new DivisionByZeroError( 'Division by zero in DecimalMath::string_div().' );
 		}
 
-		return self::unscale_digits( $quotient, $scale );
+		$neg_a  = str_starts_with( $dividend, '-' );
+		$neg_b  = str_starts_with( $divisor, '-' );
+		$is_neg = ( $neg_a xor $neg_b );
+
+		$clean_a = ltrim( $neg_a ? substr( $dividend, 1 ) : $dividend, '0' );
+		$clean_b = $clean_div;
+
+		if ( '' === $clean_a ) {
+			$zero_res = $scale > 0 ? '0.' . str_repeat( '0', $scale ) : '0';
+			assert( is_numeric( $zero_res ) );
+			return $zero_res;
+		}
+
+		// Shift dividend by target scale
+		$shifted = $clean_a . str_repeat( '0', $scale );
+
+		$quotient  = '';
+		$remainder = '';
+		$len       = strlen( $shifted );
+
+		for ( $i = 0; $i < $len; $i++ ) {
+			$remainder .= $shifted[ $i ];
+			$remainder  = ltrim( $remainder, '0' );
+			if ( '' === $remainder ) {
+				$quotient .= '0';
+				continue;
+			}
+
+			if ( self::comp_digits( $remainder, $clean_b ) < 0 ) {
+				$quotient .= '0';
+				continue;
+			}
+
+			// Binary search for quotient digit 1..9
+			$low   = 1;
+			$high  = 9;
+			$digit = 0;
+			while ( $low <= $high ) {
+				$mid     = (int) ( ( $low + $high ) / 2 );
+				$product = self::string_mul_single( $clean_b, $mid );
+				$c       = self::comp_digits( $product, $remainder );
+				if ( $c <= 0 ) {
+					$digit = $mid;
+					$low   = $mid + 1;
+				} else {
+					$high = $mid - 1;
+				}
+			}
+
+			$product   = self::string_mul_single( $clean_b, $digit );
+			$remainder = self::string_sub_pos( $remainder, $product );
+			$quotient .= (string) $digit;
+		}
+
+		$quotient = ltrim( $quotient, '0' );
+		if ( '' === $quotient ) {
+			$quotient = '0';
+		}
+
+		return self::unscale_digits( ( $is_neg ? '-' : '' ) . $quotient, $scale );
+	}
+
+	private static function string_mul_single( string $num, int $digit ): string {
+		if ( 0 === $digit || '0' === $num ) {
+			return '0';
+		}
+		if ( 1 === $digit ) {
+			return $num;
+		}
+
+		$carry = 0;
+		$res   = '';
+		$len   = strlen( $num );
+
+		for ( $i = $len - 1; $i >= 0; $i-- ) {
+			$prod  = ( ( (int) $num[ $i ] ) * $digit ) + $carry;
+			$res   = ( $prod % 10 ) . $res;
+			$carry = intdiv( $prod, 10 );
+		}
+
+		if ( $carry > 0 ) {
+			$res = $carry . $res;
+		}
+
+		return $res;
 	}
 
 	/**
@@ -372,7 +613,8 @@ final class DecimalMath {
 		$neg_b = str_starts_with( $b, '-' );
 
 		if ( $neg_a && $neg_b ) {
-			return '-' . self::string_add_pos( substr( $a, 1 ), substr( $b, 1 ) );
+			$sum = self::string_add_pos( substr( $a, 1 ), substr( $b, 1 ) );
+			return '0' === $sum ? '0' : '-' . $sum;
 		}
 		if ( ! $neg_a && ! $neg_b ) {
 			return self::string_add_pos( $a, $b );
@@ -405,6 +647,8 @@ final class DecimalMath {
 	}
 
 	private static function string_sub_pos( string $a, string $b ): string {
+		$a   = ltrim( $a, '0' );
+		$b   = ltrim( $b, '0' );
 		$cmp = self::comp_digits( $a, $b );
 		if ( 0 === $cmp ) {
 			return '0';
@@ -500,6 +744,11 @@ final class DecimalMath {
 		$int_part  = substr( $padded, 0, strlen( $padded ) - $current_scale );
 		$frac_part = substr( $padded, -$current_scale );
 
+		$int_part = ltrim( $int_part, '0' );
+		if ( '' === $int_part ) {
+			$int_part = '0';
+		}
+
 		if ( $target_scale !== $current_scale ) {
 			if ( $target_scale < $current_scale ) {
 				$frac_part = substr( $frac_part, 0, $target_scale );
@@ -508,10 +757,19 @@ final class DecimalMath {
 			}
 		}
 
-		$res = $target_scale > 0 ? $int_part . '.' . $frac_part : $int_part;
-		$res = $is_neg && '0' !== $int_part ? '-' . $res : $res;
+		$is_zero = ( '0' === $int_part && ( '' === $frac_part || 1 === preg_match( '/^0+$/', $frac_part ) ) );
+		if ( $is_zero ) {
+			$zero_res = $target_scale > 0 ? '0.' . str_repeat( '0', $target_scale ) : '0';
+			assert( is_numeric( $zero_res ) );
+			return $zero_res;
+		}
 
-		/** @var numeric-string $res */
+		$res = $target_scale > 0 ? $int_part . '.' . $frac_part : $int_part;
+		if ( $is_neg ) {
+			$res = '-' . $res;
+		}
+
+		assert( is_numeric( $res ) );
 		return $res;
 	}
 }

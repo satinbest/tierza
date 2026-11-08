@@ -37,4 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Authoritative price calculation contract (PriceCalculatorInterface) supporting percentage discounts and fixed pricing (TRZ-005).
 - Immutable PricingResult domain contract with machine-readable reason codes, explicit 0% rule vs no-rule distinction, and safe audit metadata (TRZ-005).
 - Comprehensive pricing architecture specification (docs/architecture/pricing-contracts.md) (TRZ-005).
-- 45 new unit tests bringing PHPUnit suite to 136 tests with 641 assertions passing at 100% (TRZ-005).
+- Fixed DecimalMath sign preservation on negative fractions (e.g. -0.5, -0.125) and canonical unsigned zero across BCMath and pure-PHP fallback (TRZ-005).
+- Comprehensive differential test suite (DecimalMathDifferentialTest) verifying 100% parity between BCMath and pure-PHP fallback drivers (TRZ-005).
+- Hardened Money construction to strictly accept string|int only, rejecting binary float and scientific notation (TRZ-005).
+- Reconciled category tie-breaking specification with 7-step PRD policy: deeper hierarchy depth wins; equal depth resolved by lowest final price; equal prices resolved by smaller category ID (TRZ-005).
+- Enforced strict PricingContext consistency (group entity vs group_id, category depth mapping validation, and anonymous customer isolation) (TRZ-005).
+- Hardened ResolutionResult validation with invariant checks preventing inconsistent or corrupted result states (TRZ-005).
+- Expanded PHPUnit unit test suite to 209 tests with 810 assertions passing at 100% (TRZ-005).

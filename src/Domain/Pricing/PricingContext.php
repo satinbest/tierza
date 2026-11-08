@@ -120,6 +120,13 @@ final class PricingContext {
 			);
 		}
 
+		// Validate group entity and group ID consistency.
+		if ( null !== $group && null !== $group_id && null !== $group->id() && $group->id() !== $group_id ) {
+			throw new InvalidPricingContextException(
+				sprintf( 'Group ID mismatch: entity group ID (%d) does not match supplied group ID (%d).', $group->id(), $group_id )
+			);
+		}
+
 		// Sanitize and validate category IDs
 		$clean_categories = [];
 		foreach ( $category_ids as $cid ) {
@@ -132,12 +139,25 @@ final class PricingContext {
 		}
 		$clean_categories = array_values( array_unique( $clean_categories ) );
 
-		// Sanitize category depths
+		// Validate category depths: must reference present categories and non-negative depths (not silently ignored)
 		$clean_depths = [];
 		foreach ( $category_depths as $cid => $depth ) {
-			if ( is_int( $cid ) && is_int( $depth ) && $depth >= 0 ) {
-				$clean_depths[ $cid ] = $depth;
+			if ( ! is_int( $cid ) || $cid <= 0 ) {
+				throw new InvalidPricingContextException(
+					sprintf( 'Category depth mapping key must be a positive integer category ID, got %s.', (string) $cid )
+				);
 			}
+			if ( ! in_array( $cid, $clean_categories, true ) ) {
+				throw new InvalidPricingContextException(
+					sprintf( 'Category depth mapped for category ID %d, but this category is not in the product category IDs list.', $cid )
+				);
+			}
+			if ( ! is_int( $depth ) || $depth < 0 ) {
+				throw new InvalidPricingContextException(
+					sprintf( 'Category depth for category ID %d must be a non-negative integer, got %s.', $cid, is_numeric( $depth ) ? (string) $depth : gettype( $depth ) )
+				);
+			}
+			$clean_depths[ $cid ] = $depth;
 		}
 
 		$resolved_group_id = null;

@@ -24,11 +24,11 @@ final class Money {
 	private readonly string $currency;
 
 	/**
-	 * @param string|int|float $amount
-	 * @param string           $currency
+	 * @param string|int $amount
+	 * @param string     $currency
 	 * @throws InvalidMoneyException
 	 */
-	public function __construct( string|int|float $amount, string $currency ) {
+	public function __construct( string|int $amount, string $currency ) {
 		$clean_currency = strtoupper( trim( $currency ) );
 		if ( '' === $clean_currency ) {
 			throw new InvalidMoneyException( 'Currency code cannot be empty.' );
@@ -37,7 +37,7 @@ final class Money {
 		$amount_str = is_string( $amount ) ? trim( $amount ) : (string) $amount;
 		if ( '' === $amount_str || ! is_numeric( $amount_str ) || ! DecimalMath::is_valid( $amount_str ) ) {
 			throw new InvalidMoneyException(
-				sprintf( 'Invalid monetary amount "%s". Amount must be a valid numeric string.', $amount_str )
+				sprintf( 'Invalid monetary amount "%s". Amount must be a valid non-empty numeric string without scientific notation.', $amount_str )
 			);
 		}
 
@@ -53,7 +53,7 @@ final class Money {
 		$this->currency = $clean_currency;
 	}
 
-	public static function from( string|int|float $amount, string $currency ): self {
+	public static function from( string|int $amount, string $currency ): self {
 		return new self( $amount, $currency );
 	}
 
@@ -165,9 +165,10 @@ final class Money {
 	/**
 	 * Multiplies money by a non-negative multiplier factor.
 	 *
+	 * @param string|int $factor
 	 * @throws InvalidMoneyException
 	 */
-	public function multiply( string|int|float $factor ): self {
+	public function multiply( string|int $factor ): self {
 		$factor_str = is_string( $factor ) ? trim( $factor ) : (string) $factor;
 		if ( ! is_numeric( $factor_str ) || ! DecimalMath::is_valid( $factor_str ) ) {
 			throw new InvalidMoneyException(
@@ -192,10 +193,10 @@ final class Money {
 	 *
 	 * Clamps at zero if percentage >= 100%.
 	 *
-	 * @param string|int|float $percentage
+	 * @param string|int $percentage
 	 * @throws InvalidMoneyException
 	 */
-	public function apply_percentage_discount( string|int|float $percentage ): self {
+	public function apply_percentage_discount( string|int $percentage ): self {
 		$percent_str = is_string( $percentage ) ? trim( $percentage ) : (string) $percentage;
 		if ( ! is_numeric( $percent_str ) || ! DecimalMath::is_valid( $percent_str ) ) {
 			throw new InvalidMoneyException(

@@ -15,6 +15,9 @@
     "require": {
         "php": ">=8.1"
     },
+    "suggest": {
+        "ext-bcmath": "Accelerates arbitrary-precision decimal arithmetic (deterministic pure-PHP fallback is included)"
+    },
     "require-dev": {
         "dealerdirect/phpcodesniffer-composer-installer": "*",
         "phpstan/phpstan": "^1.12 || ^2.0",

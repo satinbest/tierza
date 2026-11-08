@@ -44,17 +44,17 @@ final class PricingValue {
 		}
 
 		// Normalize to standard decimal format with 6 decimal places.
-		$formatted = self::format_decimal( $string_val );
+		$formatted = DecimalMath::normalize( $string_val, 6 );
 
-		// Validate bounds using bccomp or numerical comparison.
-		if ( bccomp( $formatted, '0.000000', 6 ) < 0 ) {
+		// Validate bounds using DecimalMath.
+		if ( DecimalMath::comp( $formatted, '0.000000', 6 ) < 0 ) {
 			throw new InvalidRuleException(
 				sprintf( 'Pricing value cannot be negative, got "%s".', $formatted )
 			);
 		}
 
 		if ( self::TYPE_PERCENTAGE === $normalized_type ) {
-			if ( bccomp( $formatted, '100.000000', 6 ) > 0 ) {
+			if ( DecimalMath::comp( $formatted, '100.000000', 6 ) > 0 ) {
 				throw new InvalidRuleException(
 					sprintf( 'Percentage discount cannot exceed 100%%, got "%s".', $formatted )
 				);
@@ -85,7 +85,7 @@ final class PricingValue {
 	 * Check if value is explicitly zero (0% or 0.00).
 	 */
 	public function is_zero(): bool {
-		return 0 === bccomp( $this->value, '0.000000', 6 );
+		return 0 === DecimalMath::comp( $this->value, '0.000000', 6 );
 	}
 
 	public function type(): string {
@@ -106,15 +106,11 @@ final class PricingValue {
 	 * @return numeric-string
 	 */
 	public static function format_decimal( string $val ): string {
-		if ( function_exists( 'bcadd' ) ) {
-			/** @var numeric-string */
-			return bcadd( $val, '0', 6 );
-		}
-		return number_format( (float) $val, 6, '.', '' );
+		return DecimalMath::normalize( $val, 6 );
 	}
 
 	public function equals( PricingValue $other ): bool {
-		return $this->type === $other->type() && 0 === bccomp( $this->value, $other->value(), 6 );
+		return $this->type === $other->type() && 0 === DecimalMath::comp( $this->value, $other->value(), 6 );
 	}
 
 	public function __toString(): string {

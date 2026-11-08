@@ -49,6 +49,10 @@ final class RuleTarget {
 		return new self( self::TYPE_USER, $user_id );
 	}
 
+	public static function customer( int $customer_id ): self {
+		return self::user( $customer_id );
+	}
+
 	public function is_group(): bool {
 		return self::TYPE_GROUP === $this->type;
 	}

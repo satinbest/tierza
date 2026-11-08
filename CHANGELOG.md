@@ -31,3 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardened schema verification verifying index uniqueness and exact column sequences (TRZ-004).
 - Entity reference validation (`EntityReferenceValidator`) verifying users, groups, products, variations, and categories (TRZ-004).
 - 31 live database integration and legacy upgrade tests executed on WordPress & MariaDB Docker environment (TRZ-004).
+- Strongly typed immutable PricingContext representing customer, group, product, variation, category hierarchy, quantity, and store currency outside WP globals (TRZ-005).
+- Deterministic arbitrary-precision decimal monetary value objects (Money and DecimalMath) with 6-decimal internal scale and pure-PHP fallback (TRZ-005).
+- Rule resolver domain interface (RuleResolverInterface) with strict 9-level precedence hierarchy and deterministic category tie-breaking specification (TRZ-005).
+- Authoritative price calculation contract (PriceCalculatorInterface) supporting percentage discounts and fixed pricing (TRZ-005).
+- Immutable PricingResult domain contract with machine-readable reason codes, explicit 0% rule vs no-rule distinction, and safe audit metadata (TRZ-005).
+- Comprehensive pricing architecture specification (docs/architecture/pricing-contracts.md) (TRZ-005).
+- Fixed DecimalMath sign preservation on negative fractions (e.g. -0.5, -0.125) and canonical unsigned zero across BCMath and pure-PHP fallback (TRZ-005).
+- Comprehensive differential test suite (DecimalMathDifferentialTest) verifying 100% parity between BCMath and pure-PHP fallback drivers (TRZ-005).
+- Hardened Money construction to strictly accept string|int only, rejecting binary float and scientific notation (TRZ-005).
+- Reconciled category tie-breaking specification with 7-step PRD policy: deeper hierarchy depth wins; equal depth resolved by lowest final price; equal prices resolved by smaller category ID (TRZ-005).
+- Enforced strict PricingContext consistency (group entity vs group_id, category depth mapping validation, and anonymous customer isolation) (TRZ-005).
+- Hardened ResolutionResult validation with invariant checks preventing inconsistent or corrupted result states (TRZ-005).
+- Expanded PHPUnit unit test suite to 209 tests with 810 assertions passing at 100% (TRZ-005).

@@ -287,13 +287,14 @@ final class AuthoritativePriceCalculatorTest extends TestCase {
 	// -------------------------------------------------------------------------
 
 	public function test_percentage_discount_uses_active_sale_price_as_base(): void {
-		// When WooCommerce product is on sale: regular = $100.00, sale = $80.00, active base_price = $80.00
+		// When WooCommerce product has a confirmed active sale: regular = $100.00, sale = $80.00, active base_price = $80.00
 		$context = new PricingContext(
 			product_id: 10,
 			base_price: Money::from( '80.00', 'USD' ),
 			customer_id: 1,
 			regular_price: Money::from( '100.00', 'USD' ),
-			sale_price: Money::from( '80.00', 'USD' )
+			sale_price: Money::from( '80.00', 'USD' ),
+			is_on_sale: true
 		);
 
 		$this->assertTrue( $context->is_sale_active() );
@@ -310,7 +311,7 @@ final class AuthoritativePriceCalculatorTest extends TestCase {
 
 		$this->assertSame( '64.000000', $result->final_price()->amount() );
 		$this->assertSame( '80.000000', $result->original_price()->amount() );
-		$this->assertSame( 'sale_price', $result->diagnostic_metadata()['base_price_type'] );
+		$this->assertSame( 'confirmed_sale_price', $result->diagnostic_metadata()['base_price_type'] );
 	}
 
 	public function test_percentage_discount_uses_regular_price_when_no_sale(): void {
@@ -319,7 +320,8 @@ final class AuthoritativePriceCalculatorTest extends TestCase {
 			base_price: Money::from( '100.00', 'USD' ),
 			customer_id: 1,
 			regular_price: Money::from( '100.00', 'USD' ),
-			sale_price: null
+			sale_price: null,
+			is_on_sale: false
 		);
 
 		$this->assertFalse( $context->is_sale_active() );
@@ -334,7 +336,31 @@ final class AuthoritativePriceCalculatorTest extends TestCase {
 		$result = $this->calculator->calculate( $context, ResolutionResult::matched( $rule, PrecedenceLevel::CUSTOMER_PRODUCT ) );
 
 		$this->assertSame( '80.000000', $result->final_price()->amount() );
-		$this->assertSame( 'regular_price', $result->diagnostic_metadata()['base_price_type'] );
+		$this->assertSame( 'confirmed_regular_price', $result->diagnostic_metadata()['base_price_type'] );
+	}
+
+	public function test_sale_price_unconfirmed_does_not_falsely_claim_sale(): void {
+		// Numerical equality when is_on_sale is null should NOT report confirmed_sale_price
+		$context = new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '80.00', 'USD' ),
+			customer_id: 1,
+			regular_price: Money::from( '100.00', 'USD' ),
+			sale_price: Money::from( '80.00', 'USD' ),
+			is_on_sale: null
+		);
+
+		$rule = new PricingRule(
+			target: RuleTarget::user( 1 ),
+			scope: RuleScope::product( 10 ),
+			pricing_value: PricingValue::percentage( '10.00' ),
+			id: 303
+		);
+
+		$result = $this->calculator->calculate( $context, ResolutionResult::matched( $rule, PrecedenceLevel::CUSTOMER_PRODUCT ) );
+
+		$this->assertSame( 'active_base_price', $result->diagnostic_metadata()['base_price_type'] );
+		$this->assertFalse( $context->is_sale_active() );
 	}
 
 	// -------------------------------------------------------------------------
@@ -800,5 +826,64 @@ final class AuthoritativePriceCalculatorTest extends TestCase {
 		// 20% discount produces 80.00, NEVER compounded with any secondary rule
 		$this->assertSame( '80.000000', $result->final_price()->amount() );
 		$this->assertSame( 903, $result->applied_rule_id() );
+	}
+
+	// -------------------------------------------------------------------------
+	// 11. Currency Precision Bounds and Silent Truncation Prevention
+	// -------------------------------------------------------------------------
+
+	public function test_calculator_rejects_unsupported_currency_decimals_7(): void {
+		$this->expectException( InvalidPricingContextException::class );
+		$this->expectExceptionMessage( 'Default currency decimals must be between 0 and 6, got 7.' );
+		new AuthoritativePriceCalculator( default_currency_decimals: 7 );
+	}
+
+	public function test_calculator_rejects_unsupported_currency_decimals_8(): void {
+		$this->expectException( InvalidPricingContextException::class );
+		$this->expectExceptionMessage( 'Default currency decimals must be between 0 and 6, got 8.' );
+		new AuthoritativePriceCalculator( default_currency_decimals: 8 );
+	}
+
+	public function test_money_rejects_values_with_more_than_six_fractional_digits(): void {
+		$this->expectException( InvalidMoneyException::class );
+		$this->expectExceptionMessage( 'Monetary amount "10.1234567" exceeds maximum supported precision of 6 decimal places.' );
+		Money::from( '10.1234567', 'USD' );
+	}
+
+	public function test_pricing_value_rejects_values_with_more_than_six_fractional_digits(): void {
+		$this->expectException( InvalidRuleException::class );
+		$this->expectExceptionMessage( 'Pricing value "50.1234567" exceeds maximum supported precision of 6 decimal places (DECIMAL(20,6)).' );
+		PricingValue::fixed( '50.1234567' );
+	}
+
+	public function test_trailing_zeros_beyond_six_decimals_are_permitted_and_normalized(): void {
+		$money = Money::from( '10.50000000', 'USD' );
+		$this->assertSame( '10.500000', $money->amount() );
+
+		$value = PricingValue::fixed( '25.50000000' );
+		$this->assertSame( '25.500000', $value->value() );
+	}
+
+	public function test_maximum_supported_precision_6_decimals_calculates_and_formats_cleanly(): void {
+		$context = new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '1.000000', 'USD' ),
+			customer_id: 1,
+			currency_decimals: 6
+		);
+
+		$rule = new PricingRule(
+			target: RuleTarget::user( 1 ),
+			scope: RuleScope::product( 10 ),
+			pricing_value: PricingValue::percentage( '12.345678' ),
+			id: 904
+		);
+
+		$resolution = ResolutionResult::matched( $rule, PrecedenceLevel::CUSTOMER_PRODUCT );
+		$result     = $this->calculator->calculate( $context, $resolution );
+
+		// 1.000000 * (1 - 0.12345678) = 0.87654322 -> rounded to 6 decimals half-up = 0.876543
+		$this->assertSame( '0.876543', $result->formatted_final_price() );
+		$this->assertSame( '0.876543', $result->final_price()->amount() );
 	}
 }

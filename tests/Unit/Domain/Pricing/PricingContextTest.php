@@ -245,12 +245,23 @@ final class PricingContextTest extends TestCase {
 
 	public function test_currency_decimals_bounds_validation(): void {
 		$this->expectException( InvalidPricingContextException::class );
-		$this->expectExceptionMessage( 'Currency decimals must be between 0 and 8, got 9.' );
+		$this->expectExceptionMessage( 'Currency decimals must be between 0 and 6, got 7.' );
 
 		new PricingContext(
 			product_id: 10,
 			base_price: Money::from( '50.00', 'USD' ),
-			currency_decimals: 9
+			currency_decimals: 7
+		);
+	}
+
+	public function test_currency_decimals_8_is_explicitly_rejected(): void {
+		$this->expectException( InvalidPricingContextException::class );
+		$this->expectExceptionMessage( 'Currency decimals must be between 0 and 6, got 8.' );
+
+		new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '50.00', 'USD' ),
+			currency_decimals: 8
 		);
 	}
 
@@ -264,21 +275,43 @@ final class PricingContextTest extends TestCase {
 		);
 	}
 
-	public function test_is_sale_active_detection(): void {
-		$context_no_sale = new PricingContext(
-			product_id: 10,
-			base_price: Money::from( '100.00', 'USD' ),
-			regular_price: Money::from( '100.00', 'USD' ),
-			sale_price: null
-		);
-		$this->assertFalse( $context_no_sale->is_sale_active() );
-
-		$context_sale = new PricingContext(
+	public function test_is_sale_active_detection_requires_explicit_confirmation(): void {
+		// Numerical equality alone must NOT trigger is_sale_active() when unconfirmed (null)
+		$context_unconfirmed = new PricingContext(
 			product_id: 10,
 			base_price: Money::from( '80.00', 'USD' ),
 			regular_price: Money::from( '100.00', 'USD' ),
-			sale_price: Money::from( '80.00', 'USD' )
+			sale_price: Money::from( '80.00', 'USD' ),
+			is_on_sale: null
 		);
-		$this->assertTrue( $context_sale->is_sale_active() );
+		$this->assertNull( $context_unconfirmed->is_on_sale() );
+		$this->assertFalse( $context_unconfirmed->is_sale_active() );
+
+		// Explicit confirmation as true
+		$context_confirmed_sale = new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '80.00', 'USD' ),
+			regular_price: Money::from( '100.00', 'USD' ),
+			sale_price: Money::from( '80.00', 'USD' ),
+			is_on_sale: true
+		);
+		$this->assertTrue( $context_confirmed_sale->is_on_sale() );
+		$this->assertTrue( $context_confirmed_sale->is_sale_active() );
+
+		// Explicit confirmation as false
+		$context_confirmed_no_sale = new PricingContext(
+			product_id: 10,
+			base_price: Money::from( '100.00', 'USD' ),
+			regular_price: Money::from( '100.00', 'USD' ),
+			sale_price: Money::from( '100.00', 'USD' ),
+			is_on_sale: false
+		);
+		$this->assertFalse( $context_confirmed_no_sale->is_on_sale() );
+		$this->assertFalse( $context_confirmed_no_sale->is_sale_active() );
+
+		// with_sale_active helper
+		$promoted = $context_unconfirmed->with_sale_active( true );
+		$this->assertTrue( $promoted->is_sale_active() );
+		$this->assertFalse( $context_unconfirmed->is_sale_active() );
 	}
 }

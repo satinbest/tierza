@@ -1644,14 +1644,18 @@ class DatabaseIntegrationLiveTest {
 				customer_id: 2, // Group member (not user 1 so rule_fixed won't match)
 				group: $group,
 				regular_price: Money::from( '150.00', 'USD' ),
-				sale_price: Money::from( '120.00', 'USD' )
+				sale_price: Money::from( '120.00', 'USD' ),
+				quantity: 1,
+				group_id: null,
+				currency_decimals: 2,
+				is_on_sale: true
 			);
 			$res_sale  = $resolver->resolve( $context_sale );
 			$calc_sale = $calculator->calculate( $context_sale, $res_sale );
 
 			$this->assert( $calc_sale->is_rule_applied(), 'Sale product group rule must apply.' );
 			$this->assert( '108.000000' === $calc_sale->final_price()->amount(), '10% on active sale price 120.00 must produce 108.00.' );
-			$this->assert( 'sale_price' === $calc_sale->diagnostic_metadata()['base_price_type'], 'Diagnostics must record sale_price as base.' );
+			$this->assert( 'confirmed_sale_price' === $calc_sale->diagnostic_metadata()['base_price_type'], 'Diagnostics must record confirmed_sale_price as base.' );
 
 			$this->rule_repo->delete( (int) $rule_sale_percent->id() );
 

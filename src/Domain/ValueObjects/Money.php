@@ -41,6 +41,17 @@ final class Money {
 			);
 		}
 
+		// Prevent silent truncation of digits beyond maximum supported scale.
+		$clean_amount = ltrim( $amount_str, '+-' );
+		if ( str_contains( $clean_amount, '.' ) ) {
+			$fraction = explode( '.', $clean_amount )[1] ?? '';
+			if ( strlen( rtrim( $fraction, '0' ) ) > self::DEFAULT_SCALE ) {
+				throw new InvalidMoneyException(
+					sprintf( 'Monetary amount "%s" exceeds maximum supported precision of %d decimal places.', $amount_str, self::DEFAULT_SCALE )
+				);
+			}
+		}
+
 		$normalized = DecimalMath::normalize( $amount_str, self::DEFAULT_SCALE );
 
 		if ( DecimalMath::comp( $normalized, '0', self::DEFAULT_SCALE ) < 0 ) {

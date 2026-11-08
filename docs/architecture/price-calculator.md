@@ -89,40 +89,61 @@ $$\text{final\_price} = \text{active\_base\_price}$$
 [ Raw Base Price & Percentage ]
              │
              ▼
-[ Intermediate Calculation ] ──> Scale: 8 decimal places (via DecimalMath)
+[ Intermediate Multiplication ] ──> Scale: 12 decimal places (exact: 6 + 6 digits)
              │
              ▼
-[ Boundary Rounding ]       ──> Scale: currency_decimals (0-8, default 2)
-                                  Mode:  PHP_ROUND_HALF_UP (WooCommerce standard)
+[ Intermediate Division by 100] ──> Scale: 14 decimal places (exact: 12 + 2 digits)
              │
              ▼
-[ Normalized Storage ]       ──> Scale: 6 decimal places (Money::DEFAULT_SCALE)
+[ Boundary Rounding ]           ──> Scale: currency_decimals (0 to 6, default 2)
+                                      Mode:  PHP_ROUND_HALF_UP (WooCommerce standard)
              │
              ▼
-[ Display / API Output ]     ──> Formatted string with currency_decimals places
+[ Normalized Storage ]           ──> Scale: 6 decimal places (Money::DEFAULT_SCALE / DECIMAL(20,6))
+             │
+             ▼
+[ Display / API Output ]         ──> Formatted string with currency_decimals places
 ```
 
 1. **Zero Binary Floating-Point:** All arithmetic operations (`add`, `sub`, `mul`, `div`, `round`, `comp`) execute via `DecimalMath` on decimal strings. Native binary floats (`float`/`double`) are never used in domain monetary calculations.
-2. **Intermediate Precision (Scale 8):** Intermediate percentage divisions and products use scale 8 to prevent truncation drift.
-3. **Output Rounding Boundary:** Half-up rounding (`PHP_ROUND_HALF_UP`) occurs **exclusively at the calculation output boundary**, respecting the store currency's configured decimal places.
-4. **Normalized Monetary Object:** The rounded result is stored in `Money` normalized to canonical 6 decimal places (e.g. `"15.000000"`).
-5. **Zero-Decimal Currencies:** Fully supports 0-decimal currencies (such as IRR, JPY, KRW, Toman) by configuring `currency_decimals = 0`.
+2. **Mathematically Justified Intermediate Precision:**
+   - Both `base_price` and `discount_percent` have at most 6 decimal places ($10^{-6}$).
+   - The product $B \times (100 - P)$ has at most $6 + 6 = 12$ exact decimal places without any lost guard digits.
+   - Dividing by $100$ only shifts the decimal point 2 positions left to at most $12 + 2 = 14$ exact decimal places.
+   - Because $100 = 10^2$, dividing by 100 never produces an infinite repeating fraction. Scale 14 captures the mathematically exact fraction.
+3. **One and Only One Output Rounding:** Half-up rounding (`PHP_ROUND_HALF_UP`) occurs **exclusively at the calculation output boundary**, rounding the exact 14-decimal value to the store currency's configured decimal places.
+4. **Supported Precision Bound (0 to 6 Decimals):**
+   - Tierza v1 enforces a strict maximum currency precision of 6 decimal places (`Money::DEFAULT_SCALE = 6`), perfectly matching the database schema (`tierza_rules.value DECIMAL(20,6)`).
+   - Higher currency decimals (such as 7 or 8) are explicitly rejected with `InvalidPricingContextException` to prevent silent truncation.
+   - Zero-decimal currencies (IRR, JPY, KRW, Toman) are fully supported.
+5. **Prevention of Silent Truncation:** Both `Money` and `PricingValue` validate that input values do not contain non-zero digits exceeding 6 decimal places, throwing `InvalidMoneyException` or `InvalidRuleException` rather than silently cutting off data.
 6. **No Automatic Currency Conversions:** No implicit multiplying or dividing by 10 between IRR and Toman. Currencies are treated as distinct ISO codes.
 7. **Large Monetary Values:** Safely handles arbitrary-length values (e.g. `999,999,999,999,999.99`) without native 64-bit integer overflow.
-8. **BCMath & Pure-PHP Parity:** Guaranteed identical behavior whether `ext-bcmath` is active or the pure-PHP fallback is utilized.
+8. **BCMath & Pure-PHP Parity:** Guaranteed 100% identical behavior whether `ext-bcmath` is active or the pure-PHP fallback is utilized.
 
 ---
 
-## 4. Active Sale Price Behavior
+## 4. Sale-Price Metadata Policy
 
 WooCommerce products may have an active promotional sale price in addition to their regular price.
 
-1. **Active Price as Calculation Base:** When a product has an active sale price, WooCommerce sets the active price (`$product->get_price()`) to that sale price. `PricingContext::base_price()` receives this active price.
-2. **Percentage Applied to Active Price:** Percentage discounts are calculated against the active base price, NOT the regular price.
-   * Example: Regular price = `$100.00`, Active sale price = `$80.00`.
-   * A 20% Tierza rule calculates: `$80.00 × (100 - 20) / 100 = $64.00` (NOT `$80.00`).
-3. **No Modification of WooCommerce Prices:** Tierza never mutates or overwrites WooCommerce's stored regular or sale price postmeta.
-4. **Diagnostics Tracking:** Diagnostic metadata tracks `'base_price_type' => 'sale_price'` if `$context->is_sale_active()` is true, otherwise `'regular_price'`.
+1. **Active Base Price is Authoritative:** The calculation always applies discounts against `PricingContext::base_price()`, which WooCommerce provides as the current active price.
+2. **No False Sale Assumptions:** Numerical equality between `base_price` and `sale_price` alone does NOT establish that a sale is active (e.g. expired sale schedule, identical regular and sale values).
+3. **Explicit Context Confirmation (`is_on_sale`):**
+   - When the store environment confirms an active sale, it passes `is_on_sale: true`. The diagnostic metadata records `'confirmed_sale_price'`.
+   - When confirmed regular, it passes `is_on_sale: false`. The diagnostic metadata records `'confirmed_regular_price'`.
+   - When unconfirmed (`is_on_sale: null`), `is_sale_active()` returns `false` and diagnostic metadata records `'active_base_price'`, never falsely asserting a confirmed promotional sale.
+4. **No Modification of Core WooCommerce Prices:** Tierza never mutates or overwrites WooCommerce's stored regular or sale price postmeta.
+
+---
+
+## 5. Independent Calculation Oracle
+
+To provide an authoritative mathematical baseline independent of the production `DecimalMath` implementation, Tierza includes `ExactRationalPricingOracle` (`tests/Unit/Application/Pricing/ExactRationalPricingOracle.php`).
+
+* Uses pure integer-rational arithmetic and grade-school string big-integer multiplication and division.
+* Verifies boundary conditions, exact halfway values, values immediately above and below rounding thresholds, very small micro-prices, large numbers, and currencies with 0, 2, 3, and 6 decimal places.
+* 100% of test vectors match `AuthoritativePriceCalculator` exactly.
 
 ---
 

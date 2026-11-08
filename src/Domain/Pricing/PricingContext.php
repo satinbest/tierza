@@ -37,6 +37,7 @@ final class PricingContext {
 	private readonly ?Money $sale_price;
 	private readonly int $quantity;
 	private readonly int $currency_decimals;
+	private readonly ?bool $is_on_sale;
 
 	/**
 	 * @param int                  $product_id        Mandatory product identifier (> 0).
@@ -50,7 +51,8 @@ final class PricingContext {
 	 * @param Money|null           $sale_price        Optional sale price metadata.
 	 * @param int                  $quantity          Item quantity (>= 1, reserved for future quantity pricing).
 	 * @param int|null             $group_id          Optional pricing group identifier fallback.
-	 * @param int                  $currency_decimals Store currency decimal precision (0 to 8, defaults to 2).
+	 * @param int                  $currency_decimals Store currency decimal precision (0 to 6, defaults to 2).
+	 * @param bool|null            $is_on_sale        Optional explicit promotional sale state confirmed by store.
 	 *
 	 * @throws MissingBasePriceException
 	 * @throws InvalidPricingContextException
@@ -69,7 +71,8 @@ final class PricingContext {
 		?Money $sale_price = null,
 		int $quantity = 1,
 		?int $group_id = null,
-		int $currency_decimals = 2
+		int $currency_decimals = 2,
+		?bool $is_on_sale = null
 	) {
 		if ( null === $base_price ) {
 			throw new MissingBasePriceException( 'Active base price is required and cannot be null or omitted.' );
@@ -87,9 +90,14 @@ final class PricingContext {
 			);
 		}
 
-		if ( $currency_decimals < 0 || $currency_decimals > 8 ) {
+		if ( $currency_decimals < 0 || $currency_decimals > Money::DEFAULT_SCALE ) {
 			throw new InvalidPricingContextException(
-				sprintf( 'Currency decimals must be between 0 and 8, got %d.', $currency_decimals )
+				sprintf(
+					'Currency decimals must be between 0 and %d, got %d. Tierza v1 supports a maximum of %d decimal places.',
+					Money::DEFAULT_SCALE,
+					$currency_decimals,
+					Money::DEFAULT_SCALE
+				)
 			);
 		}
 
@@ -195,6 +203,7 @@ final class PricingContext {
 		$this->quantity          = $quantity;
 		$this->currency          = $currency;
 		$this->currency_decimals = $currency_decimals;
+		$this->is_on_sale        = $is_on_sale;
 	}
 
 	public function product_id(): int {
@@ -279,8 +288,30 @@ final class PricingContext {
 		return $this->currency_decimals;
 	}
 
+	public function is_on_sale(): ?bool {
+		return $this->is_on_sale;
+	}
+
 	public function is_sale_active(): bool {
-		return null !== $this->sale_price && $this->base_price->equals( $this->sale_price );
+		return true === $this->is_on_sale;
+	}
+
+	public function with_sale_active( bool $is_on_sale ): self {
+		return new self(
+			$this->product_id,
+			$this->base_price,
+			$this->customer_id,
+			$this->group,
+			$this->variation_id,
+			$this->category_ids,
+			$this->category_depths,
+			$this->regular_price,
+			$this->sale_price,
+			$this->quantity,
+			$this->group_id,
+			$this->currency_decimals,
+			$is_on_sale
+		);
 	}
 
 	public function with_currency_decimals( int $currency_decimals ): self {
@@ -296,7 +327,8 @@ final class PricingContext {
 			$this->sale_price,
 			$this->quantity,
 			$this->group_id,
-			$currency_decimals
+			$currency_decimals,
+			$this->is_on_sale
 		);
 	}
 
@@ -313,7 +345,8 @@ final class PricingContext {
 			$this->sale_price,
 			$quantity,
 			$this->group_id,
-			$this->currency_decimals
+			$this->currency_decimals,
+			$this->is_on_sale
 		);
 	}
 }

@@ -36,13 +36,13 @@ use Tierza\Domain\ValueObjects\Money;
 final class AuthoritativePriceCalculator implements PriceCalculatorInterface {
 
 	public const DEFAULT_CURRENCY_DECIMALS = 2;
-	public const MAX_CURRENCY_DECIMALS     = 8;
+	public const MAX_CURRENCY_DECIMALS     = Money::DEFAULT_SCALE; // 6
 
 	private readonly int $default_currency_decimals;
 	private readonly ?string $math_driver;
 
 	/**
-	 * @param int         $default_currency_decimals Default currency decimal precision (0 to 8).
+	 * @param int         $default_currency_decimals Default currency decimal precision (0 to 6).
 	 * @param string|null $math_driver               Optional explicit driver ('bcmath'|'php'|null).
 	 */
 	public function __construct(
@@ -59,6 +59,14 @@ final class AuthoritativePriceCalculator implements PriceCalculatorInterface {
 		$this->math_driver               = $math_driver;
 	}
 
+	public function default_currency_decimals(): int {
+		return $this->default_currency_decimals;
+	}
+
+	public function math_driver(): ?string {
+		return $this->math_driver;
+	}
+
 	/**
 	 * Calculates the final authoritative price from the pricing context and resolution outcome.
 	 *
@@ -67,6 +75,7 @@ final class AuthoritativePriceCalculator implements PriceCalculatorInterface {
 	 * @return PricingResult
 	 * @throws CurrencyMismatchException
 	 * @throws InvalidMoneyException
+	 * @throws InvalidPricingContextException
 	 * @throws InvalidRuleException
 	 * @throws PricingCalculationException
 	 * @throws RuleResolutionException
@@ -77,7 +86,21 @@ final class AuthoritativePriceCalculator implements PriceCalculatorInterface {
 		$currency_decimals = $context->currency_decimals();
 
 		if ( $currency_decimals < 0 || $currency_decimals > self::MAX_CURRENCY_DECIMALS ) {
-			$currency_decimals = $this->default_currency_decimals;
+			throw new InvalidPricingContextException(
+				sprintf(
+					'Context currency decimals (%d) exceeds maximum supported precision of %d decimal places.',
+					$currency_decimals,
+					self::MAX_CURRENCY_DECIMALS
+				)
+			);
+		}
+
+		// Determine verified base price classification for diagnostics without false sale assumptions.
+		$base_price_type = 'active_base_price';
+		if ( true === $context->is_on_sale() ) {
+			$base_price_type = 'confirmed_sale_price';
+		} elseif ( false === $context->is_on_sale() ) {
+			$base_price_type = 'confirmed_regular_price';
 		}
 
 		// Validate base price is non-negative. Deliberately zero-priced products are valid.
@@ -105,7 +128,7 @@ final class AuthoritativePriceCalculator implements PriceCalculatorInterface {
 					'raw_calculated_amount' => $base_price->amount(),
 					'precedence_level'      => PrecedenceLevel::WOOCOMMERCE_FALLBACK->value,
 					'precedence_name'       => PrecedenceLevel::WOOCOMMERCE_FALLBACK->name,
-					'base_price_type'       => $context->is_sale_active() ? 'sale_price' : 'regular_price',
+					'base_price_type'       => $base_price_type,
 					'math_driver'           => DecimalMath::resolve_driver( $this->math_driver ),
 				]
 			);
@@ -245,18 +268,22 @@ final class AuthoritativePriceCalculator implements PriceCalculatorInterface {
 				$final_price        = Money::zero( $currency );
 			} else {
 				// Standard percentage calculation: active_base_price × (100 - discount_percent) / 100.
+				// Intermediate multiplication has at most 6 + 6 = 12 exact decimal places.
+				// Intermediate division by 100 has at most 12 + 2 = 14 exact decimal places.
+				// Scale 14 preserves 100% mathematical precision with zero premature rounding or lost guard digits.
 				$is_zero_percentage = false;
 				$calculation_type   = 'percentage_standard';
 
 				$remaining_percent = DecimalMath::sub( '100.000000', $raw_val, 6, $this->math_driver );
-				$product           = DecimalMath::mul( $base_price->amount(), $remaining_percent, 8, $this->math_driver );
-				$raw_calculated    = DecimalMath::div( $product, '100.000000', 8, $this->math_driver );
+				$product           = DecimalMath::mul( $base_price->amount(), $remaining_percent, 12, $this->math_driver );
+				$raw_calculated    = DecimalMath::div( $product, '100.000000', 14, $this->math_driver );
 
 				// Guarantee nonnegative price.
-				if ( DecimalMath::comp( $raw_calculated, '0.000000', 8, $this->math_driver ) < 0 ) {
+				if ( DecimalMath::comp( $raw_calculated, '0.000000', 14, $this->math_driver ) < 0 ) {
 					$raw_calculated = '0.000000';
 				}
 
+				// Exactly one final half-up rounding operation at the configured currency boundary.
 				$rounded     = DecimalMath::round( $raw_calculated, $currency_decimals, PHP_ROUND_HALF_UP, $this->math_driver );
 				$final_price = new Money( $rounded, $currency );
 			}
@@ -295,7 +322,7 @@ final class AuthoritativePriceCalculator implements PriceCalculatorInterface {
 				'raw_calculated_amount' => $raw_calculated,
 				'precedence_level'      => $resolution->precedence_level()->value,
 				'precedence_name'       => $resolution->precedence_level()->name,
-				'base_price_type'       => $context->is_sale_active() ? 'sale_price' : 'regular_price',
+				'base_price_type'       => $base_price_type,
 				'math_driver'           => DecimalMath::resolve_driver( $this->math_driver ),
 			]
 		);

@@ -43,6 +43,17 @@ final class PricingValue {
 			);
 		}
 
+		// Reject fractional digits exceeding 6 to prevent silent truncation.
+		$clean_val = ltrim( $string_val, '+-' );
+		if ( str_contains( $clean_val, '.' ) ) {
+			$fraction = explode( '.', $clean_val )[1] ?? '';
+			if ( strlen( rtrim( $fraction, '0' ) ) > 6 ) {
+				throw new InvalidRuleException(
+					sprintf( 'Pricing value "%s" exceeds maximum supported precision of 6 decimal places (DECIMAL(20,6)).', $string_val )
+				);
+			}
+		}
+
 		// Normalize to standard decimal format with 6 decimal places.
 		$formatted = DecimalMath::normalize( $string_val, 6 );
 

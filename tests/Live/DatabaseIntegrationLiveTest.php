@@ -114,6 +114,8 @@ class DatabaseIntegrationLiveTest {
 			'test_rule_resolver_query_counts_on_real_mariadb',
 			'test_rule_resolver_benchmark_fixtures_and_execution_time',
 			'test_authoritative_price_calculator_end_to_end_data_flow_in_mariadb',
+			'test_full_chain_pricing_integration_and_database_immutability_in_mariadb',
+			'test_pricing_engine_comprehensive_performance_baseline_in_mariadb',
 		];
 
 		foreach ( $methods as $method ) {
@@ -1718,6 +1720,384 @@ class DatabaseIntegrationLiveTest {
 			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $variable_pid ] );
 			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $sale_pid ] );
 			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $cat_pid ] );
+		}
+	}
+
+	public function test_full_chain_pricing_integration_and_database_immutability_in_mariadb(): void {
+		$resolver   = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+		$calculator = new AuthoritativePriceCalculator( default_currency_decimals: 2 );
+		$now        = current_time( 'mysql', true );
+
+		// 1. Create real WordPress customers
+		$this->db->insert( $this->db->users, [
+			'user_login'           => 'trz_cust_a_' . wp_rand( 1000, 9999 ),
+			'user_pass'            => 'dummy_hash',
+			'user_email'           => 'cust_a_' . wp_rand( 1000, 9999 ) . '@example.com',
+			'user_registered'      => $now,
+			'display_name'         => 'Tierza Customer A',
+		] );
+		$user_a_id = (int) $this->db->insert_id;
+
+		$this->db->insert( $this->db->users, [
+			'user_login'           => 'trz_cust_b_' . wp_rand( 1000, 9999 ),
+			'user_pass'            => 'dummy_hash',
+			'user_email'           => 'cust_b_' . wp_rand( 1000, 9999 ) . '@example.com',
+			'user_registered'      => $now,
+			'display_name'         => 'Tierza Customer B',
+		] );
+		$user_b_id = (int) $this->db->insert_id;
+
+		// 2. Create products in wp_posts
+		// Simple product
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'TRZ Full-Chain Simple', 'post_type' => 'product', 'post_status' => 'publish' ] );
+		$simple_pid = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'postmeta', [ 'post_id' => $simple_pid, 'meta_key' => '_regular_price', 'meta_value' => '200.00' ] );
+		$this->db->insert( $this->db->prefix . 'postmeta', [ 'post_id' => $simple_pid, 'meta_key' => '_price', 'meta_value' => '200.00' ] );
+
+		// Variable product with 2 variations
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'TRZ Full-Chain Variable', 'post_type' => 'product', 'post_status' => 'publish' ] );
+		$variable_pid = (int) $this->db->insert_id;
+
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'TRZ Variation 1', 'post_type' => 'product_variation', 'post_status' => 'publish', 'post_parent' => $variable_pid ] );
+		$var_1_id = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'postmeta', [ 'post_id' => $var_1_id, 'meta_key' => '_price', 'meta_value' => '150.00' ] );
+
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'TRZ Variation 2', 'post_type' => 'product_variation', 'post_status' => 'publish', 'post_parent' => $variable_pid ] );
+		$var_2_id = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'postmeta', [ 'post_id' => $var_2_id, 'meta_key' => '_price', 'meta_value' => '180.00' ] );
+
+		// Categories: Parent (depth 1) and Child (depth 2)
+		$this->db->insert( $this->db->prefix . 'terms', [ 'name' => 'TRZ Parent Cat', 'slug' => 'trz-parent-cat-' . wp_rand( 100, 999 ) ] );
+		$cat_p_id = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $cat_p_id, 'taxonomy' => 'product_cat', 'parent' => 0, 'count' => 1 ] );
+
+		$this->db->insert( $this->db->prefix . 'terms', [ 'name' => 'TRZ Child Cat', 'slug' => 'trz-child-cat-' . wp_rand( 100, 999 ) ] );
+		$cat_c_id = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $cat_c_id, 'taxonomy' => 'product_cat', 'parent' => $cat_p_id, 'count' => 1 ] );
+
+		// Record initial order count
+		$orders_count_before = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type IN ('shop_order', 'shop_order_placehold')" );
+
+		// 3. Create Tierza group and assign users
+		$group = $this->group_repo->save( new PricingGroup( 'TRZ Wholesale Group', 'trz-ws-' . wp_rand( 100, 999 ) ) );
+		$group_id = (int) $group->id();
+
+		$this->user_group_repo->assign( $user_a_id, $group_id );
+		$this->user_group_repo->assign( $user_b_id, $group_id );
+
+		// 4. Save authoritative rules in MariaDB
+		// Rule 1: User A percentage on Variation 1 = 30%
+		$r1 = $this->rule_repo->save( new PricingRule(
+			target: RuleTarget::user( $user_a_id ),
+			scope: RuleScope::variation( $var_1_id ),
+			pricing_value: PricingValue::percentage( '30.000000' )
+		) );
+
+		// Rule 2: Group percentage on Variable parent product = 20%
+		$r2 = $this->rule_repo->save( new PricingRule(
+			target: RuleTarget::group( $group_id ),
+			scope: RuleScope::product( $variable_pid ),
+			pricing_value: PricingValue::percentage( '20.000000' )
+		) );
+
+		// Rule 3: Group percentage on Child Category = 15%
+		$r3 = $this->rule_repo->save( new PricingRule(
+			target: RuleTarget::group( $group_id ),
+			scope: RuleScope::category( $cat_c_id ),
+			pricing_value: PricingValue::percentage( '15.000000' )
+		) );
+
+		// Rule 4: Group percentage on Parent Category = 25% (deeper child should beat this)
+		$r4 = $this->rule_repo->save( new PricingRule(
+			target: RuleTarget::group( $group_id ),
+			scope: RuleScope::category( $cat_p_id ),
+			pricing_value: PricingValue::percentage( '25.000000' )
+		) );
+
+		// Rule 5: Inactive rule on Variation 1 (must be ignored)
+		$r5 = $this->rule_repo->save( new PricingRule(
+			target: RuleTarget::user( $user_a_id ),
+			scope: RuleScope::variation( $var_1_id ),
+			pricing_value: PricingValue::percentage( '50.000000' ),
+			status: RuleStatus::inactive()
+		) );
+
+		try {
+			// Scenario A: Customer A on Variation 1 -> Customer Variation rule wins (30% off 150.00 = 105.00)
+			$ctx_a = new PricingContext(
+				product_id: $variable_pid,
+				base_price: Money::from( '150.00', 'USD' ),
+				customer_id: $user_a_id,
+				group: $group,
+				variation_id: $var_1_id,
+				group_id: $group_id
+			);
+			$res_a = $resolver->resolve( $ctx_a );
+			$out_a = $calculator->calculate( $ctx_a, $res_a );
+
+			$this->assert( $out_a->is_rule_applied(), 'Rule must apply for Customer A on variation.' );
+			$this->assert( '105.000000' === $out_a->final_price()->amount(), '30% discount on 150.00 must equal 105.00.' );
+			$this->assert( PrecedenceLevel::CUSTOMER_VARIATION === $out_a->precedence_level(), 'Precedence must be CUSTOMER_VARIATION.' );
+			$this->assert( $r1->id() === $out_a->applied_rule_id(), 'Applied rule ID must match Rule 1.' );
+
+			// Scenario B: Customer B on Variation 1 -> Customer Isolation: B does NOT get A's rule.
+			// Variation 1 inherits Parent Product group rule (20% off 150.00 = 120.00).
+			$ctx_b = new PricingContext(
+				product_id: $variable_pid,
+				base_price: Money::from( '150.00', 'USD' ),
+				customer_id: $user_b_id,
+				group: $group,
+				variation_id: $var_1_id,
+				group_id: $group_id
+			);
+			$res_b = $resolver->resolve( $ctx_b );
+			$out_b = $calculator->calculate( $ctx_b, $res_b );
+
+			$this->assert( $out_b->is_rule_applied(), 'Rule must apply for Customer B.' );
+			$this->assert( '120.000000' === $out_b->final_price()->amount(), 'Customer B must receive inherited group product rule (120.00), not Customer A rule.' );
+			$this->assert( PrecedenceLevel::GROUP_PRODUCT === $out_b->precedence_level(), 'Precedence must be GROUP_PRODUCT.' );
+			$this->assert( $r2->id() === $out_b->applied_rule_id(), 'Applied rule ID must match Rule 2.' );
+
+			// Scenario C: Variation 2 without specific rule inherits parent product rule
+			$ctx_v2 = new PricingContext(
+				product_id: $variable_pid,
+				base_price: Money::from( '180.00', 'USD' ),
+				customer_id: $user_b_id,
+				group: $group,
+				variation_id: $var_2_id,
+				group_id: $group_id
+			);
+			$out_v2 = $calculator->calculate( $ctx_v2, $resolver->resolve( $ctx_v2 ) );
+			$this->assert( '144.000000' === $out_v2->final_price()->amount(), 'Variation 2 must inherit parent rule (180 - 20% = 144.00).' );
+
+			// Scenario D: Simple Product in Parent (depth 1) and Child (depth 2) categories
+			$ctx_cat = new PricingContext(
+				product_id: $simple_pid,
+				base_price: Money::from( '200.00', 'USD' ),
+				customer_id: $user_b_id,
+				group: $group,
+				category_ids: [ $cat_p_id, $cat_c_id ],
+				category_depths: [ $cat_p_id => 1, $cat_c_id => 2 ],
+				group_id: $group_id
+			);
+			$out_cat = $calculator->calculate( $ctx_cat, $resolver->resolve( $ctx_cat ) );
+			$this->assert( '170.000000' === $out_cat->final_price()->amount(), 'Child category depth 2 (15%) must win over parent cat depth 1 (25%).' );
+			$this->assert( $r3->id() === $out_cat->applied_rule_id(), 'Applied rule must be child category rule.' );
+
+			// 5. Assert database immutability: stored product prices are strictly untouched
+			$price_simple = $this->db->get_var( $this->db->prepare( "SELECT meta_value FROM {$this->db->prefix}postmeta WHERE post_id = %d AND meta_key = '_price'", $simple_pid ) );
+			$price_var1   = $this->db->get_var( $this->db->prepare( "SELECT meta_value FROM {$this->db->prefix}postmeta WHERE post_id = %d AND meta_key = '_price'", $var_1_id ) );
+			$price_var2   = $this->db->get_var( $this->db->prepare( "SELECT meta_value FROM {$this->db->prefix}postmeta WHERE post_id = %d AND meta_key = '_price'", $var_2_id ) );
+
+			$this->assert( '200.00' === $price_simple, 'Stored simple product price must remain 200.00 unaltered.' );
+			$this->assert( '150.00' === $price_var1, 'Stored variation 1 price must remain 150.00 unaltered.' );
+			$this->assert( '180.00' === $price_var2, 'Stored variation 2 price must remain 180.00 unaltered.' );
+
+			// 6. Assert no customer order records were created or modified
+			$orders_count_after = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type IN ('shop_order', 'shop_order_placehold')" );
+			$this->assert( $orders_count_before === $orders_count_after, 'Pricing engine must never create or modify order records.' );
+		} finally {
+			// Clean up fixtures reliably
+			$this->rule_repo->delete( (int) $r1->id() );
+			$this->rule_repo->delete( (int) $r2->id() );
+			$this->rule_repo->delete( (int) $r3->id() );
+			$this->rule_repo->delete( (int) $r4->id() );
+			$this->rule_repo->delete( (int) $r5->id() );
+
+			$this->user_group_repo->remove( $user_a_id );
+			$this->user_group_repo->remove( $user_b_id );
+			$this->group_repo->delete( $group_id );
+
+			$this->db->delete( $this->db->users, [ 'ID' => $user_a_id ] );
+			$this->db->delete( $this->db->users, [ 'ID' => $user_b_id ] );
+
+			$this->db->delete( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $cat_p_id ] );
+			$this->db->delete( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $cat_c_id ] );
+			$this->db->delete( $this->db->prefix . 'terms', [ 'term_id' => $cat_p_id ] );
+			$this->db->delete( $this->db->prefix . 'terms', [ 'term_id' => $cat_c_id ] );
+
+			$this->db->delete( $this->db->prefix . 'postmeta', [ 'post_id' => $simple_pid ] );
+			$this->db->delete( $this->db->prefix . 'postmeta', [ 'post_id' => $var_1_id ] );
+			$this->db->delete( $this->db->prefix . 'postmeta', [ 'post_id' => $var_2_id ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $simple_pid ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $variable_pid ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $var_1_id ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $var_2_id ] );
+		}
+	}
+
+	public function test_pricing_engine_comprehensive_performance_baseline_in_mariadb(): void {
+		$resolver   = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+		$calculator = new AuthoritativePriceCalculator( default_currency_decimals: 2 );
+		$table_rules  = Schema::rules_table( $this->db );
+		$table_groups = Schema::groups_table( $this->db );
+		$now          = current_time( 'mysql', true );
+
+		// Seed 10 groups
+		$group_ids = [];
+		for ( $i = 1; $i <= 10; $i++ ) {
+			$this->db->insert( $table_groups, [
+				'name'        => sprintf( 'Perf Tier %02d', $i ),
+				'slug'        => sprintf( 'perf-tier-%02d-%d', $i, wp_rand( 100, 999 ) ),
+				'status'      => 'active',
+				'sort_order'  => $i,
+				'created_at'  => $now,
+				'updated_at'  => $now,
+			] );
+			$group_ids[] = (int) $this->db->insert_id;
+		}
+
+		// Seed 100 products
+		$product_ids = [];
+		for ( $i = 1; $i <= 100; $i++ ) {
+			$this->db->insert( $this->db->prefix . 'posts', [
+				'post_title'   => sprintf( 'Perf Prod %03d', $i ),
+				'post_type'    => 'product',
+				'post_status'  => 'publish',
+				'post_date'    => $now,
+			] );
+			$product_ids[] = (int) $this->db->insert_id;
+		}
+
+		// Seed 500 rules (100 active product rules, 10 active global rules, 390 inactive rules)
+		for ( $chunk = 0; $chunk < 5; $chunk++ ) {
+			$placeholders = [];
+			$values       = [];
+			for ( $k = 1; $k <= 100; $k++ ) {
+				$r            = $chunk * 100 + $k;
+				$target_group = $group_ids[ ( $r - 1 ) % 10 ];
+				if ( $r <= 10 ) {
+					$scope_type = 'global';
+					$scope_id   = 0;
+				} else {
+					$scope_type = 'product';
+					$scope_id   = $product_ids[ ( $r - 11 ) % 100 ];
+				}
+
+				if ( $r > 110 ) {
+					$status         = 'inactive';
+					$placeholders[] = '(%s, %d, %s, %d, %s, %s, %s, NULL, %s, %s)';
+					$values[]       = 'group';
+					$values[]       = $target_group;
+					$values[]       = $scope_type;
+					$values[]       = $scope_id;
+					$values[]       = 'percentage';
+					$values[]       = sprintf( '%02d.000000', ( $r % 40 ) + 5 );
+					$values[]       = $status;
+					$values[]       = $now;
+					$values[]       = $now;
+				} else {
+					$status         = 'active';
+					$active_key     = sprintf( 'group:%d|%s:%d', $target_group, $scope_type, $scope_id );
+					$placeholders[] = '(%s, %d, %s, %d, %s, %s, %s, %s, %s, %s)';
+					$values[]       = 'group';
+					$values[]       = $target_group;
+					$values[]       = $scope_type;
+					$values[]       = $scope_id;
+					$values[]       = 'percentage';
+					$values[]       = sprintf( '%02d.000000', ( $r % 40 ) + 5 );
+					$values[]       = $status;
+					$values[]       = $active_key;
+					$values[]       = $now;
+					$values[]       = $now;
+				}
+			}
+			$sql = "INSERT INTO {$table_rules} (target_type, target_id, scope_type, scope_id, pricing_type, value, status, active_key, created_at, updated_at) VALUES " . implode( ', ', $placeholders );
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+			$this->db->query( $this->db->prepare( $sql, ...$values ) );
+		}
+
+		try {
+			$trusted_group = $this->group_repo->find_by_id( $group_ids[0] );
+			$this->assert( null !== $trusted_group, 'Trusted group must exist.' );
+
+			// Scenario 1: 1 customer & 1 product (10 runs to measure variation)
+			$single_runs = [];
+			for ( $r = 0; $r < 10; $r++ ) {
+				$t0 = microtime( true );
+				$ctx = new PricingContext(
+					product_id: $product_ids[0],
+					base_price: Money::from( '100.00', 'USD' ),
+					customer_id: 1,
+					group: $trusted_group
+				);
+				$res = $resolver->resolve( $ctx );
+				$calculator->calculate( $ctx, $res );
+				$single_runs[] = ( microtime( true ) - $t0 ) * 1000;
+			}
+			$s1_avg  = array_sum( $single_runs ) / count( $single_runs );
+			$s1_min  = min( $single_runs );
+			$s1_max  = max( $single_runs );
+
+			// Scenario 2: 1 customer & 100 products
+			$q_before = $this->db->num_queries;
+			$m_before = memory_get_usage();
+			$t_start_100 = microtime( true );
+
+			for ( $i = 0; $i < 100; $i++ ) {
+				$ctx = new PricingContext(
+					product_id: $product_ids[ $i ],
+					base_price: Money::from( '100.00', 'USD' ),
+					customer_id: 1,
+					group: $trusted_group
+				);
+				$res = $resolver->resolve( $ctx );
+				$calculator->calculate( $ctx, $res );
+			}
+			$s2_time    = ( microtime( true ) - $t_start_100 ) * 1000;
+			$s2_queries = $this->db->num_queries - $q_before;
+			$s2_mem_peak = memory_get_peak_usage() / 1024 / 1024;
+
+			// Scenario 3: 1 customer & 500 products (simulated over 5 passes)
+			$q_before_500 = $this->db->num_queries;
+			$t_start_500  = microtime( true );
+
+			for ( $pass = 0; $pass < 5; $pass++ ) {
+				for ( $i = 0; $i < 100; $i++ ) {
+					$ctx = new PricingContext(
+						product_id: $product_ids[ $i ],
+						base_price: Money::from( '100.00', 'USD' ),
+						customer_id: 1,
+						group: $trusted_group
+					);
+					$res = $resolver->resolve( $ctx );
+					$calculator->calculate( $ctx, $res );
+				}
+			}
+			$s3_time    = ( microtime( true ) - $t_start_500 ) * 1000;
+			$s3_queries = $this->db->num_queries - $q_before_500;
+
+			// Scenario 4: Repeated lookups with identical contexts (100 times)
+			$ctx_fixed = new PricingContext(
+				product_id: $product_ids[0],
+				base_price: Money::from( '100.00', 'USD' ),
+				customer_id: 1,
+				group: $trusted_group
+			);
+			$t_start_rep = microtime( true );
+			for ( $k = 0; $k < 100; $k++ ) {
+				$res = $resolver->resolve( $ctx_fixed );
+				$calculator->calculate( $ctx_fixed, $res );
+			}
+			$s4_time = ( microtime( true ) - $t_start_rep ) * 1000;
+
+			// Assertions on performance guarantees
+			$this->assert( 100 === $s2_queries, '100 product resolutions must execute exactly 100 queries without cache.' );
+			$this->assert( 500 === $s3_queries, '500 product resolutions must execute exactly 500 queries without cache.' );
+			$this->assert( $s2_time < 3000, '100 product resolutions must execute in < 3000ms.' );
+
+			echo PHP_EOL;
+			echo "   --- Performance Baseline Metrics (TRZ-008) ---" . PHP_EOL;
+			echo sprintf( "   1 cust / 1 prod: avg = %.2f ms (min = %.2f ms, max = %.2f ms, 1 SQL query)" . PHP_EOL, $s1_avg, $s1_min, $s1_max );
+			echo sprintf( "   1 cust / 100 prods: %.2f ms total (%.2f ms/prod, %d queries, peak mem = %.2f MB)" . PHP_EOL, $s2_time, $s2_time / 100, $s2_queries, $s2_mem_peak );
+			echo sprintf( "   1 cust / 500 prods: %.2f ms total (%.2f ms/prod, %d queries)" . PHP_EOL, $s3_time, $s3_time / 500, $s3_queries );
+			echo sprintf( "   100 identical lookups (no cache): %.2f ms total (%.2f ms/lookup)" . PHP_EOL, $s4_time, $s4_time / 100 );
+			echo "   -----------------------------------------------" . PHP_EOL;
+		} finally {
+			// Clean up performance fixtures
+			$this->db->query( "DELETE FROM {$table_rules} WHERE target_type = 'group' AND target_id IN (" . implode( ',', $group_ids ) . ')' );
+			$this->db->query( "DELETE FROM {$table_groups} WHERE id IN (" . implode( ',', $group_ids ) . ')' );
+			$this->db->query( "DELETE FROM {$this->db->prefix}posts WHERE ID IN (" . implode( ',', $product_ids ) . ')' );
 		}
 	}
 }

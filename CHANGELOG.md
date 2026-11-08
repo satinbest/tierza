@@ -72,3 +72,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Strict fail-closed calculation invariant verification with `PricingCalculationException`: rejects guest customer rules, scope mismatches, and invalid percentages (TRZ-007).
 - Comprehensive unit test suite expanded to 371 PHPUnit tests (1,585 assertions) and 38 live MariaDB tests (250 assertions) verifying BCMath/pure-PHP parity, rounding boundaries, and immutability (TRZ-007).
 - Authoritative Price Calculator architecture document (`docs/architecture/price-calculator.md`) (TRZ-007).
+- Exhaustive table-driven pricing decision matrix test suite (`PricingDecisionMatrixTest`) covering all 8 precedence tiers, fallback, and non-stacking invariants (TRZ-008).
+- Customer and group boundary isolation test suite (`CustomerGroupIsolationTest`) validating guest protection, user overrides, and fail-closed repository error handling (TRZ-008).
+- Product and variation hierarchy resolution test suite (`ProductVariationHierarchyTest`) verifying variation rule inheritance, parent fallbacks, and 3-step PRD category tie-breaking (TRZ-008).
+- Comprehensive monetary test suite (`ComprehensiveMonetaryOracleTest`) comparing 100% of calculation vectors against `ExactRationalPricingOracle` across scales 0 to 6 with BCMath/pure-PHP driver parity (TRZ-008).
+- Deterministic property-based metamorphic test suite (`PropertyBasedPricingTest`) validating 10 algebraic properties (monotonicity, zero-percent identity, non-negativity, permutation invariance, subsumption, idempotence, immutability) with reproducible pseudo-random seed (TRZ-008).
+- Storage and precision boundary audit (`PrecisionPersistenceBoundaryTest`): audited MariaDB `DECIMAL(20,6)` 14-integer-digit capacity, enforcing strict upper bound `99999999999999.999999` and rejecting overflow (>14 digits) or scientific notation in `Money` and `PricingValue` (TRZ-008).
+- Reliability and fault injection test suite (`ReliabilityErrorInjectionTest`) verifying fail-closed error handling under corrupted tables, invalid scopes, and sensitive credential protection (TRZ-008).
+- Full-chain live database integration test in MariaDB verifying end-to-end flow with real WordPress customers, WooCommerce variable products, category hierarchy, and database immutability (TRZ-008).
+- Performance baseline benchmark suite on live MariaDB with 10 groups, 100 products, and 500 rules measuring execution times, memory usage, and query counts (TRZ-008).
+- Pricing test matrix and reliability documentation (`docs/testing/pricing-test-matrix.md`) (TRZ-008).
+- Hardened monetary APIs in `Money` and `PricingValue` (TRZ-008):
+  - Strictly rejected native PHP `float` inputs and scientific notation in `PricingValue::__construct`, `PricingValue::percentage`, and `PricingValue::fixed`, accepting `string|int` only.
+  - Enforced anti-truncation policy in `Money::multiply` and `Money::apply_percentage_discount`, rejecting non-zero fractional digits exceeding scale 6 with `InvalidMoneyException` while safely permitting redundant trailing zeros.
+  - Hardened `Money::multiply` with scale 12 intermediate multiplication, scale 6 half-up rounding, and negative multiplier rejection.
+  - Hardened `Money::apply_percentage_discount` with intermediate scale 12 multiplication and scale 14 division, rejecting negative percentages or percentages > 100% with `InvalidMoneyException` (no silent clamping), and preserving exact 0% and 100% boundary returns.
+  - Enforced MariaDB `DECIMAL(20,6)` 14-integer-digit storage ceiling (`99999999999999.999999`) across `Money` and `PricingValue`, preventing arithmetic or persistence overflows.
+  - Replaced production `DecimalMath` usage in property-based test with independent `ExactRationalPricingOracle` ground truth.
+- Expanded automated test suite to 471 PHPUnit tests (3,026 assertions) and 40 live MariaDB integration tests (269 assertions) passing at 100% (TRZ-008).

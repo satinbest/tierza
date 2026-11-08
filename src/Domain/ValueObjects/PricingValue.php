@@ -12,8 +12,10 @@ use Tierza\Domain\Exceptions\InvalidRuleException;
  */
 final class PricingValue {
 
-	public const TYPE_PERCENTAGE = 'percentage';
-	public const TYPE_FIXED      = 'fixed';
+	public const TYPE_PERCENTAGE    = 'percentage';
+	public const TYPE_FIXED         = 'fixed';
+	public const MAX_INTEGER_DIGITS = 14;
+	public const MAX_VALUE          = '99999999999999.999999';
 
 	private const ALLOWED_TYPES = [
 		self::TYPE_PERCENTAGE,
@@ -43,6 +45,12 @@ final class PricingValue {
 			);
 		}
 
+		if ( ! DecimalMath::is_valid( $string_val ) ) {
+			throw new InvalidRuleException(
+				sprintf( 'Pricing value cannot use scientific notation, got "%s".', $string_val )
+			);
+		}
+
 		// Reject fractional digits exceeding 6 to prevent silent truncation.
 		$clean_val = ltrim( $string_val, '+-' );
 		if ( str_contains( $clean_val, '.' ) ) {
@@ -52,6 +60,15 @@ final class PricingValue {
 					sprintf( 'Pricing value "%s" exceeds maximum supported precision of 6 decimal places (DECIMAL(20,6)).', $string_val )
 				);
 			}
+		}
+
+		// Enforce persistent storage boundary (DECIMAL(20,6) allows at most 14 integer digits).
+		$integer_part        = explode( '.', $clean_val )[0];
+		$significant_integer = ltrim( $integer_part, '0' );
+		if ( strlen( $significant_integer ) > self::MAX_INTEGER_DIGITS ) {
+			throw new InvalidRuleException(
+				sprintf( 'Pricing value "%s" exceeds maximum supported integer magnitude of %d digits (storage limit DECIMAL(20,6)).', $string_val, self::MAX_INTEGER_DIGITS )
+			);
 		}
 
 		// Normalize to standard decimal format with 6 decimal places.

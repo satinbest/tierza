@@ -14,7 +14,9 @@ use Tierza\Domain\Exceptions\InvalidMoneyException;
  */
 final class Money {
 
-	public const DEFAULT_SCALE = 6;
+	public const DEFAULT_SCALE      = 6;
+	public const MAX_INTEGER_DIGITS = 14;
+	public const MAX_AMOUNT         = '99999999999999.999999';
 
 	/**
 	 * @var numeric-string
@@ -50,6 +52,15 @@ final class Money {
 					sprintf( 'Monetary amount "%s" exceeds maximum supported precision of %d decimal places.', $amount_str, self::DEFAULT_SCALE )
 				);
 			}
+		}
+
+		// Enforce persistent storage boundary (DECIMAL(20,6) allows at most 14 integer digits).
+		$integer_part        = explode( '.', $clean_amount )[0];
+		$significant_integer = ltrim( $integer_part, '0' );
+		if ( strlen( $significant_integer ) > self::MAX_INTEGER_DIGITS ) {
+			throw new InvalidMoneyException(
+				sprintf( 'Monetary amount "%s" exceeds maximum supported integer magnitude of %d digits (storage limit DECIMAL(20,6)).', $amount_str, self::MAX_INTEGER_DIGITS )
+			);
 		}
 
 		$normalized = DecimalMath::normalize( $amount_str, self::DEFAULT_SCALE );

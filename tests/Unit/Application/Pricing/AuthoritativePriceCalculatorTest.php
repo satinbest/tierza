@@ -489,7 +489,7 @@ final class AuthoritativePriceCalculatorTest extends TestCase {
 	public function test_large_monetary_values_do_not_overflow(): void {
 		$context = new PricingContext(
 			product_id: 10,
-			base_price: Money::from( '999999999999999.99', 'USD' ),
+			base_price: Money::from( '99999999999999.99', 'USD' ),
 			customer_id: 1
 		);
 
@@ -502,9 +502,15 @@ final class AuthoritativePriceCalculatorTest extends TestCase {
 
 		$result = $this->calculator->calculate( $context, ResolutionResult::matched( $rule, PrecedenceLevel::CUSTOMER_PRODUCT ) );
 
-		// 999999999999999.99 * 0.90 = 899999999999999.991 -> 899999999999999.99
-		$this->assertSame( '899999999999999.990000', $result->final_price()->amount() );
-		$this->assertSame( '899999999999999.99', $result->formatted_final_price() );
+		// 99999999999999.99 * 0.90 = 89999999999999.991 -> 89999999999999.99
+		$this->assertSame( '89999999999999.990000', $result->final_price()->amount() );
+		$this->assertSame( '89999999999999.99', $result->formatted_final_price() );
+	}
+
+	public function test_monetary_value_exceeding_14_integer_digits_throws_exception(): void {
+		$this->expectException( InvalidMoneyException::class );
+		$this->expectExceptionMessage( 'exceeds maximum supported integer magnitude of 14 digits' );
+		Money::from( '100000000000000.00', 'USD' );
 	}
 
 	// -------------------------------------------------------------------------

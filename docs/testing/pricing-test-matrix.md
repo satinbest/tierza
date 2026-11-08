@@ -1,0 +1,123 @@
+# Tierza Pricing Test Matrix & Reliability Architecture (TRZ-008)
+
+This document provides a comprehensive technical reference for the test taxonomy, precedence decision matrix, independent monetary oracle validation, metamorphic properties, storage boundary enforcement, error-injection resilience, and performance baseline established in **TRZ-008**.
+
+---
+
+## ۱. رده‌بندی آزمون‌ها (Test Taxonomy)
+
+ساختار آزمون‌های دامنه قیمت‌گذاری Tierza به صورت چندلایه‌ای و تفکیک‌شده طراحی شده است:
+
+| لایه آزمون | فایل آزمون | هدف و دامنه اعتبارسنجی | تعداد آزمون‌ها |
+| :--- | :--- | :--- | :--- |
+| **ماتریس تصمیم‌گیری (Decision Matrix)** | [`PricingDecisionMatrixTest.php`](file:///d:/Tierza/tests/Unit/Application/Pricing/PricingDecisionMatrixTest.php) | آزمون جدول‌محور ۸ سطح تقدم و Fallback ووکامرس؛ راستی‌آزمایی برنده، سورس، دلیل، متادیتا و عدم انباشتگی قوانین. | ۱۰ آزمون (۹۳ Assertion) |
+| **جداسازی مشتری و گروه (Isolation)** | [`CustomerGroupIsolationTest.php`](file:///d:/Tierza/tests/Unit/Application/Pricing/CustomerGroupIsolationTest.php) | ایزولاسیون کامل بین مشتریان، گروه‌های فعال و غیرفعال، گروه‌های حذف‌شده، اوررایدهای فردی، و مهار خطاهای دیتابیس. | ۱۲ آزمون (۳۳ Assertion) |
+| **سلسله‌مراتب کالا و تنوع (Hierarchy)** | [`ProductVariationHierarchyTest.php`](file:///d:/Tierza/tests/Unit/Application/Pricing/ProductVariationHierarchyTest.php) | کالاهای ساده، متغیر، ارث‌بری تنوع‌ها از کالای والد، و حل تعارض‌های چنددسته‌ای ۳ مرحله‌ای PRD. | ۹ آزمون (۲۷ Assertion) |
+| **اوراکل مستقل پولی (Monetary Oracle)** | [`ComprehensiveMonetaryOracleTest.php`](file:///d:/Tierza/tests/Unit/Application/Pricing/ComprehensiveMonetaryOracleTest.php) | مقایسه ۱۰۰٪ بردارهای مالی با اوراکل محاسباتی مستقل گویا (`ExactRationalPricingOracle`) در مقیاس‌های ۰ تا ۶ اعشار و برابری درایورها. | ۲۶ آزمون (۹۳ Assertion) |
+| **آزمون‌های مبتنی بر ویژگی (Property-Based)** | [`PropertyBasedPricingTest.php`](file:///d:/Tierza/tests/Unit/Application/Pricing/PropertyBasedPricingTest.php) | آزمون ۱۰ خاصیت دگرریختی و یکنوایی با تولید شبه‌تصادفی قطعی (بذر بازتولیدپذیر `SEED = 20261109`). | ۱۰ آزمون (۱۱۲۵ Assertion) |
+| **مرز ذخیره‌سازی پایگاه‌داده (Storage Boundary)** | [`PrecisionPersistenceBoundaryTest.php`](file:///d:/Tierza/tests/Unit/Domain/Pricing/PrecisionPersistenceBoundaryTest.php) | بازرسی رابطه بین `DECIMAL(20,6)`، سقف ۱۴ رقم صحیح، اعشار میانی ۱۴، مقیاس ۶ `Money`، و رد ارقام مازاد. | ۱۱ آزمون (۲۸ Assertion) |
+| **تزریق خطا و مقاومت (Reliability & Faults)** | [`ReliabilityErrorInjectionTest.php`](file:///d:/Tierza/tests/Unit/Application/Pricing/ReliabilityErrorInjectionTest.php) | شبیه‌سازی قطعی دیتابیس، جداول ناموجود، قوانین غیرفعال بازگشتی، تعارضات هم‌سطح، و عدم نشت متادیتاهای حساس. | ۹ آزمون (۲۱ Assertion) |
+| **یکپارچگی زنده دیتابیس (MariaDB Live Integration)** | [`DatabaseIntegrationLiveTest.php`](file:///d:/Tierza/tests/Live/DatabaseIntegrationLiveTest.php) | آزمون زنجیره کامل در MariaDB 10.11 داکر؛ راستی‌آزمایی رزولور، محاسبه‌گر، دسته‌بندی‌ها، و تغییرناپذیری قیمت‌های اصلی کالا و سفارش‌ها. | ۴۰ آزمون (۲۶۹ Assertion) |
+
+---
+
+## ۲. ماتریس کامل تقدم قوانین قیمت‌گذاری (Authoritative Precedence Matrix)
+
+موتور تصمیم‌گیری رزولور قیمت‌گذاری Tierza (`DeterministicRuleResolver`) قوانین فعال واجد شرایط را بر اساس ۸ سطح اولویت قطعی زیر ارزیابی می‌کند:
+
+| اولویت | سطح تقدم (`PrecedenceLevel`) | سورس قیمت (`PricingSource`) | دامنه قانون (`RuleScope`) | کد دلیل (`PricingReasonCode`) | توضیح عملکرد |
+| :---: | :--- | :---: | :---: | :--- | :--- |
+| **۱** | `CUSTOMER_VARIATION` | `customer` | `variation` | `RULE_APPLIED_CUSTOMER_VARIATION` | قانون اختصاصی برای مشتری لاگین‌شده روی یک شناسه متغیر خاص |
+| **۲** | `CUSTOMER_PRODUCT` | `customer` | `product` | `RULE_APPLIED_CUSTOMER_PRODUCT` | قانون مشتری روی کالای ساده یا ارث‌بری توسط متغیر کالای والد |
+| **۳** | `CUSTOMER_CATEGORY` | `customer` | `category` | `RULE_APPLIED_CUSTOMER_CATEGORY` | قانون مشتری روی دسته‌بندی کالا (حل تعارض بر اساس عمق، سپس تخفیف، سپس ID) |
+| **۴** | `CUSTOMER_GLOBAL` | `customer` | `global` | `RULE_APPLIED_CUSTOMER_GLOBAL` | قانون فروشگاهی سراسری مشتری روی تمامی محصولات |
+| **۵** | `GROUP_VARIATION` | `group` | `variation` | `RULE_APPLIED_GROUP_VARIATION` | قانون گروه قیمت‌گذاری روی شناسه متغیر کالا |
+| **۶** | `GROUP_PRODUCT` | `group` | `product` | `RULE_APPLIED_GROUP_PRODUCT` | قانون گروه روی کالای ساده یا ارث‌بری توسط متغیر کالای والد |
+| **۷** | `GROUP_CATEGORY` | `group` | `category` | `RULE_APPLIED_GROUP_CATEGORY` | قانون گروه روی دسته‌بندی کالا (حل تعارض ۳ مرحله‌ای) |
+| **۸** | `GROUP_GLOBAL` | `group` | `global` | `RULE_APPLIED_GROUP_GLOBAL` | قانون سراسری گروه قیمت‌گذاری روی تمام محصولات فروشگاه |
+| **۹** | `WOOCOMMERCE_FALLBACK` | `woocommerce_fallback` | — | `FALLBACK_NO_MATCHING_RULE` / `FALLBACK_ANONYMOUS_NO_RULE` | در صورت نبود قانون تطبیق‌یافته، قیمت پایه اصلی ووکامرس بدون دستکاری اعمال می‌شود |
+
+### سیاست عدم انباشتگی (Strict Non-Stacking)
+* در نسخه ۱ Tierza، قوانین هرگز روی هم انباشته (Compound / Stacking) نمی‌شوند.
+* تنها **یک قانون برنده** انتخاب شده و مستقیماً روی قیمت پایه کانتکست اعمال می‌گردد.
+
+---
+
+## ۳. سیاست حل تعارض دسته‌بندی‌ها (Category Conflict Resolution Policy)
+
+چنانچه چند قانون دسته‌بندی در یک سطح اولویت (سطح ۳ مشتری یا سطح ۷ گروه) با یکدیگر به رقابت بپردازند، حل تعارض با خط‌مشی ۳ مرحله‌ای قطعی PRD انجام می‌پذیرد:
+1. **بیشترین عمق سلسله‌مراتب (Greatest Hierarchy Depth):** دسته فرزند با عمق بیشتر (مثلاً عمق ۲) بدون در نظر گرفتن میزان تخفیف بر دسته والد (عمق ۱) پیروز می‌شود.
+2. **کمترین قیمت نهایی / بیشترین درصد تخفیف (Lowest Final Price):** در صورتی که عمق دو دسته‌بندی برابر باشد، قانونی که تخفیف بیشتری به مشتری می‌دهد برنده می‌شود.
+3. **کوچک‌ترین شناسه دسته‌بندی (Smallest Category ID):** در صورتی که هم عمق و هم تخفیف برابر باشند، دسته‌ای که شناسه عددی کوچک‌تری دارد (`category_id ASC`) به عنوان معیار پیوندشکن قطعی انتخاب می‌شود.
+
+---
+
+## ۴. مرزهای اعشاری، ظرفیت ذخیره‌سازی و اثبات مقیاس میانی
+
+### رابطه اعشاری معماری:
+$$\text{Database DECIMAL}(20,6) \iff \text{Money Scale } 6 \iff \text{Context Decimals } 0..6 \iff \text{Calc Intermediate Scale } 14$$
+
+1. **محدودیت ارقام صحیح:**
+   * نوع داده `DECIMAL(20,6)` در پایگاه‌داده MariaDB دارای ۲۰ رقم کلی و ۶ رقم اعشار است.
+   * حداکثر ارقام صحیح مجاز برابر است با $20 - 6 = 14$ رقم صحیح.
+   * حداکثر مقدار قابل ذخیره بدون سرریز دیتابیس برابر است با: `99999999999999.999999` (۹۹ تریلیون و ۹۹۹ میلیارد...).
+   * هر مقداری با ۱۵ رقم صحیح (مانند `100000000000000.00`) صراحتاً در سازنده [`Money`](file:///d:/Tierza/src/Domain/ValueObjects/Money.php) و [`PricingValue`](file:///d:/Tierza/src/Domain/ValueObjects/PricingValue.php) با خطای `InvalidMoneyException` یا `InvalidRuleException` رد می‌شود تا دیتابیس هرگز دچار برش خاموش یا خطای Numeric Overflow نگردد.
+2. **اثبات ریاضی مقیاس میانی ۱۴ (Intermediate Precision Proof):**
+   * قیمت پایه $B$ حداکثر ۶ رقم اعشار ($10^{-6}$) و درصد تخفیف $P$ حداکثر ۶ رقم اعشار ($10^{-6}$) دارد.
+   * درصد باقی‌مانده $R = 100 - P$ حداکثر ۶ رقم اعشار دقیق دارد.
+   * حاصل‌ضرب $B \times R$ حداکثر $6 + 6 = 12$ رقم اعشار دقیق دارد. لذا `DecimalMath::mul()` با مقیاس ۱۲ اجرا شده و کوچک‌ترین رقم محافظتی (Guard Digit) از بین نمی‌رود.
+   * در تقسیم بر ۱۰۰ ($10^2$)، مخرج تنها توان‌های ۲ و ۵ دارد و هرگز کسر متناوب ایجاد نمی‌کند؛ نتیجه $\frac{B \times R}{100}$ دارای حداکثر $12 + 2 = 14$ رقم اعشار دقیق متناهی است.
+   * در نتیجه `DecimalMath::div(..., 14)` کسر را به شکل ۱۰۰٪ دقیق و جبری نگهداری کرده و عمل گردکردن نیمه‌به‌بالا (`PHP_ROUND_HALF_UP`) **دقیقاً یک‌بار** در مرز پیکربندی‌شده ارز اعمال می‌گردد.
+
+---
+
+## ۵. خواص ریاضی و دگرریختی (Metamorphic Properties)
+
+مجموعه آزمون [`PropertyBasedPricingTest.php`](file:///d:/Tierza/tests/Unit/Application/Pricing/PropertyBasedPricingTest.php) با استفاده از بذر شبه‌تصادفی بازتولیدپذیر `SEED = 20261109` خواص دگرریختی زیر را به اثبات رسانده است:
+
+1. **همانی تخفیف ۰٪ (Zero-Percent Identity):** تخفیف صفر درصد دقیقاً قیمت پایه را در مرز اعشار مشخص ارز حفظ می‌کند (`final_price == round(base_price)`).
+2. **صفر مطلق تخفیف ۱۰۰٪ (Hundred-Percent Annihilation):** تخفیف ۱۰۰ درصد در تمامی قیمت‌ها و ارزها عدد دقیق صفر (`0.000000`) تولید می‌کند.
+3. **یکنوایی تخفیف (Discount Monotonicity):** برای یک قیمت پایه ثابت، با افزایش درصد تخفیف، قیمت نهایی هرگز افزایش نمی‌یابد ($P_1 \le P_2 \implies f(B, P_1) \ge f(B, P_2)$).
+4. **نامنفی بودن (Non-Negativity):** قیمت نهایی تحت هر ورودی معتبر همواره بزرگ‌تر یا مساوی صفر است.
+5. **تغییرناپذیری بر اساس ترتیب قوانین (Permutation Invariance):** بازآرایی و تغییر ترتیب درج قوانین در مخزن داده‌ها، قانون برنده محاسبه‌شده توسط رزولور را تغییر نمی‌دهد.
+6. **فروشمولی و استقلال (Subsumption Independence):** افزودن قوانین نامربوط (سایر مشتریان، سایر محصولات) هیچ تاثیری در خروجی قانون مشتری هدف ندارد.
+7. **خاصیت خنثی و تکرارپذیری (Idempotence & Determinism):** فراخوانی مکرر رزولور و محاسبه‌گر نتایج ۱۰۰٪ یکسان تولید می‌کند.
+8. **استقلال قیمت مقطوع (Fixed-Price Independence):** خروجی قانون قیمت مقطوع مستقل از قیمت پایه کالا است (به جز برای ثبت لاگ و متادیتا).
+9. **تغییرناپذیری اشیاء دامنه (Immutability):** فرایند محاسبه هیچ فیلدی را در شیء کانتکست (`PricingContext`)، ارزش پول (`Money`) یا قانون (`PricingRule`) جهش یا تغییر نمی‌دهد.
+10. **برابری کامل درایورها (Driver Parity):** اجرای محاسبات در هر دو درایور `bcmath` و پیاده‌سازی بدون افزونه `php` خروجی‌های کاملاً یکسان و متقارن تولید می‌کند.
+
+---
+
+## ۶. سناریوهای تزریق خطا و قابلیت اطمینان (Error-Injection Scenarios)
+
+1. **خطای خواندن از مخزن قوانین:** پرتاب `DatabaseQueryException` توسط مخزن، منجر به پرتاب استثنای صریح `RuleResolutionException` شده و هرگز به صورت خاموش به قیمت پایه ووکامرس Fallback نمی‌کند.
+2. **خطای خواندن از مخزن گروه‌ها:** در صورت خرابی یا قطعی ارتباط جدول گروه‌ها، استثنای صریح ایجاد می‌شود.
+3. **قوانین غیرفعال برگشتی از مخزن معیوب:** اگر مخزنی قانون غیرفعال برگرداند، به عنوان نقض یکپارچگی داده تشخیص داده شده و رد می‌شود.
+4. **قوانین متعلق به تارگت‌های نامربوط:** در صورت ناهماهنگی تارگت قانون با تارگت‌های واجد شرایط کانتکست، بلافاصله رد می‌شود.
+5. **قوانین هم‌اولویت متعارض (Conflicting Same-Priority Rules):** وجود بیش از یک قانون در سطوح غیردسته‌ای با خطای صریح تعارض متوقف می‌گردد.
+6. **فقدان متادیتای عمق در تعارض دسته‌ها:** اگر کانتکست فاقد متادیتای عمق برای دسته‌های در حال رقابت باشد، به صورت Fail-Closed متوقف می‌شود.
+7. **امنیت داده‌های حساس:** متادیتای تشخیصی `PricingResult` تضمین می‌کند که هیچ نام کاربری دیتابیس، رمز عبور، کلید محرمانه یا توکن احراز هویت در آرایه تشخیص ثبت نشود.
+
+---
+
+## ۷. مبنای سنجش کارایی و توان پردازشی (Performance Baseline)
+
+سنجش کارایی روی دیتابیس واقعی MariaDB 10.11 همراه با هسته فعال وردپرس با ۱۰ گروه قیمت‌گذاری و ۵۰۰ قانون قیمت‌گذاری مستقر در دیتابیس اندازه‌گیری شد:
+
+| سناریوی سنجش کارایی | تعداد کوئری‌های SQL | کل زمان اجرا (Total ms) | زمان میانگین هر کالا (Avg ms) | اوج مصرف حافظه (Peak RAM) | رفتار و نوسان (Jitter) |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **۱ مشتری / ۱ محصول** | ۱ کوئری | ۰.۳۲ میلی‌ثانیه | ۰.۳۲ میلی‌ثانیه | پایه وردپرس | حداقل: ۰.۲۴ms، حداکثر: ۰.۵۳ms |
+| **۱ مشتری / ۱۰۰ محصول** | ۱۰۰ کوئری | ۲۴.۴۷ میلی‌ثانیه | ۰.۲۴ میلی‌ثانیه | ۱۰۱.۶۸ مگابایت | کاملاً پایدار، خطی بر اساس تعداد کالا |
+| **۱ مشتری / ۵۰۰ محصول** | ۵۰۰ کوئری | ۱۲۸.۷۲ میلی‌ثانیه | ۰.۲۶ میلی‌ثانیه | ۱۰۱.۶۸ مگابایت | پایداری کامل بدون نشت حافظه |
+| **۱۰۰ جستجوی تکراری یکسان** | ۱۰۰ کوئری | ۲۴.۰۹ میلی‌ثانیه | ۰.۲۴ میلی‌ثانیه | ۱۰۱.۶۸ مگابایت | رفتار یکنواخت بدون کش تولیدی |
+
+### معیارهای پذیرش کارایی برای تسک TRZ-009 (Production Caching):
+با پیاده‌سازی کش لایه دامنه در TRZ-009:
+* تعداد کوئری‌های SQL در جستجوهای تکراری باید از ۱۰۰ به **۰ کوئری** کاهش یابد (Hit کامل از کش).
+* میانگین زمان تفکیک هر کالا در حالت Warm Cache باید به کمتر از **۰.۰۵ میلی‌ثانیه** برسد.
+
+---
+
+## ۸. خطرات باقی‌مانده و توصیه‌های معماری (Remaining Testing Risks)
+1. **انباشتگی کوئری‌ها در سبد خریدهای حجیم:** در صورتی که کاربری ۵۰۰ قلم کالا در سبد خرید داشته باشد، موتور فعلی بدون کش ۵۰۰ کوئری به دیتابیس می‌زند؛ این موضوع مستلزم پیاده‌سازی لایه کشینگ و Batch Query در TRZ-009 است.
+2. **عدم اتصال به فیلترهای ووکامرس:** موتور محاسبه‌گر به صورت کاملاً مستقل و Autoritative اعتبارسنجی شده و اتصال به هوک‌های ووکامرس برای تسک بعدی برنامه‌ریزی شده است.

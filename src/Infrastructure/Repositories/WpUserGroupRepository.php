@@ -12,6 +12,8 @@ use Tierza\Infrastructure\Database\Schema;
 use Tierza\Infrastructure\Validation\EntityReferenceValidator;
 use wpdb;
 
+use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
+
 /**
  * WordPress database implementation of UserGroupRepositoryInterface.
  */
@@ -20,12 +22,22 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 	private wpdb $db;
 	private string $table_user_groups;
 	private EntityReferenceValidator $validator;
+	private ?PricingCacheInterface $cache;
 
-	public function __construct( ?wpdb $db = null, ?EntityReferenceValidator $validator = null ) {
+	public function __construct(
+		?wpdb $db = null,
+		?EntityReferenceValidator $validator = null,
+		?PricingCacheInterface $cache = null
+	) {
 		global $wpdb;
 		$this->db                = $db ?? $GLOBALS['wpdb'];
 		$this->table_user_groups = Schema::user_groups_table( $this->db );
 		$this->validator         = $validator ?? new EntityReferenceValidator( $this->db );
+		$this->cache             = $cache;
+	}
+
+	public function set_cache( ?PricingCacheInterface $cache ): void {
+		$this->cache = $cache;
 	}
 
 	public function assign( int $user_id, int $group_id ): UserGroupAssignment {
@@ -70,6 +82,7 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 		);
 
 		$insert_id = (int) $this->db->insert_id;
+		$this->cache?->invalidate_customer( $user_id );
 		return $this->find_by_id( $insert_id ) ?? new UserGroupAssignment(
 			$user_id,
 			$group_id,
@@ -114,7 +127,9 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 			[ '%d' ]
 		);
 
-		return $this->find_by_user_id( $user_id ) ?? $existing->reassign_to_group( $new_group_id );
+		$assigned = $this->find_by_user_id( $user_id ) ?? $existing->reassign_to_group( $new_group_id );
+		$this->cache?->invalidate_customer( $user_id );
+		return $assigned;
 	}
 
 	public function find_by_user_id( int $user_id ): ?UserGroupAssignment {
@@ -175,7 +190,12 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 			[ '%d' ]
 		);
 
-		return false !== $deleted && $deleted > 0;
+		$success = false !== $deleted && $deleted > 0;
+		if ( $success ) {
+			$this->cache?->invalidate_customer( $user_id );
+		}
+
+		return $success;
 	}
 
 	private function find_by_id( int $id ): ?UserGroupAssignment {

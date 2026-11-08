@@ -15,6 +15,8 @@ use Tierza\Infrastructure\Database\Schema;
 use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use wpdb;
 
+use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
+
 /**
  * WordPress database implementation of GroupRepositoryInterface.
  */
@@ -24,13 +26,19 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 	private string $table_groups;
 	private string $table_rules;
 	private string $table_user_groups;
+	private ?PricingCacheInterface $cache;
 
-	public function __construct( ?wpdb $db = null ) {
+	public function __construct( ?wpdb $db = null, ?PricingCacheInterface $cache = null ) {
 		global $wpdb;
 		$this->db                = $db ?? $GLOBALS['wpdb'];
 		$this->table_groups      = Schema::groups_table( $this->db );
 		$this->table_rules       = Schema::rules_table( $this->db );
 		$this->table_user_groups = Schema::user_groups_table( $this->db );
+		$this->cache             = $cache;
+	}
+
+	public function set_cache( ?PricingCacheInterface $cache ): void {
+		$this->cache = $cache;
 	}
 
 	public function save( PricingGroup $group ): PricingGroup {
@@ -82,7 +90,9 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			);
 
 			$insert_id = (int) $this->db->insert_id;
-			return $this->find_by_id( $insert_id ) ?? $group->with_id( $insert_id );
+			$saved     = $this->find_by_id( $insert_id ) ?? $group->with_id( $insert_id );
+			$this->cache?->invalidate_groups();
+			return $saved;
 		}
 
 		// Update existing record.
@@ -101,7 +111,9 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			[ '%d' ]
 		);
 
-		return $this->find_by_id( $group_id ) ?? $group;
+		$saved = $this->find_by_id( $group_id ) ?? $group;
+		$this->cache?->invalidate_groups();
+		return $saved;
 	}
 
 	public function find_by_id( int $id ): ?PricingGroup {
@@ -249,7 +261,12 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			throw new DatabaseQueryException( 'Database query failed while deleting pricing group.' );
 		}
 
-		return false !== $deleted && $deleted > 0;
+		$success = false !== $deleted && $deleted > 0;
+		if ( $success ) {
+			$this->cache?->invalidate_groups();
+		}
+
+		return $success;
 	}
 
 	public function has_assigned_users( int $group_id ): bool {

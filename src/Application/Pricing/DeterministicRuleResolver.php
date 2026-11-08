@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Tierza\Application\Pricing;
 
 use Throwable;
+use Tierza\Application\Pricing\Cache\PricingCacheKeyGenerator;
 use Tierza\Domain\Entities\PricingRule;
 use Tierza\Domain\Exceptions\RuleResolutionException;
+use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
 use Tierza\Domain\Pricing\Contracts\RuleResolverInterface;
 use Tierza\Domain\Pricing\Enums\PrecedenceLevel;
 use Tierza\Domain\Pricing\Enums\PricingReasonCode;
@@ -48,13 +50,24 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 
 	private RuleRepositoryInterface $rule_repository;
 	private ?GroupRepositoryInterface $group_repository;
+	private ?PricingCacheInterface $cache;
 
 	public function __construct(
 		RuleRepositoryInterface $rule_repository,
-		?GroupRepositoryInterface $group_repository = null
+		?GroupRepositoryInterface $group_repository = null,
+		?PricingCacheInterface $cache = null
 	) {
 		$this->rule_repository  = $rule_repository;
 		$this->group_repository = $group_repository;
+		$this->cache            = $cache;
+	}
+
+	public function cache(): ?PricingCacheInterface {
+		return $this->cache;
+	}
+
+	public function set_cache( ?PricingCacheInterface $cache ): void {
+		$this->cache = $cache;
 	}
 
 	/**
@@ -65,6 +78,21 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 	public function resolve( PricingContext $context ): ResolutionResult {
 		$this->validate_context( $context );
 
+		// Check resolution cache if caching is enabled.
+		$context_key = null;
+		if ( null !== $this->cache ) {
+			$group_id     = $context->group_id();
+			$group_active = null;
+			if ( null !== $group_id && $group_id > 0 ) {
+				$group_active = $this->is_group_active( $context, $group_id );
+			}
+			$context_key = PricingCacheKeyGenerator::context_key( $context, $group_active );
+			$cached_res  = $this->cache->get_resolution( $context_key );
+			if ( null !== $cached_res ) {
+				return $cached_res;
+			}
+		}
+
 		// Step 1: Identify eligible active targets.
 		$targets = $this->determine_eligible_targets( $context );
 
@@ -74,7 +102,7 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 				? PricingReasonCode::FALLBACK_ANONYMOUS_NO_RULE->value
 				: PricingReasonCode::FALLBACK_NO_MATCHING_RULE->value;
 
-			return ResolutionResult::fallback( $reason, [ 'targets' => [] ] );
+			return $this->cache_resolution( $context_key, ResolutionResult::fallback( $reason, [ 'targets' => [] ] ) );
 		}
 
 		// Step 2: Fetch active candidate rules from repository.
@@ -86,7 +114,7 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 				? PricingReasonCode::FALLBACK_ANONYMOUS_NO_RULE->value
 				: PricingReasonCode::FALLBACK_NO_MATCHING_RULE->value;
 
-			return ResolutionResult::fallback( $reason );
+			return $this->cache_resolution( $context_key, ResolutionResult::fallback( $reason ) );
 		}
 
 		// Step 3: Validate rule data integrity.
@@ -109,16 +137,19 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 			// Level matched! Select the single winning rule for this level.
 			$winning_rule = $this->select_winning_rule_for_level( $level, $level_rules, $context );
 
-			return ResolutionResult::matched(
-				$winning_rule,
-				$level,
-				null,
-				[
-					'target_type' => $winning_rule->target()->type(),
-					'target_id'   => $winning_rule->target()->id(),
-					'scope_type'  => $winning_rule->scope()->type(),
-					'scope_id'    => $winning_rule->scope()->id(),
-				]
+			return $this->cache_resolution(
+				$context_key,
+				ResolutionResult::matched(
+					$winning_rule,
+					$level,
+					null,
+					[
+						'target_type' => $winning_rule->target()->type(),
+						'target_id'   => $winning_rule->target()->id(),
+						'scope_type'  => $winning_rule->scope()->type(),
+						'scope_id'    => $winning_rule->scope()->id(),
+					]
+				)
 			);
 		}
 
@@ -127,7 +158,15 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 			? PricingReasonCode::FALLBACK_ANONYMOUS_NO_RULE->value
 			: PricingReasonCode::FALLBACK_NO_MATCHING_RULE->value;
 
-		return ResolutionResult::fallback( $reason );
+		return $this->cache_resolution( $context_key, ResolutionResult::fallback( $reason ) );
+	}
+
+	private function cache_resolution( ?string $context_key, ResolutionResult $res ): ResolutionResult {
+		if ( null !== $context_key && null !== $this->cache ) {
+			$this->cache->set_resolution( $context_key, $res );
+		}
+
+		return $res;
 	}
 
 	/**
@@ -188,6 +227,45 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 	}
 
 	/**
+	 * Resolves winning rules for an array of pricing contexts in a single bounded batch operation.
+	 *
+	 * Prefetches candidate rules across all distinct eligible targets in the batch to minimize SQL queries.
+	 *
+	 * @param array<int|string, PricingContext> $contexts
+	 * @return array<int|string, ResolutionResult> Same keys as input array.
+	 * @throws RuleResolutionException If an unrecoverable validation error, data corruption, or DB failure occurs.
+	 */
+	public function resolve_batch( array $contexts ): array {
+		if ( empty( $contexts ) ) {
+			return [];
+		}
+
+		// Step 1: Pre-validate all contexts and extract distinct targets.
+		$all_targets = [];
+		foreach ( $contexts as $context ) {
+			$this->validate_context( $context );
+			$targets = $this->determine_eligible_targets( $context );
+			foreach ( $targets as $target ) {
+				$sig                 = $target->type() . ':' . $target->id();
+				$all_targets[ $sig ] = $target;
+			}
+		}
+
+		// Step 2: Prefetch candidate rules if distinct targets exist.
+		if ( ! empty( $all_targets ) ) {
+			$this->fetch_candidate_rules( array_values( $all_targets ) );
+		}
+
+		// Step 3: Resolve each context.
+		$results = [];
+		foreach ( $contexts as $key => $context ) {
+			$results[ $key ] = $this->resolve( $context );
+		}
+
+		return $results;
+	}
+
+	/**
 	 * Checks whether the referenced group is active, and verifies reference integrity.
 	 *
 	 * @throws RuleResolutionException If the referenced group ID is invalid or deleted.
@@ -196,6 +274,18 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 		$group = $context->group();
 		if ( null !== $group ) {
 			return $group->is_active();
+		}
+
+		if ( null !== $this->cache ) {
+			$cached_status = $this->cache->get_group_status( $group_id );
+			if ( null !== $cached_status ) {
+				if ( ! $cached_status['exists'] ) {
+					throw new RuleResolutionException(
+						sprintf( 'Referenced pricing group ID %d does not exist or has been deleted.', $group_id )
+					);
+				}
+				return $cached_status['is_active'];
+			}
 		}
 
 		// If an entity was not attached to context, verify against the group repository.
@@ -219,12 +309,16 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 		}
 
 		if ( null === $loaded_group ) {
+			$this->cache?->set_group_status( $group_id, false, false, null );
 			throw new RuleResolutionException(
 				sprintf( 'Referenced pricing group ID %d does not exist or has been deleted.', $group_id )
 			);
 		}
 
-		return $loaded_group->is_active();
+		$is_active = $loaded_group->is_active();
+		$this->cache?->set_group_status( $group_id, true, $is_active, $loaded_group );
+
+		return $is_active;
 	}
 
 	/**
@@ -235,8 +329,16 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 	 * @throws RuleResolutionException
 	 */
 	private function fetch_candidate_rules( array $targets ): array {
+		if ( null !== $this->cache ) {
+			$target_key = PricingCacheKeyGenerator::target_key( $targets );
+			$cached     = $this->cache->get_candidate_rules( $target_key );
+			if ( null !== $cached ) {
+				return $cached;
+			}
+		}
+
 		try {
-			return $this->rule_repository->find_active_for_targets( $targets );
+			$rules = $this->rule_repository->find_active_for_targets( $targets );
 		} catch ( Throwable $e ) {
 			throw new RuleResolutionException(
 				sprintf( 'Repository failure while querying pricing rules: %s', $e->getMessage() ),
@@ -244,6 +346,13 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 				$e
 			);
 		}
+
+		if ( null !== $this->cache ) {
+			$target_key = PricingCacheKeyGenerator::target_key( $targets );
+			$this->cache->set_candidate_rules( $target_key, $rules );
+		}
+
+		return $rules;
 	}
 
 	/**

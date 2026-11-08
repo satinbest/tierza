@@ -16,6 +16,8 @@ use Throwable;
 use RuntimeException;
 
 use Tierza\Application\Pricing\AuthoritativePriceCalculator;
+use Tierza\Application\Pricing\Batch\PricingBatchPrefetcher;
+use Tierza\Application\Pricing\Cache\RequestPricingCache;
 use Tierza\Application\Pricing\DeterministicRuleResolver;
 use Tierza\Domain\Entities\PricingGroup;
 use Tierza\Domain\Entities\PricingRule;
@@ -116,6 +118,10 @@ class DatabaseIntegrationLiveTest {
 			'test_authoritative_price_calculator_end_to_end_data_flow_in_mariadb',
 			'test_full_chain_pricing_integration_and_database_immutability_in_mariadb',
 			'test_pricing_engine_comprehensive_performance_baseline_in_mariadb',
+			'test_pricing_cache_query_reduction_for_100_and_500_products_in_mariadb',
+			'test_pricing_cache_repeated_identical_lookups_in_mariadb',
+			'test_pricing_cache_invalidation_upon_mutations_in_mariadb',
+			'test_pricing_cache_customer_privacy_and_isolation_in_mariadb',
 		];
 
 		foreach ( $methods as $method ) {
@@ -2098,6 +2104,278 @@ class DatabaseIntegrationLiveTest {
 			$this->db->query( "DELETE FROM {$table_rules} WHERE target_type = 'group' AND target_id IN (" . implode( ',', $group_ids ) . ')' );
 			$this->db->query( "DELETE FROM {$table_groups} WHERE id IN (" . implode( ',', $group_ids ) . ')' );
 			$this->db->query( "DELETE FROM {$this->db->prefix}posts WHERE ID IN (" . implode( ',', $product_ids ) . ')' );
+		}
+	}
+
+	public function test_pricing_cache_query_reduction_for_100_and_500_products_in_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Live Batch Group', 'live-batch-group' ) );
+		$group_id = (int) $group->id();
+
+		$rule = $this->rule_repo->save(
+			new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::global(),
+				PricingValue::percentage( '12.500000' )
+			)
+		);
+
+		try {
+			$cache = new RequestPricingCache();
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo, $cache );
+
+			// 100 products batch test
+			$contexts_100 = [];
+			for ( $p = 1001; $p <= 1100; $p++ ) {
+				$contexts_100[ 'item_' . $p ] = new PricingContext(
+					product_id: $p,
+					base_price: Money::from( '100.00', 'USD' ),
+					customer_id: 50,
+					group: $group
+				);
+			}
+
+			$q_before_100 = $this->db->num_queries;
+			$t_start_100  = microtime( true );
+			$batch_100    = $resolver->resolve_batch( $contexts_100 );
+			$t_100        = ( microtime( true ) - $t_start_100 ) * 1000;
+			$queries_100  = $this->db->num_queries - $q_before_100;
+
+			$this->assert( 100 === count( $batch_100 ), 'Batch 100 must return exactly 100 results.' );
+			$this->assert( 1 === $queries_100, "100 products must execute exactly 1 database query via batch cache (executed: {$queries_100})." );
+
+			foreach ( $batch_100 as $res ) {
+				$this->assert( ! $res->is_fallback(), 'All 100 items must match active group rule.' );
+				$this->assert( '12.500000' === $res->rule()?->pricing_value()->value(), 'Rule value must be 12.5%.' );
+			}
+
+			// 500 products batch test
+			$cache_500 = new RequestPricingCache();
+			$resolver_500 = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo, $cache_500 );
+
+			$contexts_500 = [];
+			for ( $p = 2001; $p <= 2500; $p++ ) {
+				$contexts_500[ 'item_' . $p ] = new PricingContext(
+					product_id: $p,
+					base_price: Money::from( '50.00', 'USD' ),
+					customer_id: 50,
+					group: $group
+				);
+			}
+
+			$q_before_500 = $this->db->num_queries;
+			$t_start_500  = microtime( true );
+			$batch_500    = $resolver_500->resolve_batch( $contexts_500 );
+			$t_500        = ( microtime( true ) - $t_start_500 ) * 1000;
+			$queries_500  = $this->db->num_queries - $q_before_500;
+
+			$this->assert( 500 === count( $batch_500 ), 'Batch 500 must return exactly 500 results.' );
+			$this->assert( 1 === $queries_500, "500 products must execute exactly 1 database query via batch cache (executed: {$queries_500})." );
+
+			echo PHP_EOL;
+			echo "   --- Batch Prefetching & Caching Metrics (TRZ-009) ---" . PHP_EOL;
+			echo sprintf( "   1 cust / 100 prods: %.2f ms total (%.2f ms/prod, %d SQL query vs 100 in baseline)" . PHP_EOL, $t_100, $t_100 / 100, $queries_100 );
+			echo sprintf( "   1 cust / 500 prods: %.2f ms total (%.2f ms/prod, %d SQL query vs 500 in baseline)" . PHP_EOL, $t_500, $t_500 / 500, $queries_500 );
+			echo "   -----------------------------------------------------" . PHP_EOL;
+		} finally {
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->group_repo->delete( $group_id );
+		}
+	}
+
+	public function test_pricing_cache_repeated_identical_lookups_in_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Repeat Cache Group', 'repeat-cache-group' ) );
+		$group_id = (int) $group->id();
+
+		$this->db->insert(
+			$this->db->prefix . 'posts',
+			[
+				'post_title'  => 'Test Product Cache Repeat',
+				'post_type'   => 'product',
+				'post_status' => 'publish',
+			]
+		);
+		$product_id = (int) $this->db->insert_id;
+
+		$rule = $this->rule_repo->save(
+			new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::product( $product_id ),
+				PricingValue::percentage( '20.000000' )
+			)
+		);
+
+		try {
+			$cache = new RequestPricingCache();
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo, $cache );
+
+			$ctx = new PricingContext(
+				product_id: $product_id,
+				base_price: Money::from( '100.00', 'USD' ),
+				customer_id: 25,
+				group: $group
+			);
+
+			// 1st resolution (cold cache): queries DB and warms cache
+			$q_before_1 = $this->db->num_queries;
+			$res1 = $resolver->resolve( $ctx );
+			$q_after_1 = $this->db->num_queries;
+			$this->assert( 1 === ( $q_after_1 - $q_before_1 ), 'Initial resolution must execute 1 DB query.' );
+			$this->assert( '20.000000' === $res1->rule()?->pricing_value()->value(), 'Must match 20% rule.' );
+
+			// 99 repeated identical lookups (warm cache)
+			$q_before_rep = $this->db->num_queries;
+			for ( $k = 0; $k < 99; $k++ ) {
+				$res_k = $resolver->resolve( $ctx );
+				$this->assert( '20.000000' === $res_k->rule()?->pricing_value()->value(), 'Warm cache must match same rule.' );
+			}
+			$q_after_rep = $this->db->num_queries;
+			$additional_queries = $q_after_rep - $q_before_rep;
+
+			$this->assert( 0 === $additional_queries, "99 repeated lookups must execute exactly 0 additional queries (executed: {$additional_queries})." );
+			$stats = $cache->stats();
+			$this->assert( 99 === $stats['resolution_hits'], 'Must record exactly 99 resolution hits.' );
+			$this->assert( 1 === $stats['resolution_misses'], 'Must record exactly 1 resolution miss.' );
+		} finally {
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->group_repo->delete( $group_id );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $product_id ] );
+		}
+	}
+
+	public function test_pricing_cache_invalidation_upon_mutations_in_mariadb(): void {
+		$cache = new RequestPricingCache();
+		$cached_rule_repo = new WpRuleRepository( $this->db, $this->validator, $cache );
+		$cached_group_repo = new WpGroupRepository( $this->db, $cache );
+		$cached_ug_repo = new WpUserGroupRepository( $this->db, $this->validator, $cache );
+		$resolver = new DeterministicRuleResolver( $cached_rule_repo, $cached_group_repo, $cache );
+
+		$group = $cached_group_repo->save( new PricingGroup( 'Mutation Test Group', 'mutation-test-group' ) );
+		$group_id = (int) $group->id();
+
+		$this->db->insert(
+			$this->db->prefix . 'posts',
+			[
+				'post_title'  => 'Test Product Mutation',
+				'post_type'   => 'product',
+				'post_status' => 'publish',
+			]
+		);
+		$product_id = (int) $this->db->insert_id;
+
+		$rule = $cached_rule_repo->save(
+			new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::product( $product_id ),
+				PricingValue::percentage( '10.000000' )
+			)
+		);
+		$rule_id = (int) $rule->id();
+
+		try {
+			$ctx = new PricingContext(
+				product_id: $product_id,
+				base_price: Money::from( '100.00', 'USD' ),
+				customer_id: 30,
+				group: $group
+			);
+
+			// Step 1: Initial resolution (warm cache with 10%)
+			$res1 = $resolver->resolve( $ctx );
+			$this->assert( '10.000000' === $res1->rule()?->pricing_value()->value(), 'Initial rule must be 10%.' );
+			$this->assert( $cache->stats()['resolution_count'] > 0, 'Resolution cache must be populated.' );
+
+			// Step 2: Update rule to 25% discount -> repository save() must invalidate cache
+			$updated_rule = new PricingRule(
+				RuleTarget::group( $group_id ),
+				RuleScope::product( $product_id ),
+				PricingValue::percentage( '25.000000' ),
+				$rule_id,
+				RuleStatus::active()
+			);
+			$cached_rule_repo->save( $updated_rule );
+
+			$this->assert( 0 === $cache->stats()['resolution_count'], 'Rule save must invalidate resolution cache.' );
+
+			// Next resolution reflects updated 25% rule immediately
+			$res2 = $resolver->resolve( $ctx );
+			$this->assert( '25.000000' === $res2->rule()?->pricing_value()->value(), 'Updated rule of 25% must be applied immediately.' );
+
+			// Step 3: Delete rule -> repository delete() must invalidate cache
+			$cached_rule_repo->delete( $rule_id );
+			$this->assert( 0 === $cache->stats()['resolution_count'], 'Rule delete must invalidate resolution cache.' );
+
+			// Next resolution falls back immediately
+			$res3 = $resolver->resolve( $ctx );
+			$this->assert( $res3->is_fallback(), 'After rule deletion, resolution must fallback.' );
+		} finally {
+			$this->cached_cleanup( $group_id );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $product_id ] );
+		}
+	}
+
+	public function test_pricing_cache_customer_privacy_and_isolation_in_mariadb(): void {
+		$this->db->insert(
+			$this->db->prefix . 'posts',
+			[
+				'post_title'  => 'Test Product Privacy',
+				'post_type'   => 'product',
+				'post_status' => 'publish',
+			]
+		);
+		$product_id = (int) $this->db->insert_id;
+
+		$user_a_id = $this->create_test_user( 'priv_user_a', 'priv_a@test.com' );
+		$user_b_id = $this->create_test_user( 'priv_user_b', 'priv_b@test.com' );
+
+		$rule_user_a = $this->rule_repo->save(
+			new PricingRule( RuleTarget::user( $user_a_id ), RuleScope::product( $product_id ), PricingValue::percentage( '30.000000' ) )
+		);
+		$rule_user_b = $this->rule_repo->save(
+			new PricingRule( RuleTarget::user( $user_b_id ), RuleScope::product( $product_id ), PricingValue::percentage( '10.000000' ) )
+		);
+
+		try {
+			$cache = new RequestPricingCache();
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo, $cache );
+
+			$ctx_a = new PricingContext( product_id: $product_id, base_price: Money::from( '100.00', 'USD' ), customer_id: $user_a_id );
+			$ctx_b = new PricingContext( product_id: $product_id, base_price: Money::from( '100.00', 'USD' ), customer_id: $user_b_id );
+			$ctx_guest = new PricingContext( product_id: $product_id, base_price: Money::from( '100.00', 'USD' ), customer_id: 0 );
+
+			// Resolve User A
+			$res_a = $resolver->resolve( $ctx_a );
+			$this->assert( '30.000000' === $res_a->rule()?->pricing_value()->value(), 'User A must get 30% discount.' );
+
+			// Resolve User B (must never get User A's 30%)
+			$res_b = $resolver->resolve( $ctx_b );
+			$this->assert( '10.000000' === $res_b->rule()?->pricing_value()->value(), 'User B must get 10% discount, never User A discount.' );
+
+			// Resolve Guest (must never get User A or User B discount)
+			$res_guest = $resolver->resolve( $ctx_guest );
+			$this->assert( $res_guest->is_fallback(), 'Guest must fallback, never receive authenticated discount.' );
+
+			// Repeat warm resolutions
+			$res_a_warm = $resolver->resolve( $ctx_a );
+			$res_b_warm = $resolver->resolve( $ctx_b );
+			$res_guest_warm = $resolver->resolve( $ctx_guest );
+
+			$this->assert( '30.000000' === $res_a_warm->rule()?->pricing_value()->value(), 'User A warm cache must remain 30%.' );
+			$this->assert( '10.000000' === $res_b_warm->rule()?->pricing_value()->value(), 'User B warm cache must remain 10%.' );
+			$this->assert( $res_guest_warm->is_fallback(), 'Guest warm cache must remain fallback.' );
+		} finally {
+			$this->rule_repo->delete( (int) $rule_user_a->id() );
+			$this->rule_repo->delete( (int) $rule_user_b->id() );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $product_id ] );
+			$this->delete_test_user( $user_a_id );
+			$this->delete_test_user( $user_b_id );
+		}
+	}
+
+	private function cached_cleanup( int $group_id ): void {
+		try {
+			$this->group_repo->delete( $group_id );
+		} catch ( Throwable ) {
+			// Ignore if already deleted.
 		}
 	}
 }

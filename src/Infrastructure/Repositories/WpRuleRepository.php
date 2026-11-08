@@ -18,6 +18,8 @@ use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use Tierza\Infrastructure\Validation\EntityReferenceValidator;
 use wpdb;
 
+use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
+
 /**
  * WordPress database implementation of RuleRepositoryInterface.
  */
@@ -26,12 +28,22 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 	private wpdb $db;
 	private string $table_rules;
 	private EntityReferenceValidator $validator;
+	private ?PricingCacheInterface $cache;
 
-	public function __construct( ?wpdb $db = null, ?EntityReferenceValidator $validator = null ) {
+	public function __construct(
+		?wpdb $db = null,
+		?EntityReferenceValidator $validator = null,
+		?PricingCacheInterface $cache = null
+	) {
 		global $wpdb;
 		$this->db          = $db ?? $GLOBALS['wpdb'];
 		$this->table_rules = Schema::rules_table( $this->db );
 		$this->validator   = $validator ?? new EntityReferenceValidator( $this->db );
+		$this->cache       = $cache;
+	}
+
+	public function set_cache( ?PricingCacheInterface $cache ): void {
+		$this->cache = $cache;
 	}
 
 	public function save( PricingRule $rule ): PricingRule {
@@ -98,7 +110,9 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			}
 
 			$insert_id = (int) $this->db->insert_id;
-			return $this->find_by_id( $insert_id ) ?? $rule->with_id( $insert_id );
+			$saved     = $this->find_by_id( $insert_id ) ?? $rule->with_id( $insert_id );
+			$this->cache?->invalidate_rules();
+			return $saved;
 		}
 
 		// Update existing record.
@@ -140,7 +154,9 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			}
 		}
 
-		return $this->find_by_id( $rule_id ) ?? $rule;
+		$saved = $this->find_by_id( $rule_id ) ?? $rule;
+		$this->cache?->invalidate_rules();
+		return $saved;
 	}
 
 	public function find_by_id( int $id ): ?PricingRule {
@@ -183,7 +199,7 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 		return array_map( [ $this, 'hydrate' ], $rows );
 	}
 
-	public function find_active_for_targets( array $targets ): array {
+	public function find_active_for_targets( array $targets, array $scopes = [] ): array {
 		if ( empty( $targets ) ) {
 			return [];
 		}
@@ -200,17 +216,87 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 		$params[] = RuleStatus::ACTIVE;
 		$where    = implode( ' OR ', $clauses );
 
+		if ( empty( $scopes ) ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$sql = $this->db->prepare(
+				"SELECT * FROM {$this->table_rules} WHERE ({$where}) AND status = %s ORDER BY id ASC",
+				...$params
+			);
+
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+			$rows = $this->db->get_results( $sql, ARRAY_A );
+
+			if ( ! empty( $this->db->last_error ) || ! is_array( $rows ) ) {
+				throw new DatabaseQueryException( 'Database query failed while retrieving active rules for targets.' );
+			}
+
+			return array_map( [ $this, 'hydrate' ], $rows );
+		}
+
+		// When scopes are specified, group scopes by type to optimize indexing and query structure.
+		$has_global    = false;
+		$category_ids  = [];
+		$product_ids   = [];
+		$variation_ids = [];
+
+		foreach ( $scopes as $scope ) {
+			$type = $scope->type();
+			$id   = $scope->id();
+			if ( 'global' === $type ) {
+				$has_global = true;
+			} elseif ( 'category' === $type && $id > 0 ) {
+				$category_ids[ $id ] = true;
+			} elseif ( 'product' === $type && $id > 0 ) {
+				$product_ids[ $id ] = true;
+			} elseif ( 'variation' === $type && $id > 0 ) {
+				$variation_ids[ $id ] = true;
+			}
+		}
+
+		$scope_clauses = [];
+		$scope_params  = [];
+
+		if ( $has_global ) {
+			$scope_clauses[] = "(scope_type = 'global' AND scope_id = 0)";
+		}
+
+		$append_in_clause = function ( string $type, array $ids ) use ( &$scope_clauses, &$scope_params ): void {
+			if ( empty( $ids ) ) {
+				return;
+			}
+			// Chunk by 500 to keep parameter counts well within database limits.
+			$chunks = array_chunk( array_keys( $ids ), 500 );
+			foreach ( $chunks as $chunk ) {
+				$placeholders    = implode( ', ', array_fill( 0, count( $chunk ), '%d' ) );
+				$scope_clauses[] = "(scope_type = '{$type}' AND scope_id IN ({$placeholders}))";
+				foreach ( $chunk as $id ) {
+					$scope_params[] = (int) $id;
+				}
+			}
+		};
+
+		$append_in_clause( 'category', $category_ids );
+		$append_in_clause( 'product', $product_ids );
+		$append_in_clause( 'variation', $variation_ids );
+
+		if ( empty( $scope_clauses ) ) {
+			return [];
+		}
+
+		$where_scopes = implode( ' OR ', $scope_clauses );
+		$all_params   = array_merge( $params, $scope_params );
+
 		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$sql = $this->db->prepare(
-			"SELECT * FROM {$this->table_rules} WHERE ({$where}) AND status = %s ORDER BY id ASC",
-			...$params
+			"SELECT * FROM {$this->table_rules} WHERE ({$where}) AND status = %s AND ({$where_scopes}) ORDER BY id ASC",
+			...$all_params
 		);
 
 		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 		$rows = $this->db->get_results( $sql, ARRAY_A );
 
 		if ( ! empty( $this->db->last_error ) || ! is_array( $rows ) ) {
-			throw new DatabaseQueryException( 'Database query failed while retrieving active rules for targets.' );
+			throw new DatabaseQueryException( 'Database query failed while retrieving active rules for targets and scopes.' );
 		}
 
 		return array_map( [ $this, 'hydrate' ], $rows );
@@ -407,7 +493,12 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			throw new DatabaseQueryException( 'Database query failed while deleting rule.' );
 		}
 
-		return false !== $deleted && $deleted > 0;
+		$success = false !== $deleted && $deleted > 0;
+		if ( $success ) {
+			$this->cache?->invalidate_rules();
+		}
+
+		return $success;
 	}
 
 	/**

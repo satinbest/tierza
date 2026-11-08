@@ -90,3 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Enforced MariaDB `DECIMAL(20,6)` 14-integer-digit storage ceiling (`99999999999999.999999`) across `Money` and `PricingValue`, preventing arithmetic or persistence overflows.
   - Replaced production `DecimalMath` usage in property-based test with independent `ExactRationalPricingOracle` ground truth.
 - Expanded automated test suite to 471 PHPUnit tests (3,026 assertions) and 40 live MariaDB integration tests (269 assertions) passing at 100% (TRZ-008).
+- Multi-tier request-scoped pricing cache and prefetching architecture (`PricingCacheInterface`, `RequestPricingCache`, `PricingCacheKeyGenerator`, `PricingBatchPrefetcher`, `CachedRuleRepository`) (TRZ-009).
+- High-performance batch resolution API (`DeterministicRuleResolver::resolve_batch`) prefetching candidate rules in a single indexed query (TRZ-009).
+- Drastic database query reduction on archive and catalog listings: 100 products reduced from 100 queries (24.66 ms) to 1 query (3.99 ms) (99% reduction, 6.2x faster); 500 products reduced from 500 queries (124.24 ms) to 1 query (3.52 ms) (99.8% reduction, 35.3x faster) (TRZ-009).
+- Zero additional database queries for 100 repeated identical lookups (1 initial query, 99 cache hits, 100% cache hit rate) (TRZ-009).
+- Strict customer isolation and tenant segregation preventing state leaks across distinct users or guest/unauthenticated sessions (TRZ-009).
+- Automatic cache invalidation hooks wired into repository mutations: `WpRuleRepository::save`/`delete`, `WpGroupRepository::save`/`delete`, and `WpUserGroupRepository::assign`/`reassign`/`remove` (TRZ-009).
+- Strict memory bounds with FIFO eviction (100 candidate sets, 2,000 resolutions, 2,000 calculations) preventing runaway memory during bulk imports or massive batches (TRZ-009).
+- Dedicated Pricing Cache architecture guide (`docs/architecture/pricing-cache.md`) (TRZ-009).
+- Expanded automated test suite to 505 PHPUnit tests (3,282 assertions) and 44 live MariaDB integration tests (589 assertions) passing at 100% (TRZ-009).

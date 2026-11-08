@@ -15,6 +15,7 @@ use wpdb;
 use Throwable;
 use RuntimeException;
 
+use Tierza\Application\Pricing\DeterministicRuleResolver;
 use Tierza\Domain\Entities\PricingGroup;
 use Tierza\Domain\Entities\PricingRule;
 use Tierza\Domain\Exceptions\DuplicateRuleException;
@@ -23,6 +24,11 @@ use Tierza\Domain\Exceptions\GroupDeletionSafeguardException;
 use Tierza\Domain\Exceptions\InvalidAssignmentException;
 use Tierza\Domain\Exceptions\InvalidRuleException;
 use Tierza\Domain\Exceptions\SchemaMigrationException;
+use Tierza\Domain\Pricing\Enums\PrecedenceLevel;
+use Tierza\Domain\Pricing\Enums\PricingReasonCode;
+use Tierza\Domain\Pricing\Enums\PricingSource;
+use Tierza\Domain\Pricing\PricingContext;
+use Tierza\Domain\ValueObjects\Money;
 use Tierza\Domain\ValueObjects\GroupSlug;
 use Tierza\Domain\ValueObjects\GroupStatus;
 use Tierza\Domain\ValueObjects\PricingValue;
@@ -97,6 +103,10 @@ class DatabaseIntegrationLiveTest {
 			'test_legacy_upgrade_repeated_after_successful_backfill_is_idempotent',
 			'test_legacy_upgrade_existing_rule_ids_values_and_timestamps_preserved',
 			'test_legacy_upgrade_new_uniqueness_constraint_rejects_concurrent_duplicates',
+			'test_rule_resolver_real_stored_rules_in_mariadb',
+			'test_rule_resolver_category_hierarchy_in_mariadb',
+			'test_rule_resolver_explicit_zero_and_inactive_rules_in_mariadb',
+			'test_rule_resolver_query_counts_on_real_mariadb',
 		];
 
 		foreach ( $methods as $method ) {
@@ -1173,6 +1183,164 @@ class DatabaseIntegrationLiveTest {
 		// Restore clean 1.0.0 schema at end of upgrade tests.
 		Schema::install( $this->db );
 		$this->clean_tables();
+	}
+
+	public function test_rule_resolver_real_stored_rules_in_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Live Resolver Group', 'live-resolver-group' ) );
+		$group_id = (int) $group->id();
+
+		// Create mock product and variation
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'Live Product', 'post_type' => 'product', 'post_status' => 'publish' ] );
+		$product_id = (int) $this->db->insert_id;
+
+		$this->db->insert( $this->db->prefix . 'posts', [ 'post_title' => 'Live Variation', 'post_type' => 'product_variation', 'post_status' => 'publish', 'post_parent' => $product_id ] );
+		$variation_id = (int) $this->db->insert_id;
+
+		$customer_id = 1; // existing admin user
+
+		$rule1 = $this->rule_repo->save( new PricingRule( RuleTarget::group( $group_id ), RuleScope::product( $product_id ), PricingValue::percentage( '15.000000' ) ) );
+		$rule2 = $this->rule_repo->save( new PricingRule( RuleTarget::user( $customer_id ), RuleScope::variation( $variation_id ), PricingValue::percentage( '25.000000' ) ) );
+
+		try {
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+			$context  = new PricingContext(
+				product_id: $product_id,
+				base_price: Money::from( '200.00', 'USD' ),
+				customer_id: $customer_id,
+				group: $group,
+				variation_id: $variation_id
+			);
+
+			$result = $resolver->resolve( $context );
+
+			$this->assert( ! $result->is_fallback(), 'Result must not be fallback.' );
+			$this->assert( PrecedenceLevel::CUSTOMER_VARIATION === $result->precedence_level(), 'Customer variation must win over group product.' );
+			$this->assert( $rule2->id() === $result->rule()->id(), 'Winning rule ID must match customer variation rule.' );
+			$this->assert( '25.000000' === $result->rule()->pricing_value()->value(), 'Winning percentage must be 25%.' );
+		} finally {
+			$this->rule_repo->delete( (int) $rule1->id() );
+			$this->rule_repo->delete( (int) $rule2->id() );
+			$this->group_repo->delete( $group_id );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $variation_id ] );
+			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $product_id ] );
+		}
+	}
+
+	public function test_rule_resolver_category_hierarchy_in_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Live Category Group', 'live-cat-group' ) );
+		$group_id = (int) $group->id();
+
+		// Mock categories
+		$this->db->insert( $this->db->prefix . 'terms', [ 'name' => 'Parent Cat', 'slug' => 'parent-cat-live' ] );
+		$parent_cat_id = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $parent_cat_id, 'taxonomy' => 'product_cat', 'count' => 1 ] );
+
+		$this->db->insert( $this->db->prefix . 'terms', [ 'name' => 'Child Cat', 'slug' => 'child-cat-live' ] );
+		$child_cat_id = (int) $this->db->insert_id;
+		$this->db->insert( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $child_cat_id, 'taxonomy' => 'product_cat', 'parent' => $parent_cat_id, 'count' => 1 ] );
+
+		// Parent rule (depth 1, 50% discount) vs Child rule (depth 2, 10% discount)
+		$rule_parent = $this->rule_repo->save( new PricingRule( RuleTarget::group( $group_id ), RuleScope::category( $parent_cat_id ), PricingValue::percentage( '50.000000' ) ) );
+		$rule_child  = $this->rule_repo->save( new PricingRule( RuleTarget::group( $group_id ), RuleScope::category( $child_cat_id ), PricingValue::percentage( '10.000000' ) ) );
+
+		try {
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+			$context  = new PricingContext(
+				product_id: 10,
+				base_price: Money::from( '100.00', 'USD' ),
+				customer_id: 0,
+				group: $group,
+				category_ids: [ $parent_cat_id, $child_cat_id ],
+				category_depths: [ $parent_cat_id => 1, $child_cat_id => 2 ]
+			);
+
+			$result = $resolver->resolve( $context );
+
+			$this->assert( PrecedenceLevel::GROUP_CATEGORY === $result->precedence_level(), 'Group category must be resolved.' );
+			$this->assert( $rule_child->id() === $result->rule()->id(), 'Child category rule at depth 2 must win over parent at depth 1.' );
+			$this->assert( '10.000000' === $result->rule()->pricing_value()->value(), 'Winning discount must be child discount.' );
+		} finally {
+			$this->rule_repo->delete( (int) $rule_parent->id() );
+			$this->rule_repo->delete( (int) $rule_child->id() );
+			$this->group_repo->delete( $group_id );
+			$this->db->delete( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $child_cat_id ] );
+			$this->db->delete( $this->db->prefix . 'terms', [ 'term_id' => $child_cat_id ] );
+			$this->db->delete( $this->db->prefix . 'term_taxonomy', [ 'term_id' => $parent_cat_id ] );
+			$this->db->delete( $this->db->prefix . 'terms', [ 'term_id' => $parent_cat_id ] );
+		}
+	}
+
+	public function test_rule_resolver_explicit_zero_and_inactive_rules_in_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Live Zero Group', 'live-zero-group' ) );
+		$group_id = (int) $group->id();
+
+		// Inactive 50% rule
+		$inactive_rule = new PricingRule(
+			RuleTarget::group( $group_id ),
+			RuleScope::global(),
+			PricingValue::percentage( '50.000000' ),
+			null,
+			RuleStatus::INACTIVE
+		);
+		$saved_inactive = $this->rule_repo->save( $inactive_rule );
+
+		// Active explicit 0% rule for user 1
+		$zero_rule = new PricingRule(
+			RuleTarget::user( 1 ),
+			RuleScope::global(),
+			PricingValue::percentage( '0.000000' )
+		);
+		$saved_zero = $this->rule_repo->save( $zero_rule );
+
+		try {
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+			$context  = new PricingContext(
+				product_id: 10,
+				base_price: Money::from( '100.00', 'USD' ),
+				customer_id: 1,
+				group: $group
+			);
+
+			$result = $resolver->resolve( $context );
+
+			$this->assert( PrecedenceLevel::CUSTOMER_GLOBAL === $result->precedence_level(), 'Customer global must win.' );
+			$this->assert( '0.000000' === $result->rule()->pricing_value()->value(), 'Explicit 0% rule must be winning value.' );
+			$this->assert( PricingReasonCode::RULE_APPLIED_ZERO_PERCENTAGE->value === $result->reason_code(), 'Reason code must indicate zero percentage applied.' );
+		} finally {
+			$this->rule_repo->delete( (int) $saved_inactive->id() );
+			$this->rule_repo->delete( (int) $saved_zero->id() );
+			$this->group_repo->delete( $group_id );
+		}
+	}
+
+	public function test_rule_resolver_query_counts_on_real_mariadb(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Query Count Group', 'query-count-group' ) );
+		$group_id = (int) $group->id();
+
+		$rule = $this->rule_repo->save( new PricingRule( RuleTarget::group( $group_id ), RuleScope::global(), PricingValue::percentage( '10.000000' ) ) );
+
+		try {
+			$resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo );
+
+			// Scenario 1: Anonymous user without group -> exactly 0 queries!
+			$anon_context = new PricingContext( product_id: 10, base_price: Money::from( '100.00', 'USD' ), customer_id: 0 );
+			$q_before     = $this->db->num_queries;
+			$anon_res     = $resolver->resolve( $anon_context );
+			$q_after      = $this->db->num_queries;
+			$this->assert( 0 === ( $q_after - $q_before ), 'Anonymous user without group must execute 0 DB queries.' );
+			$this->assert( $anon_res->is_fallback(), 'Anonymous user must fallback.' );
+
+			// Scenario 2: Authenticated user with attached group -> exactly 1 batch query!
+			$auth_context = new PricingContext( product_id: 10, base_price: Money::from( '100.00', 'USD' ), customer_id: 1, group: $group );
+			$q_before     = $this->db->num_queries;
+			$auth_res     = $resolver->resolve( $auth_context );
+			$q_after      = $this->db->num_queries;
+			$this->assert( 1 === ( $q_after - $q_before ), 'Authenticated user with group must execute at most 1 DB query.' );
+			$this->assert( ! $auth_res->is_fallback(), 'Authenticated user with group must match rule.' );
+		} finally {
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->group_repo->delete( $group_id );
+		}
 	}
 }
 

@@ -31,10 +31,11 @@ Tierza provides clean, authoritative, server-side pricing rules for wholesale an
 - [x] **TRZ-003 (CI Pipeline)**: GitHub Actions continuous integration testing PHP 8.1 & 8.4 matrix, JS quality, containerized integration, Playwright E2E, and production ZIP artifact validation.
 - [x] **TRZ-004 (Database Schema & Persistence Layer)**: Production-ready MariaDB/MySQL database schema (`tierza_groups`, `tierza_rules`, `tierza_user_groups`), database-enforced active rule uniqueness (`uq_active_rule`), domain entities, repositories, failure-safe idempotent migrations, entity reference validation, and 31 live database integration and legacy upgrade tests.
 - [x] **TRZ-005 (Pricing Contracts & Domain Interfaces)**: Strongly typed immutable PricingContext, arbitrary-precision deterministic decimal value objects (Money, DecimalMath) with zero float imprecision and pure-PHP fallback (no mandatory undocumented extensions), strict 9-level precedence hierarchy contracts (RuleResolverInterface), calculation contracts (PriceCalculatorInterface), immutable PricingResult, machine-readable reason codes, and 209 unit tests (810 assertions).
+- [x] **TRZ-006 (Deterministic Rule Resolver)**: High-performance deterministic rule selection engine (`DeterministicRuleResolver`), single batch database query optimization (`find_active_for_targets()`), guaranteed 0 DB queries for guest users, deterministic 3-step category hierarchy tie-breaking, variation rule inheritance, explicit 0% and zero-price rule support, referential safeguards, 53 pure unit tests, and 4 live MariaDB integration tests (268 total unit tests, 1155 assertions, 35 live DB tests).
 
 ### Planned Milestones:
-- [ ] **TRZ-006**: Rule Resolver (Precedence hierarchy, deterministic rule resolution, category & product tier evaluation)
-- [ ] **TRZ-007+**: WooCommerce price filtering, Cart/Checkout integration, REST API, and React admin SPA.
+- [ ] **TRZ-007**: Authoritative Price Calculator (Calculations, rounding, minimum price clamps, tax compatibility)
+- [ ] **TRZ-008+**: WooCommerce price filtering, Cart/Checkout integration, REST API, and React admin SPA.
 
 ---
 

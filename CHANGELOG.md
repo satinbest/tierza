@@ -44,3 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Enforced strict PricingContext consistency (group entity vs group_id, category depth mapping validation, and anonymous customer isolation) (TRZ-005).
 - Hardened ResolutionResult validation with invariant checks preventing inconsistent or corrupted result states (TRZ-005).
 - Expanded PHPUnit unit test suite to 209 tests with 810 assertions passing at 100% (TRZ-005).
+- Deterministic pricing rule selection engine (`DeterministicRuleResolver`) implementing strict 9-level precedence hierarchy and 100% pure unit testing (TRZ-006).
+- High-performance single batch query method (`RuleRepositoryInterface::find_active_for_targets()`) utilizing composite index `idx_target` (TRZ-006).
+- Guaranteed zero database queries for unauthenticated/anonymous guests without assigned groups (TRZ-006).
+- Fully deterministic 3-step category hierarchy tie-breaking engine (deepest taxonomy depth, lowest final price/highest percentage, smallest category ID) (TRZ-006).
+- Strict referential safeguards for inactive rules, inactive groups, and deleted group references with domain exceptions (TRZ-006).
+- Full support for explicit 0% discount and fixed zero price rules with dedicated reason codes (`RULE_APPLIED_ZERO_PERCENTAGE`) (TRZ-006).
+- Variation rule inheritance allowing product-level rules to cascade to variations when no variation-specific rule matches (TRZ-006).
+- In-memory mock repositories (`InMemoryRuleRepository` and `InMemoryGroupRepository`) for isolated high-speed testing (TRZ-006).
+- Complete 53-test resolver unit test suite including 28-pair precedence matrix and 50-iteration randomized order invariance tests (TRZ-006).
+- Live MariaDB resolver integration tests verifying end-to-end repository queries, category taxonomy matching, and query counts (TRZ-006).
+- Comprehensive Rule Resolver architecture document (`docs/architecture/rule-resolver.md`) (TRZ-006).

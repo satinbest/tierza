@@ -173,6 +173,39 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 		return array_map( [ $this, 'hydrate' ], $rows );
 	}
 
+	public function find_active_for_targets( array $targets ): array {
+		if ( empty( $targets ) ) {
+			return [];
+		}
+
+		$clauses = [];
+		$params  = [];
+
+		foreach ( $targets as $target ) {
+			$clauses[] = '(target_type = %s AND target_id = %d)';
+			$params[]  = $target->type();
+			$params[]  = $target->id();
+		}
+
+		$params[] = RuleStatus::ACTIVE;
+		$where    = implode( ' OR ', $clauses );
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$sql = $this->db->prepare(
+			"SELECT * FROM {$this->table_rules} WHERE ({$where}) AND status = %s ORDER BY id ASC",
+			...$params
+		);
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		$rows = $this->db->get_results( $sql, ARRAY_A );
+
+		if ( ! is_array( $rows ) ) {
+			return [];
+		}
+
+		return array_map( [ $this, 'hydrate' ], $rows );
+	}
+
 	public function find_active_by_scope( RuleScope $scope ): array {
 		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$rows = $this->db->get_results(

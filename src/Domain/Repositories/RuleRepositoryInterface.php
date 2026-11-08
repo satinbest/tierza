@@ -34,6 +34,16 @@ interface RuleRepositoryInterface {
 	public function find_active_by_target( RuleTarget $target ): array;
 
 	/**
+	 * Find active rules matching any of the given targets.
+	 *
+	 * High-efficiency indexed batch query using idx_target (target_type, target_id, status).
+	 *
+	 * @param RuleTarget[] $targets
+	 * @return PricingRule[]
+	 */
+	public function find_active_for_targets( array $targets ): array;
+
+	/**
 	 * Find active rules for a specific scope.
 	 *
 	 * @return PricingRule[]

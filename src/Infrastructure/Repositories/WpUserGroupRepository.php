@@ -24,6 +24,13 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 	private EntityReferenceValidator $validator;
 	private ?PricingCacheInterface $cache;
 
+	/**
+	 * In-memory map of user_id => ?UserGroupAssignment for current request.
+	 *
+	 * @var array<int, ?UserGroupAssignment>
+	 */
+	private array $user_assignments = [];
+
 	public function __construct(
 		?wpdb $db = null,
 		?EntityReferenceValidator $validator = null,
@@ -89,15 +96,17 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 			throw new DatabaseQueryException( 'Database query failed while assigning user to group.' );
 		}
 
-		$insert_id = (int) $this->db->insert_id;
-		$this->cache?->invalidate_customer( $user_id );
-		return $this->find_by_id( $insert_id ) ?? new UserGroupAssignment(
+		$insert_id                          = (int) $this->db->insert_id;
+		$assigned                           = $this->find_by_id( $insert_id ) ?? new UserGroupAssignment(
 			$user_id,
 			$group_id,
 			$insert_id,
 			new DateTimeImmutable( $now ),
 			new DateTimeImmutable( $now )
 		);
+		$this->user_assignments[ $user_id ] = $assigned;
+		$this->cache?->invalidate_customer( $user_id );
+		return $assigned;
 	}
 
 	public function reassign( int $user_id, int $new_group_id ): UserGroupAssignment {
@@ -139,12 +148,18 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 			throw new DatabaseQueryException( 'Database query failed while reassigning user group.' );
 		}
 
-		$assigned = $this->find_by_user_id( $user_id ) ?? $existing->reassign_to_group( $new_group_id );
+		unset( $this->user_assignments[ $user_id ] );
+		$assigned                           = $this->find_by_user_id( $user_id ) ?? $existing->reassign_to_group( $new_group_id );
+		$this->user_assignments[ $user_id ] = $assigned;
 		$this->cache?->invalidate_customer( $user_id );
 		return $assigned;
 	}
 
 	public function find_by_user_id( int $user_id ): ?UserGroupAssignment {
+		if ( array_key_exists( $user_id, $this->user_assignments ) ) {
+			return $this->user_assignments[ $user_id ];
+		}
+
 		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$row = $this->db->get_row(
 			$this->db->prepare(
@@ -155,10 +170,13 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 		);
 
 		if ( ! is_array( $row ) ) {
+			$this->user_assignments[ $user_id ] = null;
 			return null;
 		}
 
-		return $this->hydrate( $row );
+		$assignment                         = $this->hydrate( $row );
+		$this->user_assignments[ $user_id ] = $assignment;
+		return $assignment;
 	}
 
 	public function list_by_group_id( int $group_id, int $limit = 50, int $offset = 0 ): array {
@@ -208,10 +226,15 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 
 		$success = false !== $deleted && $deleted > 0;
 		if ( $success ) {
+			unset( $this->user_assignments[ $user_id ] );
 			$this->cache?->invalidate_customer( $user_id );
 		}
 
 		return $success;
+	}
+
+	public function clear_cache(): void {
+		$this->user_assignments = [];
 	}
 
 	private function find_by_id( int $id ): ?UserGroupAssignment {

@@ -5,7 +5,10 @@ declare(strict_types=1);
 namespace Tierza;
 
 use Tierza\Admin\AdminMenu;
+use Tierza\Application\Pricing\AuthoritativePriceCalculator;
+use Tierza\Application\Pricing\Batch\PricingBatchPrefetcher;
 use Tierza\Application\Pricing\Cache\RequestPricingCache;
+use Tierza\Application\Pricing\DeterministicRuleResolver;
 use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
 use Tierza\Domain\Repositories\GroupRepositoryInterface;
 use Tierza\Domain\Repositories\RuleRepositoryInterface;
@@ -15,6 +18,8 @@ use Tierza\Infrastructure\Environment;
 use Tierza\Infrastructure\Repositories\WpGroupRepository;
 use Tierza\Infrastructure\Repositories\WpRuleRepository;
 use Tierza\Infrastructure\Repositories\WpUserGroupRepository;
+use Tierza\Integration\WooCommerce\ProductPricingAdapter;
+use Tierza\Integration\WooCommerce\ProductPricingIntegration;
 
 /**
  * Main Tierza plugin singleton coordinator.
@@ -32,12 +37,14 @@ final class Plugin {
 	private ?AdminMenu $admin_menu = null;
 
 	/**
-	 * Repository and cache instances.
+	 * Repository, cache, and pricing integration instances.
 	 */
 	private ?GroupRepositoryInterface $group_repository          = null;
 	private ?RuleRepositoryInterface $rule_repository            = null;
 	private ?UserGroupRepositoryInterface $user_group_repository = null;
 	private ?PricingCacheInterface $pricing_cache                = null;
+	private ?ProductPricingAdapter $pricing_adapter              = null;
+	private ?ProductPricingIntegration $pricing_integration      = null;
 
 	/**
 	 * Whether the plugin has been initialized.
@@ -114,6 +121,22 @@ final class Plugin {
 		$this->group_repository      = new WpGroupRepository( null, $this->pricing_cache );
 		$this->rule_repository       = new WpRuleRepository( null, null, $this->pricing_cache );
 		$this->user_group_repository = new WpUserGroupRepository( null, null, $this->pricing_cache );
+
+		// Instantiate pricing engine & WooCommerce product integration.
+		$resolver         = new DeterministicRuleResolver( $this->rule_repository, $this->group_repository, $this->pricing_cache );
+		$calculator       = new AuthoritativePriceCalculator();
+		$batch_prefetcher = new PricingBatchPrefetcher( $this->rule_repository, $this->pricing_cache );
+
+		$this->pricing_adapter     = new ProductPricingAdapter(
+			$resolver,
+			$calculator,
+			$this->group_repository,
+			$this->user_group_repository,
+			$this->pricing_cache,
+			$batch_prefetcher
+		);
+		$this->pricing_integration = new ProductPricingIntegration( $this->pricing_adapter );
+		$this->pricing_integration->register();
 
 		if ( is_admin() ) {
 			$this->admin_menu = new AdminMenu();
@@ -231,6 +254,20 @@ final class Plugin {
 	 */
 	public function get_pricing_cache(): ?PricingCacheInterface {
 		return $this->pricing_cache;
+	}
+
+	/**
+	 * Get WooCommerce product pricing adapter.
+	 */
+	public function get_pricing_adapter(): ?ProductPricingAdapter {
+		return $this->pricing_adapter;
+	}
+
+	/**
+	 * Get WooCommerce product pricing integration.
+	 */
+	public function get_pricing_integration(): ?ProductPricingIntegration {
+		return $this->pricing_integration;
 	}
 
 	/**

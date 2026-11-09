@@ -102,3 +102,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Strict memory bounds with deterministic FIFO eviction across all four tiers (100 candidate sets, 2,000 resolutions, 2,000 calculations, 500 group statuses) preventing runaway memory during bulk imports or massive batches (TRZ-009).
 - Dedicated Pricing Cache architecture guide (`docs/architecture/pricing-cache.md`) (TRZ-009).
 - Expanded automated test suite to 508 PHPUnit tests (5,384 assertions) and 46 live MariaDB integration tests (605 assertions) passing at 100% (TRZ-009).
+- WooCommerce product pricing integration layer (`ProductPricingAdapter`, `ProductPricingIntegration`) connecting deterministic rule resolver and price calculator to WooCommerce product price retrieval and display (TRZ-010).
+- Standard WooCommerce pricing hook bindings (`woocommerce_product_get_price`, `woocommerce_product_variation_get_price`, `woocommerce_variation_prices_price`, `woocommerce_get_price_html`, `woocommerce_get_variation_prices_hash`, `woocommerce_product_loop_start`, `the_posts`) (TRZ-010).
+- Pure price filtering without database mutation: raw stored WooCommerce prices in `wp_posts` and `wp_postmeta` (`_price`, `_regular_price`, `_sale_price`) remain untouched (TRZ-010).
+- Safe unfiltered price acquisition via `$product->get_price('edit')` and reentrancy recursion prevention locks preventing infinite hook recursion (TRZ-010).
+- Scheduled promotional sale awareness: active scheduled native sale price serves as discount baseline; no sale inferred solely from numerical equality (TRZ-010).
+- Customer & group identity security: customer identity strictly derived from authenticated WordPress session (`get_current_user_id()`), never trusting query parameters or input (TRZ-010).
+- Variation transient cache segregation via `woocommerce_get_variation_prices_hash` preventing Customer A's price range from being served to Customer B or guest visitors (TRZ-010).
+- Catalog loop batch prefetching: warm-up of candidate rules and term caching in 1 SQL query, resulting in 0 additional queries during loop product iterations (TRZ-010).
+- Protected administrative and background scopes: price filtering safely bypassed in admin editing (`post.php`, `post-new.php`, `edit.php`, `woocommerce_save_variations`), CSV import/export, and administrative REST requests (TRZ-010).
+- Playwright E2E browser test suite (`tests/e2e/storefront-pricing.spec.ts`) verifying live storefront price display for guests, wholesale B2B users, and incognito sessions (TRZ-010).
+- Dedicated architecture guide (`docs/architecture/woocommerce-product-integration.md`) (TRZ-010).
+- Expanded automated test suite to 529 PHPUnit tests (5,459 assertions), 52 live MariaDB integration tests (654 assertions), and 7 Playwright E2E tests passing at 100% (TRZ-010).

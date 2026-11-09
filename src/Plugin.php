@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Tierza;
 
 use Tierza\Admin\AdminMenu;
+use Tierza\Application\Pricing\Cache\RequestPricingCache;
+use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
 use Tierza\Domain\Repositories\GroupRepositoryInterface;
 use Tierza\Domain\Repositories\RuleRepositoryInterface;
 use Tierza\Domain\Repositories\UserGroupRepositoryInterface;
@@ -30,11 +32,12 @@ final class Plugin {
 	private ?AdminMenu $admin_menu = null;
 
 	/**
-	 * Repository instances.
+	 * Repository and cache instances.
 	 */
 	private ?GroupRepositoryInterface $group_repository          = null;
 	private ?RuleRepositoryInterface $rule_repository            = null;
 	private ?UserGroupRepositoryInterface $user_group_repository = null;
+	private ?PricingCacheInterface $pricing_cache                = null;
 
 	/**
 	 * Whether the plugin has been initialized.
@@ -106,10 +109,11 @@ final class Plugin {
 		// Run idempotent database migrations if needed.
 		Schema::maybe_upgrade();
 
-		// Instantiate repositories.
-		$this->group_repository      = new WpGroupRepository();
-		$this->rule_repository       = new WpRuleRepository();
-		$this->user_group_repository = new WpUserGroupRepository();
+		// Instantiate cache and repositories.
+		$this->pricing_cache         = new RequestPricingCache();
+		$this->group_repository      = new WpGroupRepository( null, $this->pricing_cache );
+		$this->rule_repository       = new WpRuleRepository( null, null, $this->pricing_cache );
+		$this->user_group_repository = new WpUserGroupRepository( null, null, $this->pricing_cache );
 
 		if ( is_admin() ) {
 			$this->admin_menu = new AdminMenu();
@@ -220,6 +224,13 @@ final class Plugin {
 	 */
 	public function get_user_group_repository(): ?UserGroupRepositoryInterface {
 		return $this->user_group_repository;
+	}
+
+	/**
+	 * Get request-scoped pricing cache.
+	 */
+	public function get_pricing_cache(): ?PricingCacheInterface {
+		return $this->pricing_cache;
 	}
 
 	/**

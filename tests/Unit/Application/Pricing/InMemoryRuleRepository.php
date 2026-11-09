@@ -25,6 +25,16 @@ final class InMemoryRuleRepository implements RuleRepositoryInterface {
 
 	private bool $should_fail_on_query = false;
 
+	private int $query_count = 0;
+
+	public function query_count(): int {
+		return $this->query_count;
+	}
+
+	public function reset_query_count(): void {
+		$this->query_count = 0;
+	}
+
 	public function set_should_fail_on_query( bool $fail ): void {
 		$this->should_fail_on_query = $fail;
 	}
@@ -59,7 +69,7 @@ final class InMemoryRuleRepository implements RuleRepositoryInterface {
 		return $results;
 	}
 
-	public function find_active_for_targets( array $targets ): array {
+	public function find_active_for_targets( array $targets, array $scopes = [] ): array {
 		if ( $this->should_fail_on_query ) {
 			throw new RuntimeException( 'Simulated database read failure in find_active_for_targets().' );
 		}
@@ -68,9 +78,18 @@ final class InMemoryRuleRepository implements RuleRepositoryInterface {
 			return [];
 		}
 
+		++$this->query_count;
+
 		$target_map = [];
 		foreach ( $targets as $target ) {
 			$target_map[ $target->type() . ':' . $target->id() ] = true;
+		}
+
+		$scope_map = [];
+		if ( ! empty( $scopes ) ) {
+			foreach ( $scopes as $scope ) {
+				$scope_map[ $scope->type() . ':' . (int) $scope->id() ] = true;
+			}
 		}
 
 		$results = [];
@@ -79,9 +98,18 @@ final class InMemoryRuleRepository implements RuleRepositoryInterface {
 				continue;
 			}
 			$sig = $rule->target()->type() . ':' . $rule->target()->id();
-			if ( isset( $target_map[ $sig ] ) ) {
-				$results[] = $rule;
+			if ( ! isset( $target_map[ $sig ] ) ) {
+				continue;
 			}
+
+			if ( ! empty( $scopes ) ) {
+				$scope_sig = $rule->scope()->type() . ':' . (int) $rule->scope()->id();
+				if ( ! isset( $scope_map[ $scope_sig ] ) ) {
+					continue;
+				}
+			}
+
+			$results[] = $rule;
 		}
 
 		return $results;

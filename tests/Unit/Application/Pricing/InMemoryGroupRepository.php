@@ -24,6 +24,16 @@ final class InMemoryGroupRepository implements GroupRepositoryInterface {
 
 	private bool $should_fail_on_query = false;
 
+	private int $query_count = 0;
+
+	public function query_count(): int {
+		return $this->query_count;
+	}
+
+	public function reset_query_count(): void {
+		$this->query_count = 0;
+	}
+
 	public function set_should_fail_on_query( bool $fail ): void {
 		$this->should_fail_on_query = $fail;
 	}
@@ -40,6 +50,8 @@ final class InMemoryGroupRepository implements GroupRepositoryInterface {
 	}
 
 	public function find_by_id( int $id ): ?PricingGroup {
+		++$this->query_count;
+
 		if ( $this->should_fail_on_query ) {
 			throw new RuntimeException( 'Simulated database read failure in find_by_id().' );
 		}

@@ -7,8 +7,10 @@ namespace Tierza\Infrastructure\Repositories;
 use DateTimeImmutable;
 use Tierza\Domain\Entities\UserGroupAssignment;
 use Tierza\Domain\Exceptions\InvalidAssignmentException;
+use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
 use Tierza\Domain\Repositories\UserGroupRepositoryInterface;
 use Tierza\Infrastructure\Database\Schema;
+use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use Tierza\Infrastructure\Validation\EntityReferenceValidator;
 use wpdb;
 
@@ -20,12 +22,26 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 	private wpdb $db;
 	private string $table_user_groups;
 	private EntityReferenceValidator $validator;
+	private ?PricingCacheInterface $cache;
 
-	public function __construct( ?wpdb $db = null, ?EntityReferenceValidator $validator = null ) {
+	public function __construct(
+		?wpdb $db = null,
+		?EntityReferenceValidator $validator = null,
+		?PricingCacheInterface $cache = null
+	) {
 		global $wpdb;
 		$this->db                = $db ?? $GLOBALS['wpdb'];
 		$this->table_user_groups = Schema::user_groups_table( $this->db );
 		$this->validator         = $validator ?? new EntityReferenceValidator( $this->db );
+		$this->cache             = $cache;
+	}
+
+	public function set_cache( ?PricingCacheInterface $cache ): void {
+		$this->cache = $cache;
+	}
+
+	public function cache(): ?PricingCacheInterface {
+		return $this->cache;
 	}
 
 	public function assign( int $user_id, int $group_id ): UserGroupAssignment {
@@ -58,7 +74,7 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 
 		$now = current_time( 'mysql', true );
 
-		$this->db->insert(
+		$inserted = $this->db->insert(
 			$this->table_user_groups,
 			[
 				'user_id'    => $user_id,
@@ -69,7 +85,12 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 			[ '%d', '%d', '%s', '%s' ]
 		);
 
+		if ( false === $inserted && ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while assigning user to group.' );
+		}
+
 		$insert_id = (int) $this->db->insert_id;
+		$this->cache?->invalidate_customer( $user_id );
 		return $this->find_by_id( $insert_id ) ?? new UserGroupAssignment(
 			$user_id,
 			$group_id,
@@ -103,7 +124,7 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 
 		$now = current_time( 'mysql', true );
 
-		$this->db->update(
+		$updated = $this->db->update(
 			$this->table_user_groups,
 			[
 				'group_id'   => $new_group_id,
@@ -114,7 +135,13 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 			[ '%d' ]
 		);
 
-		return $this->find_by_user_id( $user_id ) ?? $existing->reassign_to_group( $new_group_id );
+		if ( false === $updated && ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while reassigning user group.' );
+		}
+
+		$assigned = $this->find_by_user_id( $user_id ) ?? $existing->reassign_to_group( $new_group_id );
+		$this->cache?->invalidate_customer( $user_id );
+		return $assigned;
 	}
 
 	public function find_by_user_id( int $user_id ): ?UserGroupAssignment {
@@ -175,7 +202,16 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 			[ '%d' ]
 		);
 
-		return false !== $deleted && $deleted > 0;
+		if ( false === $deleted && ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while removing user group assignment.' );
+		}
+
+		$success = false !== $deleted && $deleted > 0;
+		if ( $success ) {
+			$this->cache?->invalidate_customer( $user_id );
+		}
+
+		return $success;
 	}
 
 	private function find_by_id( int $id ): ?UserGroupAssignment {

@@ -78,6 +78,7 @@ cust:{guest:0|auth:<id>}#grp:{none|unverified:<id>|inactive:<id>|grp:<id>}#prod:
 1. **Customer Segregation:**
    - Unauthenticated: `cust:guest:0`
    - Authenticated: `cust:auth:{customer_id}`
+   - Exact Boundary Delimiter: All keys prefix customer tokens with `#` delimiters (e.g., `cust:auth:12#...`), preventing substring collision between customer IDs like `12` and `123`.
 2. **Group State Segregation:**
    - No group: `grp:none`
    - Unverified numeric ID: `grp:unverified:{id}`
@@ -96,7 +97,8 @@ cust:{guest:0|auth:<id>}#grp:{none|unverified:<id>|inactive:<id>|grp:<id>}#prod:
 Security and tenant segregation are foundational invariants in Tierza:
 - **No Shared Session Cache:** Guest pricing contexts (`customer_id: 0`) always map to `cust:guest:0` and can never retrieve rules cached under `cust:auth:{id}`.
 - **Cross-Customer Partitioning:** Even if two customers request the same product at the same time, their distinct customer IDs generate completely segregated keys (`cust:auth:101#...` vs `cust:auth:102#...`).
-- **Batch Isolation:** `PricingBatchPrefetcher` partitions requests into distinct target signatures. Candidate rules are segregated per target set and never merged across unrelated customers.
+- **Exact Customer Invalidation:** `invalidate_customer($customer_id)` isolates target customer entries without false-positive evictions. Candidate keys (`targets:...`) are tokenized with `explode('|', ...)` checking exact `user:{$customer_id}` tokens, and resolution/calculation keys are matched against `cust:auth:{$customer_id}#`. This guarantees customer `12` invalidation never touches customer `123` or `120`.
+- **Heterogeneous Batch Isolation:** `PricingBatchPrefetcher` partitions requests into distinct target signatures. When a batch mixes multiple customers or groups, candidate rules are segregated per individual target signature and never merged into a shared multi-user pool.
 
 ---
 
@@ -135,16 +137,28 @@ A critical domain requirement is distinguishing an **explicit 0% or \$0.000000 r
 
 ## 7. Memory Bounds, Capacity Limits & Eviction Policy
 
-To prevent runaway memory consumption during large background imports or huge batch operations (e.g. 10,000 products), `RequestPricingCache` enforces strict capacity bounds and FIFO eviction:
+To prevent unbounded memory growth during high-volume operations (e.g., massive catalog exports, background REST API syncs, or bulk rule processing), `RequestPricingCache` enforces strict capacity bounds and deterministic FIFO eviction across all four tiers:
 
-| Cache Tier | Maximum Entries | Eviction Policy | Rationale |
-|:---|:---:|:---:|:---|
-| **Candidate Rules** | 100 | FIFO / LRU | Typically 1-5 customer/group signatures per request. |
-| **Resolutions** | 2,000 | FIFO / LRU | Accommodates large catalog archives while bounding RAM to ~5 MB. |
-| **Calculations** | 2,000 | FIFO / LRU | Bounds RAM to ~5 MB. |
-| **Group Status** | 500 | FIFO | Accommodates large B2B group configurations. |
+| Cache Tier | Default Capacity | Configurable Parameter | Eviction Policy | Memory Profile |
+|:---|:---:|:---:|:---:|:---|
+| **Candidate Rules** | 100 | `$max_candidate_entries` | FIFO | Holds sets of domain `PricingRule` objects per target signature. Memory scales with rule count per tenant. |
+| **Resolutions** | 2,000 | `$max_resolution_entries` | FIFO | Holds lightweight `ResolutionResult` objects (~1-2 KB per entry). 2,000 entries consume ~3-5 MB RAM. |
+| **Calculations** | 2,000 | `$max_calculation_entries` | FIFO | Holds immutable `PricingResult` objects. Bounded to ~3-5 MB RAM. |
+| **Group Status** | 500 | `$max_group_entries` | FIFO | Holds group active state arrays (`exists`, `is_active`, `?PricingGroup`). Bounded to < 1 MB RAM. |
 
-When any tier exceeds its capacity limit, the oldest entries are evicted immediately, keeping peak memory usage constant and predictable.
+### Memory Sizing Disclaimers:
+- Memory consumption per entry is dynamic: candidate entries hold full `PricingRule` entity objects (whose memory footprint scales with rule payload and scope depth), while resolution and calculation entries store lightweight value objects.
+- Overall request cache memory is safely bounded by these capacity limits, preventing out-of-memory errors on PHP configurations with low memory ceilings (e.g. 128M).
+
+### Group Status Cache Bounding & Missing-vs-Inactive Semantics:
+- The group status cache caps maximum entries at a default of 500 (configurable via `$max_group_entries` constructor argument).
+- FIFO eviction prunes the oldest group status when capacity is exceeded.
+- **Eviction Isolation:** Evicting a group status from cache **never** treats the group as inactive or deleted. Subsequent requests detect a cache miss (`null`), initiating an authoritative re-query from `WpGroupRepository`.
+- **Three-State Representation:** `get_group_status()` distinguishes three distinct outcomes:
+  1. `null` = Cache miss (evicted or unqueried; requires database check).
+  2. `['exists' => false, 'is_active' => false]` = Authoritatively confirmed non-existent in database.
+  3. `['exists' => true, 'is_active' => false]` = Authoritatively confirmed inactive in database.
+  4. `['exists' => true, 'is_active' => true, 'group' => PricingGroup]` = Authoritatively verified active group.
 
 ---
 
@@ -184,11 +198,17 @@ flowchart LR
 ## 9. Batch Prefetching & Scope Chunking Strategy
 
 `PricingBatchPrefetcher` analyzes an array of `PricingContext` objects before resolution begins:
-1. **Target Aggregation:** Collects all unique `RuleTarget` instances (`user:<id>` and `group:<id>`) across all contexts.
+1. **Target Aggregation & Signature Partitioning:**
+   - Collects all unique `RuleTarget` instances across all contexts (combining user IDs and group IDs).
+   - Identifies the specific target signature for each context (`targets:group:X|user:Y`).
 2. **Scope Aggregation:** Collects all product IDs, variation IDs, and category IDs.
 3. **Chunking Safeguard:** When scopes exceed 500 parameters, queries are chunked into 500-element slices to avoid database placeholder limits (`max_allowed_packet` and SQL parser limits).
-4. **Single Prefetch Execution:** Executes a single indexed query via `WpRuleRepository::find_active_for_targets()`.
-5. **Cache Warming:** Populates the candidate cache under the compound target signature, allowing subsequent item evaluations to run entirely in memory.
+4. **Single Unified Batch Execution:** Executes a single indexed query via `WpRuleRepository::find_active_for_targets()` fetching rules matching the union of all targets in the batch.
+5. **Heterogeneous Isolation & Partitioned Cache Warming:**
+   - Rather than storing the entire batch query result under a shared multi-target key, `PricingBatchPrefetcher` filters the returned rules for each unique context target signature.
+   - Each customer/group pair receives its own isolated candidate rule set in `RequestPricingCache` (`targets:group:1|user:101`, `targets:group:2|user:102`).
+   - Guest contexts with no targets are warmed with an empty candidate array under `targets:none`.
+   - Result: A heterogeneous batch with multiple distinct customers and groups executes in **exactly 1 SQL query** with **zero cross-tenant leaking**. Subsequent resolution of each item hits its own isolated candidate cache in memory.
 
 ---
 

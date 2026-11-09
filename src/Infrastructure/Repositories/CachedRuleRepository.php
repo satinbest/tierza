@@ -37,7 +37,10 @@ final class CachedRuleRepository implements RuleRepositoryInterface {
 
 	public function save( PricingRule $rule ): PricingRule {
 		$saved = $this->inner->save( $rule );
-		$this->cache->invalidate_rules();
+		// Avoid duplicate invalidation if the decorated repository already manages invalidation for this cache.
+		if ( ! ( method_exists( $this->inner, 'cache' ) && $this->inner->cache() === $this->cache ) ) {
+			$this->cache->invalidate_rules();
+		}
 		return $saved;
 	}
 
@@ -97,7 +100,7 @@ final class CachedRuleRepository implements RuleRepositoryInterface {
 
 	public function delete( int $id ): bool {
 		$deleted = $this->inner->delete( $id );
-		if ( $deleted ) {
+		if ( $deleted && ! ( method_exists( $this->inner, 'cache' ) && $this->inner->cache() === $this->cache ) ) {
 			$this->cache->invalidate_rules();
 		}
 		return $deleted;

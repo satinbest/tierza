@@ -162,20 +162,101 @@ final class RequestPricingCacheTest extends TestCase {
 		$this->assertFalse( $this->cache->has_resolution( 'res:5' ) );
 	}
 
-	public function test_invalidate_customer_only_evicts_target_customer(): void {
-		$this->cache->set_candidate_rules( 'targets:group:1|user:10', [] );
-		$this->cache->set_candidate_rules( 'targets:group:1|user:20', [] );
+	public function test_exact_customer_invalidation_boundary_regression_12_vs_123(): void {
+		// Populate entries for customer 1, 10, 12, 123, 1234, and guest (0).
+		$customers = [ 1, 10, 12, 123, 1234 ];
+		foreach ( $customers as $id ) {
+			$this->cache->set_candidate_rules( "targets:group:1|user:{$id}", [] );
+			$this->cache->set_resolution( "cust:auth:{$id}#grp:1#prod:10#var:none#cats:none", ResolutionResult::fallback( 'none' ) );
+			$this->cache->set_calculated_price(
+				"cust:auth:{$id}#grp:1#prod:10#var:none#cats:none#qty:1#base:100.000000#reg:none#sale:none#promo:auto#curr:USD#dec:2",
+				new PricingResult( Money::from( '100', 'USD' ), Money::from( '100', 'USD' ), null, null, null, PricingSource::WOOCOMMERCE_FALLBACK, false, false, 'none' )
+			);
+		}
 
-		$this->cache->set_resolution( 'cust:auth:10#grp:none#prod:1#var:none', ResolutionResult::fallback( 'none' ) );
-		$this->cache->set_resolution( 'cust:auth:20#grp:none#prod:1#var:none', ResolutionResult::fallback( 'none' ) );
+		// Also populate guest entry.
+		$this->cache->set_resolution( 'cust:guest:0#grp:none#prod:10#var:none#cats:none', ResolutionResult::fallback( 'none' ) );
 
-		$this->cache->invalidate_customer( 10 );
+		// Invalidate customer 12 strictly.
+		$this->cache->invalidate_customer( 12 );
 
-		$this->assertFalse( $this->cache->has_candidate_rules( 'targets:group:1|user:10' ) );
-		$this->assertTrue( $this->cache->has_candidate_rules( 'targets:group:1|user:20' ) );
+		// Customer 12 must be completely evicted across all tiers.
+		$this->assertFalse( $this->cache->has_candidate_rules( 'targets:group:1|user:12' ) );
+		$this->assertFalse( $this->cache->has_resolution( 'cust:auth:12#grp:1#prod:10#var:none#cats:none' ) );
+		$this->assertFalse( $this->cache->has_calculated_price( 'cust:auth:12#grp:1#prod:10#var:none#cats:none#qty:1#base:100.000000#reg:none#sale:none#promo:auto#curr:USD#dec:2' ) );
 
-		$this->assertFalse( $this->cache->has_resolution( 'cust:auth:10#grp:none#prod:1#var:none' ) );
-		$this->assertTrue( $this->cache->has_resolution( 'cust:auth:20#grp:none#prod:1#var:none' ) );
+		// Customer 123, 1234, 1, 10, and Guest must remain 100% intact!
+		foreach ( [ 1, 10, 123, 1234 ] as $unaffected_id ) {
+			$this->assertTrue(
+				$this->cache->has_candidate_rules( "targets:group:1|user:{$unaffected_id}" ),
+				"Candidate rules for customer {$unaffected_id} must remain untouched when customer 12 is invalidated."
+			);
+			$this->assertTrue(
+				$this->cache->has_resolution( "cust:auth:{$unaffected_id}#grp:1#prod:10#var:none#cats:none" ),
+				"Resolution for customer {$unaffected_id} must remain untouched when customer 12 is invalidated."
+			);
+			$this->assertTrue(
+				$this->cache->has_calculated_price( "cust:auth:{$unaffected_id}#grp:1#prod:10#var:none#cats:none#qty:1#base:100.000000#reg:none#sale:none#promo:auto#curr:USD#dec:2" ),
+				"Calculation for customer {$unaffected_id} must remain untouched when customer 12 is invalidated."
+			);
+		}
+
+		$this->assertTrue( $this->cache->has_resolution( 'cust:guest:0#grp:none#prod:10#var:none#cats:none' ), 'Guest entries must remain untouched.' );
+
+		// Next: Invalidate customer 1 strictly.
+		$this->cache->invalidate_customer( 1 );
+		$this->assertFalse( $this->cache->has_resolution( 'cust:auth:1#grp:1#prod:10#var:none#cats:none' ) );
+		$this->assertTrue( $this->cache->has_resolution( 'cust:auth:10#grp:1#prod:10#var:none#cats:none' ), 'Customer 10 must not be evicted when customer 1 is invalidated.' );
+		$this->assertTrue( $this->cache->has_resolution( 'cust:auth:123#grp:1#prod:10#var:none#cats:none' ) );
+
+		// Next: Invalidate guest (0).
+		$this->cache->invalidate_customer( 0 );
+		$this->assertFalse( $this->cache->has_resolution( 'cust:guest:0#grp:none#prod:10#var:none#cats:none' ) );
+		$this->assertTrue( $this->cache->has_resolution( 'cust:auth:10#grp:1#prod:10#var:none#cats:none' ) );
+	}
+
+	public function test_group_status_bounded_fifo_eviction_and_memory(): void {
+		$cache = new RequestPricingCache( max_group_entries: 500 );
+
+		$mem_before = memory_get_usage();
+
+		// Insert 550 distinct group statuses.
+		for ( $g = 1; $g <= 550; $g++ ) {
+			$group = new PricingGroup( "Group {$g}", new GroupSlug( "group-{$g}" ), $g, null, GroupStatus::active() );
+			$cache->set_group_status( $g, true, true, $group );
+		}
+
+		$mem_after = memory_get_usage();
+		$delta_kb  = ( $mem_after - $mem_before ) / 1024;
+
+		// Group count must be strictly bounded to 500 entries.
+		$this->assertSame( 500, $cache->stats()['group_count'], 'Group statuses must be bounded to maximum 500 entries.' );
+
+		// Oldest 50 entries (1..50) must have been evicted.
+		for ( $g = 1; $g <= 50; $g++ ) {
+			$this->assertNull(
+				$cache->get_group_status( $g ),
+				"Group {$g} should have been evicted by FIFO."
+			);
+		}
+
+		// Entries 51..550 must remain retained.
+		for ( $g = 51; $g <= 550; $g++ ) {
+			$status = $cache->get_group_status( $g );
+			$this->assertNotNull( $status, "Group {$g} must be retained in cache." );
+			$this->assertTrue( $status['exists'] );
+			$this->assertTrue( $status['is_active'] );
+			$this->assertSame( $g, $status['group']?->id() );
+		}
+
+		// Updating an existing entry should not prune or grow.
+		$updated_group = new PricingGroup( 'Group 550 Updated', new GroupSlug( 'group-550-updated' ), 550, null, GroupStatus::inactive() );
+		$cache->set_group_status( 550, true, false, $updated_group );
+		$this->assertSame( 500, $cache->stats()['group_count'] );
+		$this->assertFalse( $cache->get_group_status( 550 )['is_active'] );
+
+		// Memory check: 500 entries must not exceed realistic bound (typically ~150-300 KB).
+		$this->assertLessThan( 2048, $delta_kb, '500 group entries should consume far less than 2 MB.' );
 	}
 
 	public function test_invalidate_product_only_evicts_target_product(): void {

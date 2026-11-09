@@ -46,6 +46,10 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 		$this->cache = $cache;
 	}
 
+	public function cache(): ?PricingCacheInterface {
+		return $this->cache;
+	}
+
 	public function save( PricingRule $rule ): PricingRule {
 		// Validate target and scope entity references before persistence.
 		$this->validator->validate_target( $rule->target() );

@@ -23,10 +23,12 @@ final class RequestPricingCache implements PricingCacheInterface {
 	public const DEFAULT_MAX_CANDIDATE_ENTRIES   = 100;
 	public const DEFAULT_MAX_RESOLUTION_ENTRIES  = 2000;
 	public const DEFAULT_MAX_CALCULATION_ENTRIES = 2000;
+	public const DEFAULT_MAX_GROUP_ENTRIES       = 500;
 
 	private int $max_candidate_entries;
 	private int $max_resolution_entries;
 	private int $max_calculation_entries;
+	private int $max_group_entries;
 
 	/**
 	 * @var array<string, PricingRule[]>
@@ -60,11 +62,13 @@ final class RequestPricingCache implements PricingCacheInterface {
 	public function __construct(
 		int $max_candidate_entries = self::DEFAULT_MAX_CANDIDATE_ENTRIES,
 		int $max_resolution_entries = self::DEFAULT_MAX_RESOLUTION_ENTRIES,
-		int $max_calculation_entries = self::DEFAULT_MAX_CALCULATION_ENTRIES
+		int $max_calculation_entries = self::DEFAULT_MAX_CALCULATION_ENTRIES,
+		int $max_group_entries = self::DEFAULT_MAX_GROUP_ENTRIES
 	) {
-		$this->max_candidate_entries   = max( 10, $max_candidate_entries );
-		$this->max_resolution_entries  = max( 50, $max_resolution_entries );
-		$this->max_calculation_entries = max( 50, $max_calculation_entries );
+		$this->max_candidate_entries   = max( 1, $max_candidate_entries );
+		$this->max_resolution_entries  = max( 1, $max_resolution_entries );
+		$this->max_calculation_entries = max( 1, $max_calculation_entries );
+		$this->max_group_entries       = max( 1, $max_group_entries );
 	}
 
 	public function get_candidate_rules( string $target_key ): ?array {
@@ -139,6 +143,14 @@ final class RequestPricingCache implements PricingCacheInterface {
 	}
 
 	public function set_group_status( int $group_id, bool $exists, bool $is_active, ?PricingGroup $group = null ): void {
+		// Prune oldest group status entry if capacity limit reached on new group insertion.
+		if ( ! array_key_exists( $group_id, $this->group_statuses ) && count( $this->group_statuses ) >= $this->max_group_entries ) {
+			$oldest_key = array_key_first( $this->group_statuses );
+			if ( null !== $oldest_key ) {
+				unset( $this->group_statuses[ $oldest_key ] );
+			}
+		}
+
 		$this->group_statuses[ $group_id ] = [
 			'exists'    => $exists,
 			'is_active' => $is_active,
@@ -164,25 +176,41 @@ final class RequestPricingCache implements PricingCacheInterface {
 	public function invalidate_customer( int $customer_id ): void {
 		++$this->invalidations;
 
-		// Evict customer candidate rules.
+		// 1. Evict customer candidate rules on exact segment boundaries.
+		// Candidate keys follow the grammar: targets:<target>|<target>|...
+		// e.g. "targets:group:5|user:12"
 		$user_token = 'user:' . $customer_id;
 		foreach ( array_keys( $this->candidate_rules ) as $key ) {
-			if ( str_contains( $key, $user_token ) ) {
+			$target_part = str_starts_with( $key, 'targets:' ) ? substr( $key, 8 ) : $key;
+			$segments    = explode( '|', $target_part );
+			if ( in_array( $user_token, $segments, true ) ) {
 				unset( $this->candidate_rules[ $key ] );
 			}
 		}
 
-		// Evict customer resolutions.
-		$auth_prefix = 'cust:auth:' . $customer_id;
+		// 2. Evict customer resolutions on exact segment boundary.
+		// Context keys follow the grammar: cust:{auth:<id>|guest:0}#grp:...
+		// Segment ends with '#' to guarantee exact integer boundary match (e.g. "cust:auth:12#" will never match "cust:auth:123#").
+		$is_guest    = ( $customer_id <= 0 );
+		$cust_prefix = 'cust:auth:' . $customer_id . '#';
+
 		foreach ( array_keys( $this->resolutions ) as $key ) {
-			if ( str_starts_with( $key, $auth_prefix ) ) {
+			if ( $is_guest ) {
+				if ( str_starts_with( $key, 'cust:guest:0#' ) || str_starts_with( $key, 'cust:guest#' ) ) {
+					unset( $this->resolutions[ $key ] );
+				}
+			} elseif ( str_starts_with( $key, $cust_prefix ) ) {
 				unset( $this->resolutions[ $key ] );
 			}
 		}
 
-		// Evict customer calculated prices.
+		// 3. Evict customer calculated prices on exact segment boundary.
 		foreach ( array_keys( $this->calculated_prices ) as $key ) {
-			if ( str_starts_with( $key, $auth_prefix ) ) {
+			if ( $is_guest ) {
+				if ( str_starts_with( $key, 'cust:guest:0#' ) || str_starts_with( $key, 'cust:guest#' ) ) {
+					unset( $this->calculated_prices[ $key ] );
+				}
+			} elseif ( str_starts_with( $key, $cust_prefix ) ) {
 				unset( $this->calculated_prices[ $key ] );
 			}
 		}

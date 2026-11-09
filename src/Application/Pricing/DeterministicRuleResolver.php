@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tierza\Application\Pricing;
 
 use Throwable;
+use Tierza\Application\Pricing\Batch\PricingBatchPrefetcher;
 use Tierza\Application\Pricing\Cache\PricingCacheKeyGenerator;
 use Tierza\Domain\Entities\PricingRule;
 use Tierza\Domain\Exceptions\RuleResolutionException;
@@ -240,20 +241,19 @@ final class DeterministicRuleResolver implements RuleResolverInterface {
 			return [];
 		}
 
-		// Step 1: Pre-validate all contexts and extract distinct targets.
-		$all_targets = [];
+		// Step 1: Pre-validate all contexts.
 		foreach ( $contexts as $context ) {
 			$this->validate_context( $context );
-			$targets = $this->determine_eligible_targets( $context );
-			foreach ( $targets as $target ) {
-				$sig                 = $target->type() . ':' . $target->id();
-				$all_targets[ $sig ] = $target;
-			}
 		}
 
-		// Step 2: Prefetch candidate rules if distinct targets exist.
-		if ( ! empty( $all_targets ) ) {
-			$this->fetch_candidate_rules( array_values( $all_targets ) );
+		// Step 2: Prefetch candidate rules across batch if cache is available.
+		if ( null !== $this->cache ) {
+			$prefetcher = new PricingBatchPrefetcher(
+				$this->rule_repository,
+				$this->cache,
+				$this->group_repository
+			);
+			$prefetcher->prefetch_contexts( $contexts );
 		}
 
 		// Step 3: Resolve each context.

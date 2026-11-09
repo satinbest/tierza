@@ -444,4 +444,133 @@ final class PricingCacheAndBatchPrefetchTest extends TestCase {
 		$prefetcher->prefetch_customer( 10, 1 );
 		$this->assertTrue( $this->cache->has_candidate_rules( 'targets:group:1|user:10' ) );
 	}
+
+	public function test_heterogeneous_batch_with_different_customers_groups_and_guest_executes_single_query_with_complete_isolation(): void {
+		// Group 1: 10% global discount.
+		$group1 = new PricingGroup( 'Group 1', new GroupSlug( 'group-1' ), 1, null, GroupStatus::active() );
+		$this->group_repo->save( $group1 );
+		$this->rule_repo->save( new PricingRule( RuleTarget::group( 1 ), RuleScope::global(), PricingValue::percentage( '10' ) ) );
+
+		// Group 2: 20% global discount.
+		$group2 = new PricingGroup( 'Group 2', new GroupSlug( 'group-2' ), 2, null, GroupStatus::active() );
+		$this->group_repo->save( $group2 );
+		$this->rule_repo->save( new PricingRule( RuleTarget::group( 2 ), RuleScope::global(), PricingValue::percentage( '20' ) ) );
+
+		// Customer 10: 30% discount on product 100.
+		$this->rule_repo->save( new PricingRule( RuleTarget::user( 10 ), RuleScope::product( 100 ), PricingValue::percentage( '30' ) ) );
+
+		// Customer 20: 40% discount on product 100.
+		$this->rule_repo->save( new PricingRule( RuleTarget::user( 20 ), RuleScope::product( 100 ), PricingValue::percentage( '40' ) ) );
+
+		// Reset query count after fixture setup.
+		$this->rule_repo->reset_query_count();
+
+		$contexts = [
+			'c10_p100'  => new PricingContext( product_id: 100, base_price: Money::from( '100', 'USD' ), customer_id: 10, group: $group1 ),
+			'c10_p200'  => new PricingContext( product_id: 200, base_price: Money::from( '100', 'USD' ), customer_id: 10, group: $group1 ),
+			'c20_p100'  => new PricingContext( product_id: 100, base_price: Money::from( '100', 'USD' ), customer_id: 20, group: $group2 ),
+			'guest_100' => new PricingContext( product_id: 100, base_price: Money::from( '100', 'USD' ), customer_id: 0 ),
+			'c20_p200'  => new PricingContext( product_id: 200, base_price: Money::from( '100', 'USD' ), customer_id: 20, group: $group2 ),
+			'c30_p100'  => new PricingContext( product_id: 100, base_price: Money::from( '100', 'USD' ), customer_id: 30 ),
+		];
+
+		$results = $this->resolver->resolve_batch( $contexts );
+
+		// Heterogeneous prefetch must execute exactly 1 SQL query across all distinct targets!
+		$this->assertSame( 1, $this->rule_repo->query_count(), 'Heterogeneous batch prefetch must execute exactly 1 query for all targets.' );
+
+		// Context 1: Customer 10 on product 100 receives Customer 10's 30% rule.
+		$this->assertTrue( $results['c10_p100']->has_rule() );
+		$this->assertSame( PrecedenceLevel::CUSTOMER_PRODUCT, $results['c10_p100']->precedence_level() );
+		$this->assertSame( '30.000000', $results['c10_p100']->rule()?->pricing_value()->value() );
+
+		// Context 2: Customer 10 on product 200 receives Group 1's 10% rule.
+		$this->assertTrue( $results['c10_p200']->has_rule() );
+		$this->assertSame( PrecedenceLevel::GROUP_GLOBAL, $results['c10_p200']->precedence_level() );
+		$this->assertSame( '10.000000', $results['c10_p200']->rule()?->pricing_value()->value() );
+
+		// Context 3: Customer 20 on product 100 receives Customer 20's 40% rule (never Customer 10's 30%).
+		$this->assertTrue( $results['c20_p100']->has_rule() );
+		$this->assertSame( PrecedenceLevel::CUSTOMER_PRODUCT, $results['c20_p100']->precedence_level() );
+		$this->assertSame( '40.000000', $results['c20_p100']->rule()?->pricing_value()->value() );
+
+		// Context 4: Guest on product 100 falls back to WooCommerce (never receives customer or group discount).
+		$this->assertFalse( $results['guest_100']->has_rule() );
+		$this->assertSame( PrecedenceLevel::WOOCOMMERCE_FALLBACK, $results['guest_100']->precedence_level() );
+
+		// Context 5: Customer 20 on product 200 receives Group 2's 20% rule.
+		$this->assertTrue( $results['c20_p200']->has_rule() );
+		$this->assertSame( PrecedenceLevel::GROUP_GLOBAL, $results['c20_p200']->precedence_level() );
+		$this->assertSame( '20.000000', $results['c20_p200']->rule()?->pricing_value()->value() );
+
+		// Context 6: Customer 30 (no group) falls back.
+		$this->assertFalse( $results['c30_p100']->has_rule() );
+		$this->assertSame( PrecedenceLevel::WOOCOMMERCE_FALLBACK, $results['c30_p100']->precedence_level() );
+
+		// Strict candidate partition verification:
+		// Customer 10 candidate cache has ONLY rules targeting user:10 and group:1.
+		$c10_candidates = $this->cache->get_candidate_rules( 'targets:group:1|user:10' );
+		$this->assertNotNull( $c10_candidates );
+		foreach ( $c10_candidates as $r ) {
+			$this->assertTrue(
+				( 'user' === $r->target()->type() && 10 === $r->target()->id() ) ||
+				( 'group' === $r->target()->type() && 1 === $r->target()->id() ),
+				'Customer 10 candidate cache must never contain rules from other identities.'
+			);
+		}
+
+		// Customer 20 candidate cache has ONLY rules targeting user:20 and group:2.
+		$c20_candidates = $this->cache->get_candidate_rules( 'targets:group:2|user:20' );
+		$this->assertNotNull( $c20_candidates );
+		foreach ( $c20_candidates as $r ) {
+			$this->assertTrue(
+				( 'user' === $r->target()->type() && 20 === $r->target()->id() ) ||
+				( 'group' === $r->target()->type() && 2 === $r->target()->id() ),
+				'Customer 20 candidate cache must never contain rules from other identities.'
+			);
+		}
+
+		// Second resolution of same batch: 0 additional queries (100% resolution cache hits).
+		$warm_results = $this->resolver->resolve_batch( $contexts );
+		$this->assertSame( 1, $this->rule_repo->query_count(), 'Second batch resolution must execute 0 additional queries.' );
+		$this->assertSame( $results['c10_p100']->rule()?->id(), $warm_results['c10_p100']->rule()?->id() );
+	}
+
+	public function test_evicted_group_status_triggers_clean_repository_requery_without_interpreting_as_inactive(): void {
+		// Create Group 1 as active in repository.
+		$group1 = new PricingGroup( 'Active Evicted Group', new GroupSlug( 'active-evicted' ), 1, null, GroupStatus::active() );
+		$this->group_repo->save( $group1 );
+
+		// Rule for Group 1.
+		$this->rule_repo->save( new PricingRule( RuleTarget::group( 1 ), RuleScope::product( 55 ), PricingValue::percentage( '15' ) ) );
+
+		// Create cache with maximum 5 group entries.
+		$small_cache = new RequestPricingCache( max_group_entries: 5 );
+		$small_resolver = new DeterministicRuleResolver( $this->rule_repo, $this->group_repo, $small_cache );
+
+		// Warm group 1 in cache.
+		$ctx = new PricingContext( product_id: 55, base_price: Money::from( '100', 'USD' ), group_id: 1 );
+		$res1 = $small_resolver->resolve( $ctx );
+		$this->assertTrue( $res1->has_rule(), 'Group 1 rule must match on initial lookup.' );
+
+		// Now insert 5 other groups (IDs 10..14) to push Group 1 out of group status cache.
+		for ( $g = 10; $g <= 14; $g++ ) {
+			$small_cache->set_group_status( $g, true, true, null );
+		}
+
+		// Verify Group 1 was evicted from cache (returns null).
+		$this->assertNull( $small_cache->get_group_status( 1 ), 'Group 1 must be evicted from cache.' );
+
+		// Invalidate resolution cache to force group re-verification.
+		$small_cache->invalidate_rules();
+
+		// Resolve again with group_id: 1.
+		// Resolver MUST NOT interpret evicted group as inactive or missing!
+		// It queries group_repo->find_by_id(1) and re-verifies cleanly.
+		$res2 = $small_resolver->resolve( $ctx );
+		$this->assertTrue( $res2->has_rule(), 'Evicted group must be re-queried and re-verified as active.' );
+		$this->assertSame( '15.000000', $res2->rule()?->pricing_value()->value() );
+		$this->assertNotNull( $small_cache->get_group_status( 1 ), 'Group 1 status must be re-cached.' );
+		$this->assertTrue( $small_cache->get_group_status( 1 )['is_active'] );
+	}
 }

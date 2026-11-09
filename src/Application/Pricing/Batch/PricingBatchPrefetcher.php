@@ -35,13 +35,18 @@ final class PricingBatchPrefetcher implements PricingBatchPrefetcherInterface {
 			return;
 		}
 
-		$targets_by_sig = [];
+		/** @var array<string, RuleTarget[]> $target_sets_by_sig */
+		$target_sets_by_sig = [];
+		/** @var array<string, RuleTarget> $missing_targets */
+		$missing_targets = [];
 
 		foreach ( $contexts as $context ) {
+			$context_targets = [];
+
 			// Customer target: authenticated users only.
 			if ( $context->is_authenticated() ) {
-				$user_target = RuleTarget::user( $context->customer_id() );
-				$targets_by_sig[ $user_target->type() . ':' . $user_target->id() ] = $user_target;
+				$user_target       = RuleTarget::user( $context->customer_id() );
+				$context_targets[] = $user_target;
 			}
 
 			// Group target: active groups only.
@@ -49,22 +54,59 @@ final class PricingBatchPrefetcher implements PricingBatchPrefetcherInterface {
 			if ( null !== $group_id && $group_id > 0 ) {
 				$is_active = $this->resolve_group_active( $context, $group_id );
 				if ( $is_active ) {
-					$group_target = RuleTarget::group( $group_id );
-					$targets_by_sig[ $group_target->type() . ':' . $group_target->id() ] = $group_target;
+					$context_targets[] = RuleTarget::group( $group_id );
+				}
+			}
+
+			if ( empty( $context_targets ) ) {
+				continue;
+			}
+
+			$target_sig = PricingCacheKeyGenerator::target_key( $context_targets );
+			if ( ! isset( $target_sets_by_sig[ $target_sig ] ) ) {
+				$target_sets_by_sig[ $target_sig ] = $context_targets;
+
+				// If not already cached, collect missing targets for database query.
+				if ( ! $this->cache->has_candidate_rules( $target_sig ) ) {
+					foreach ( $context_targets as $t ) {
+						$missing_targets[ $t->type() . ':' . $t->id() ] = $t;
+					}
 				}
 			}
 		}
 
-		if ( empty( $targets_by_sig ) ) {
+		if ( empty( $missing_targets ) ) {
 			return;
 		}
 
-		$targets    = array_values( $targets_by_sig );
-		$target_key = PricingCacheKeyGenerator::target_key( $targets );
+		// Fetch active rules for all missing targets across the batch in a single database query.
+		$rules = $this->rule_repository->find_active_for_targets( array_values( $missing_targets ) );
 
-		if ( ! $this->cache->has_candidate_rules( $target_key ) ) {
-			$rules = $this->rule_repository->find_active_for_targets( $targets );
-			$this->cache->set_candidate_rules( $target_key, $rules );
+		// Index returned rules by target signature for fast, isolated partitioning.
+		/** @var array<string, \Tierza\Domain\Entities\PricingRule[]> $rules_by_target */
+		$rules_by_target = [];
+		foreach ( $rules as $rule ) {
+			$rt_sig                       = $rule->target()->type() . ':' . $rule->target()->id();
+			$rules_by_target[ $rt_sig ][] = $rule;
+		}
+
+		// Populate candidate cache for each target set with strictly and only its own rules.
+		foreach ( $target_sets_by_sig as $target_sig => $targets ) {
+			if ( $this->cache->has_candidate_rules( $target_sig ) ) {
+				continue;
+			}
+
+			$set_rules = [];
+			foreach ( $targets as $t ) {
+				$t_sig = $t->type() . ':' . $t->id();
+				if ( isset( $rules_by_target[ $t_sig ] ) ) {
+					foreach ( $rules_by_target[ $t_sig ] as $r ) {
+						$set_rules[] = $r;
+					}
+				}
+			}
+
+			$this->cache->set_candidate_rules( $target_sig, $set_rules );
 		}
 	}
 

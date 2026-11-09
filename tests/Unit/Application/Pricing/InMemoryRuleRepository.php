@@ -25,6 +25,16 @@ final class InMemoryRuleRepository implements RuleRepositoryInterface {
 
 	private bool $should_fail_on_query = false;
 
+	private int $query_count = 0;
+
+	public function query_count(): int {
+		return $this->query_count;
+	}
+
+	public function reset_query_count(): void {
+		$this->query_count = 0;
+	}
+
 	public function set_should_fail_on_query( bool $fail ): void {
 		$this->should_fail_on_query = $fail;
 	}
@@ -67,6 +77,8 @@ final class InMemoryRuleRepository implements RuleRepositoryInterface {
 		if ( empty( $targets ) ) {
 			return [];
 		}
+
+		++$this->query_count;
 
 		$target_map = [];
 		foreach ( $targets as $target ) {

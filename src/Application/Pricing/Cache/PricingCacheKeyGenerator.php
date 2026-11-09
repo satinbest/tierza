@@ -61,7 +61,7 @@ final class PricingCacheKeyGenerator {
 		// 1. Customer dimension.
 		$customer_segment = $context->is_authenticated()
 			? 'cust:auth:' . $context->customer_id()
-			: 'cust:guest';
+			: 'cust:guest:0';
 
 		// 2. Group dimension.
 		$group_id = $context->group_id();

@@ -41,6 +41,10 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 		$this->cache = $cache;
 	}
 
+	public function cache(): ?PricingCacheInterface {
+		return $this->cache;
+	}
+
 	public function save( PricingGroup $group ): PricingGroup {
 		$slug_val = $group->slug()->value();
 		$group_id = $group->id();
@@ -75,7 +79,7 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 
 		if ( null === $group_id ) {
 			// Insert new record.
-			$this->db->insert(
+			$inserted = $this->db->insert(
 				$this->table_groups,
 				[
 					'name'        => $group->name(),
@@ -89,14 +93,22 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 				[ '%s', '%s', '%s', '%s', '%d', '%s', '%s' ]
 			);
 
+			if ( false === $inserted && ! empty( $this->db->last_error ) ) {
+				throw new DatabaseQueryException( 'Database query failed while inserting pricing group.' );
+			}
+
 			$insert_id = (int) $this->db->insert_id;
-			$saved     = $this->find_by_id( $insert_id ) ?? $group->with_id( $insert_id );
+			if ( $insert_id <= 0 ) {
+				throw new DatabaseQueryException( 'Failed to obtain inserted pricing group ID.' );
+			}
+
+			$saved = $this->find_by_id( $insert_id ) ?? $group->with_id( $insert_id );
 			$this->cache?->invalidate_groups();
 			return $saved;
 		}
 
 		// Update existing record.
-		$this->db->update(
+		$updated = $this->db->update(
 			$this->table_groups,
 			[
 				'name'        => $group->name(),
@@ -110,6 +122,10 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 			[ '%s', '%s', '%s', '%s', '%d', '%s' ],
 			[ '%d' ]
 		);
+
+		if ( false === $updated && ! empty( $this->db->last_error ) ) {
+			throw new DatabaseQueryException( 'Database query failed while updating pricing group.' );
+		}
 
 		$saved = $this->find_by_id( $group_id ) ?? $group;
 		$this->cache?->invalidate_groups();

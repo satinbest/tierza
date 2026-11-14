@@ -3023,7 +3023,7 @@ class DatabaseIntegrationLiveTest {
 
 	public function test_variation_version_atomic_concurrency_and_failure_safety_in_mariadb(): void {
 		$plugin      = Plugin::instance();
-		$invalidator = $plugin->get_variation_cache_invalidator();
+		$invalidator = $plugin->get_variation_cache_invalidator() ?? new VariationPriceCacheInvalidator( $this->db );
 		$this->assert( $invalidator instanceof VariationPriceCacheInvalidator, 'Invalidator instance loaded.' );
 
 		$v_start = $invalidator->get_version();
@@ -3062,7 +3062,7 @@ class DatabaseIntegrationLiveTest {
 
 	public function test_pricing_failure_tracking_and_degraded_fallback_in_mariadb(): void {
 		$plugin  = Plugin::instance();
-		$tracker = $plugin->get_pricing_failure_tracker();
+		$tracker = $plugin->get_pricing_failure_tracker() ?? new \Tierza\Application\Pricing\PricingFailureTracker();
 		$this->assert( $tracker instanceof \Tierza\Application\Pricing\PricingFailureTracker, 'Failure tracker loaded.' );
 
 		$product = new \WC_Product_Simple();

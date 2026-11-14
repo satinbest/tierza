@@ -3048,15 +3048,17 @@ class DatabaseIntegrationLiveTest {
 		$this->assert( $db_val === $v_final, "Database option_value must equal invalidator version ({$v_final} === {$db_val})" );
 
 		// Test failure handling: invalidator with broken query must throw DatabaseQueryException
-		$failing_db = clone $this->db;
-		$failing_db->options = 'non_existent_table_for_tierza_test';
-		$failing_invalidator = new VariationPriceCacheInvalidator( $failing_db );
-
-		$threw = false;
+		$orig_options = $this->db->options;
+		$suppress     = $this->db->suppress_errors( true );
+		$threw        = false;
 		try {
-			$failing_invalidator->increment_version();
+			$this->db->options = 'non_existent_table_for_tierza_test';
+			$invalidator->increment_version();
 		} catch ( \Tierza\Infrastructure\Exceptions\DatabaseQueryException ) {
 			$threw = true;
+		} finally {
+			$this->db->options = $orig_options;
+			$this->db->suppress_errors( $suppress );
 		}
 		$this->assert( $threw, 'Invalidator must throw DatabaseQueryException when database write fails and must not report success.' );
 	}

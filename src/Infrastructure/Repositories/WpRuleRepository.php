@@ -18,6 +18,7 @@ use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use Tierza\Infrastructure\Validation\EntityReferenceValidator;
 use wpdb;
 
+use Tierza\Application\Pricing\Cache\VariationPriceCacheInvalidator;
 use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
 
 /**
@@ -29,21 +30,28 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 	private string $table_rules;
 	private EntityReferenceValidator $validator;
 	private ?PricingCacheInterface $cache;
+	private ?VariationPriceCacheInvalidator $variation_cache_invalidator;
 
 	public function __construct(
 		?wpdb $db = null,
 		?EntityReferenceValidator $validator = null,
-		?PricingCacheInterface $cache = null
+		?PricingCacheInterface $cache = null,
+		?VariationPriceCacheInvalidator $variation_cache_invalidator = null
 	) {
 		global $wpdb;
-		$this->db          = $db ?? $GLOBALS['wpdb'];
-		$this->table_rules = Schema::rules_table( $this->db );
-		$this->validator   = $validator ?? new EntityReferenceValidator( $this->db );
-		$this->cache       = $cache;
+		$this->db                          = $db ?? $GLOBALS['wpdb'];
+		$this->table_rules                 = Schema::rules_table( $this->db );
+		$this->validator                   = $validator ?? new EntityReferenceValidator( $this->db );
+		$this->cache                       = $cache;
+		$this->variation_cache_invalidator = $variation_cache_invalidator;
 	}
 
 	public function set_cache( ?PricingCacheInterface $cache ): void {
 		$this->cache = $cache;
+	}
+
+	public function set_variation_cache_invalidator( ?VariationPriceCacheInvalidator $invalidator ): void {
+		$this->variation_cache_invalidator = $invalidator;
 	}
 
 	public function cache(): ?PricingCacheInterface {
@@ -116,6 +124,7 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 			$insert_id = (int) $this->db->insert_id;
 			$saved     = $this->find_by_id( $insert_id ) ?? $rule->with_id( $insert_id );
 			$this->cache?->invalidate_rules();
+			$this->variation_cache_invalidator?->invalidate_for_rule( $saved );
 			return $saved;
 		}
 
@@ -160,6 +169,7 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 
 		$saved = $this->find_by_id( $rule_id ) ?? $rule;
 		$this->cache?->invalidate_rules();
+		$this->variation_cache_invalidator?->invalidate_for_rule( $saved );
 		return $saved;
 	}
 
@@ -487,6 +497,8 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 	}
 
 	public function delete( int $id ): bool {
+		$rule = $this->find_by_id( $id );
+
 		$deleted = $this->db->delete(
 			$this->table_rules,
 			[ 'id' => $id ],
@@ -500,6 +512,12 @@ final class WpRuleRepository implements RuleRepositoryInterface {
 		$success = false !== $deleted && $deleted > 0;
 		if ( $success ) {
 			$this->cache?->invalidate_rules();
+			if ( null !== $rule ) {
+				$this->variation_cache_invalidator?->invalidate_for_rule( $rule );
+			} else {
+				$this->variation_cache_invalidator?->increment_version();
+				$this->variation_cache_invalidator?->clean_all_variation_transients();
+			}
 		}
 
 		return $success;

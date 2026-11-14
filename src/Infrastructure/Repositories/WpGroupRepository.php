@@ -15,6 +15,7 @@ use Tierza\Infrastructure\Database\Schema;
 use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use wpdb;
 
+use Tierza\Application\Pricing\Cache\VariationPriceCacheInvalidator;
 use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
 
 /**
@@ -27,18 +28,28 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 	private string $table_rules;
 	private string $table_user_groups;
 	private ?PricingCacheInterface $cache;
+	private ?VariationPriceCacheInvalidator $variation_cache_invalidator;
 
-	public function __construct( ?wpdb $db = null, ?PricingCacheInterface $cache = null ) {
+	public function __construct(
+		?wpdb $db = null,
+		?PricingCacheInterface $cache = null,
+		?VariationPriceCacheInvalidator $variation_cache_invalidator = null
+	) {
 		global $wpdb;
-		$this->db                = $db ?? $GLOBALS['wpdb'];
-		$this->table_groups      = Schema::groups_table( $this->db );
-		$this->table_rules       = Schema::rules_table( $this->db );
-		$this->table_user_groups = Schema::user_groups_table( $this->db );
-		$this->cache             = $cache;
+		$this->db                          = $db ?? $GLOBALS['wpdb'];
+		$this->table_groups                = Schema::groups_table( $this->db );
+		$this->table_rules                 = Schema::rules_table( $this->db );
+		$this->table_user_groups           = Schema::user_groups_table( $this->db );
+		$this->cache                       = $cache;
+		$this->variation_cache_invalidator = $variation_cache_invalidator;
 	}
 
 	public function set_cache( ?PricingCacheInterface $cache ): void {
 		$this->cache = $cache;
+	}
+
+	public function set_variation_cache_invalidator( ?VariationPriceCacheInvalidator $invalidator ): void {
+		$this->variation_cache_invalidator = $invalidator;
 	}
 
 	public function cache(): ?PricingCacheInterface {
@@ -104,6 +115,7 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 
 			$saved = $this->find_by_id( $insert_id ) ?? $group->with_id( $insert_id );
 			$this->cache?->invalidate_groups();
+			$this->variation_cache_invalidator?->invalidate_for_group( (int) $saved->id() );
 			return $saved;
 		}
 
@@ -129,6 +141,7 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 
 		$saved = $this->find_by_id( $group_id ) ?? $group;
 		$this->cache?->invalidate_groups();
+		$this->variation_cache_invalidator?->invalidate_for_group( (int) $saved->id() );
 		return $saved;
 	}
 
@@ -280,6 +293,7 @@ final class WpGroupRepository implements GroupRepositoryInterface {
 		$success = false !== $deleted && $deleted > 0;
 		if ( $success ) {
 			$this->cache?->invalidate_groups();
+			$this->variation_cache_invalidator?->invalidate_for_group( $id );
 		}
 
 		return $success;

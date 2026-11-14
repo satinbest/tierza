@@ -89,4 +89,40 @@ class VariationPriceCacheInvalidatorTest extends TestCase {
 		$this->invalidator->invalidate_for_customer( 42 );
 		$this->assertSame( $v2 + 1, $this->invalidator->get_version() );
 	}
+
+	public function test_database_write_failure_throws_exception_and_does_not_advance_version(): void {
+		$failing_db = $this->createMock( wpdb::class );
+		$failing_db->options = 'wp_options';
+		$failing_db->method( 'prepare' )->willReturnCallback( fn( $q ) => $q );
+		$failing_db->method( 'query' )->willReturn( false );
+		$failing_db->last_error = 'Simulated connection lost error';
+
+		$invalidator = new VariationPriceCacheInvalidator( $failing_db );
+		$initial_version = $invalidator->get_version();
+
+		$this->expectException( \Tierza\Infrastructure\Exceptions\DatabaseQueryException::class );
+		$this->expectExceptionMessage( 'Failed to increment variation cache version' );
+
+		try {
+			$invalidator->increment_version();
+		} finally {
+			// Version was not corrupted
+			$this->assertSame( $initial_version, $invalidator->get_version() );
+		}
+	}
+
+	public function test_database_verification_failure_throws_exception(): void {
+		$failing_db = $this->createMock( wpdb::class );
+		$failing_db->options = 'wp_options';
+		$failing_db->method( 'prepare' )->willReturnCallback( fn( $q ) => $q );
+		$failing_db->method( 'query' )->willReturn( 1 );
+		$failing_db->method( 'get_var' )->willReturn( null ); // Verification fails
+
+		$invalidator = new VariationPriceCacheInvalidator( $failing_db );
+
+		$this->expectException( \Tierza\Infrastructure\Exceptions\DatabaseQueryException::class );
+		$this->expectExceptionMessage( 'Failed to verify updated variation cache version' );
+
+		$invalidator->increment_version();
+	}
 }

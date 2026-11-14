@@ -348,3 +348,11 @@ if ( ! function_exists( 'remove_action' ) ) {
 		return remove_filter( $tag, $function_to_remove, $priority );
 	}
 }
+
+if ( ! class_exists( 'WC_Cache_Helper' ) ) {
+	class WC_Cache_Helper {
+		public static function get_transient_version( string $group, bool $refresh = false ): string {
+			return '1.0';
+		}
+	}
+}

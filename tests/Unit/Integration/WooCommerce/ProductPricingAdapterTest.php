@@ -110,6 +110,7 @@ class ProductPricingAdapterTest extends TestCase {
 			$this->cache,
 			$this->batch_prefetcher
 		);
+		$this->adapter->enable_test_mode( true );
 	}
 
 	public function test_simple_product_fallback_preserves_original_price(): void {
@@ -660,19 +661,68 @@ class ProductPricingAdapterTest extends TestCase {
 
 		$this->adapter->enable_test_mode( false );
 
-		// Without permission or test mode, explicit customer ID 42 is discarded and authenticated user 10 is used
+		// In production mode (test_mode = false), explicit customer ID 42 is discarded and authenticated user 10 is used
 		$resolved = $this->adapter->resolve_customer_id( 42 );
 		$this->assertSame( 10, $resolved );
 
-		// With test mode enabled, explicit customer ID is respected
+		// In production mode, even when administrator is logged in (manage_woocommerce = true), explicit customer ID is strictly ignored!
+		$wp_mock_user_caps = [ 'manage_woocommerce' => true ];
+		$this->assertSame( 10, $this->adapter->resolve_customer_id( 42 ) );
+
+		// With test mode enabled, explicit customer ID is respected (isolated test suites)
 		$this->adapter->enable_test_mode( true );
 		$resolved_test = $this->adapter->resolve_customer_id( 42 );
 		$this->assertSame( 42, $resolved_test );
 
-		// With manage_woocommerce capability, explicit customer ID is respected even without test mode
-		$this->adapter->enable_test_mode( false );
-		$wp_mock_user_caps = [ 'manage_woocommerce' => true ];
-		$this->assertSame( 42, $this->adapter->resolve_customer_id( 42 ) );
+		// Re-enable test mode for following tests
+		$this->adapter->enable_test_mode( true );
+	}
+
+	public function test_admin_pricing_simulation_service_requires_authorization(): void {
+		global $current_user_id_mock, $wp_mock_user_caps;
+		$current_user_id_mock = 5;
+		$wp_mock_user_caps    = [ 'manage_woocommerce' => false ];
+
+		$product = new WC_Product( 101 );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+
+		$this->rule_repo->save(
+			new PricingRule(
+				RuleTarget::user( 42 ),
+				RuleScope::product( 101 ),
+				PricingValue::percentage( '20.000000' )
+			)
+		);
+
+		$simulation_service = new \Tierza\Application\Pricing\AdminPricingSimulationService( $this->adapter );
+
+		// Non-admin attempt throws PricingCalculationException
+		$this->expectException( \Tierza\Domain\Exceptions\PricingCalculationException::class );
+		$this->expectExceptionMessage( 'Unauthorized customer pricing simulation attempt.' );
+		$simulation_service->simulate_customer_price( $product, 42 );
+	}
+
+	public function test_admin_pricing_simulation_service_succeeds_for_authorized_admin(): void {
+		global $current_user_id_mock, $wp_mock_user_caps;
+		$current_user_id_mock = 1;
+		$wp_mock_user_caps    = [ 'manage_woocommerce' => true ];
+
+		$product = new WC_Product( 101 );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+
+		$this->rule_repo->save(
+			new PricingRule(
+				RuleTarget::user( 42 ),
+				RuleScope::product( 101 ),
+				PricingValue::percentage( '20.000000' )
+			)
+		);
+
+		$simulation_service = new \Tierza\Application\Pricing\AdminPricingSimulationService( $this->adapter );
+		$price = $simulation_service->simulate_customer_price( $product, 42 );
+		$this->assertSame( '80.00', $price );
 	}
 
 	public function test_zero_percent_rule_does_not_render_sale_strikethrough(): void {

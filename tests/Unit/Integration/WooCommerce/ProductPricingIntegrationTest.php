@@ -236,23 +236,28 @@ class ProductPricingIntegrationTest extends TestCase {
 		// Mock adapter throwing an exception to verify integration error containment.
 		$failing_adapter = $this->createMock( ProductPricingAdapter::class );
 		$failing_adapter->method( 'get_adjusted_price' )
-			->willThrowException( new RuntimeException( 'Simulated database failure during pricing' ) );
+			->willThrowException( new \Tierza\Infrastructure\Exceptions\DatabaseQueryException( 'Simulated database failure during pricing' ) );
 
-		$integration = new ProductPricingIntegration( $failing_adapter );
+		$tracker     = new \Tierza\Application\Pricing\PricingFailureTracker();
+		$integration = new ProductPricingIntegration( $failing_adapter, $tracker );
 
 		$product = new WC_Product( 101 );
 		$product->set_regular_price( '100.00' );
 		$product->set_price( '100.00' );
 
-		$action_fired = false;
+		$captured_code = '';
+		$captured_msg  = '';
+		$action_fired  = false;
 		if ( function_exists( 'add_action' ) ) {
 			add_action(
 				'tierza_pricing_calculation_failed',
-				function ( int $product_id, $e ) use ( &$action_fired ) {
-					$action_fired = true;
+				function ( int $product_id, string $code, string $msg ) use ( &$action_fired, &$captured_code, &$captured_msg ) {
+					$action_fired  = true;
+					$captured_code = $code;
+					$captured_msg  = $msg;
 				},
 				10,
-				2
+				3
 			);
 		}
 
@@ -260,6 +265,44 @@ class ProductPricingIntegrationTest extends TestCase {
 		$price = $integration->filter_product_price( '100.00', $product );
 		$this->assertSame( '100.00', $price );
 		$this->assertTrue( $action_fired, 'Failure hook tierza_pricing_calculation_failed must be fired!' );
+		$this->assertSame( \Tierza\Application\Pricing\PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, $captured_code );
+		$this->assertStringContainsString( 'Simulated database failure', $captured_msg );
+
+		// Verify failure tracker records state
+		$this->assertTrue( $tracker->has_failed( 101 ) );
+		$failure = $tracker->get_failure( 101 );
+		$this->assertNotNull( $failure );
+		$this->assertSame( \Tierza\Application\Pricing\PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, $failure['error_code'] );
+	}
+
+	public function test_pricing_calculator_failure_is_tracked_safely(): void {
+		$failing_adapter = $this->createMock( ProductPricingAdapter::class );
+		$failing_adapter->method( 'get_adjusted_price' )
+			->willThrowException( new \Tierza\Domain\Exceptions\PricingCalculationException( 'Simulated calculation failure' ) );
+
+		$tracker     = new \Tierza\Application\Pricing\PricingFailureTracker();
+		$integration = new ProductPricingIntegration( $failing_adapter, $tracker );
+
+		$product = new WC_Product( 102 );
+		$product->set_regular_price( '150.00' );
+		$product->set_price( '150.00' );
+
+		$captured_code = '';
+		if ( function_exists( 'add_action' ) ) {
+			add_action(
+				'tierza_pricing_calculation_failed',
+				function ( int $product_id, string $code, string $msg ) use ( &$captured_code ) {
+					$captured_code = $code;
+				},
+				10,
+				3
+			);
+		}
+
+		$price = $integration->filter_product_price( '150.00', $product );
+		$this->assertSame( '150.00', $price );
+		$this->assertSame( \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, $captured_code );
+		$this->assertTrue( $tracker->has_failed( 102 ) );
 	}
 
 	public function test_safe_html_error_handling_falls_back(): void {
@@ -267,26 +310,31 @@ class ProductPricingIntegrationTest extends TestCase {
 		$failing_adapter->method( 'get_price_html' )
 			->willThrowException( new RuntimeException( 'Simulated HTML rendering exception' ) );
 
-		$integration = new ProductPricingIntegration( $failing_adapter );
+		$tracker     = new \Tierza\Application\Pricing\PricingFailureTracker();
+		$integration = new ProductPricingIntegration( $failing_adapter, $tracker );
 
 		$product = new WC_Product( 101 );
 		$product->set_regular_price( '100.00' );
 
-		$action_fired = false;
+		$action_fired  = false;
+		$captured_code = '';
 		if ( function_exists( 'add_action' ) ) {
 			add_action(
 				'tierza_pricing_html_failed',
-				function ( int $product_id, $e ) use ( &$action_fired ) {
-					$action_fired = true;
+				function ( int $product_id, string $code, string $msg ) use ( &$action_fired, &$captured_code ) {
+					$action_fired  = true;
+					$captured_code = $code;
 				},
 				10,
-				2
+				3
 			);
 		}
 
 		$html = $integration->filter_price_html( '$100.00', $product );
 		$this->assertSame( '$100.00', $html );
 		$this->assertTrue( $action_fired, 'Failure hook tierza_pricing_html_failed must be fired!' );
+		$this->assertSame( \Tierza\Application\Pricing\PricingFailureTracker::CODE_UNEXPECTED, $captured_code );
+		$this->assertTrue( $tracker->has_failed( 101 ) );
 	}
 
 	public function test_scope_boundaries_protect_admin_and_import(): void {

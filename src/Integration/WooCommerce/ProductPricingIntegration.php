@@ -4,6 +4,11 @@ declare(strict_types=1);
 
 namespace Tierza\Integration\WooCommerce;
 
+use Tierza\Application\Pricing\PricingFailureTracker;
+use Tierza\Domain\Exceptions\InvalidMoneyException;
+use Tierza\Domain\Exceptions\InvalidPricingContextException;
+use Tierza\Domain\Exceptions\PricingCalculationException;
+use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use Throwable;
 use WC_Product;
 use WP_Post;
@@ -33,14 +38,24 @@ class ProductPricingIntegration {
 	 */
 	private bool $allow_cli_pricing = true;
 
+	private readonly PricingFailureTracker $failure_tracker;
+
 	/**
 	 * Constructor.
 	 *
-	 * @param ProductPricingAdapter $adapter Pricing adapter service.
+	 * @param ProductPricingAdapter      $adapter         Pricing adapter service.
+	 * @param PricingFailureTracker|null $failure_tracker Pricing failure tracker.
 	 */
 	public function __construct(
-		private readonly ProductPricingAdapter $adapter
-	) {}
+		private readonly ProductPricingAdapter $adapter,
+		?PricingFailureTracker $failure_tracker = null
+	) {
+		$this->failure_tracker = $failure_tracker ?? new PricingFailureTracker();
+	}
+
+	public function get_failure_tracker(): PricingFailureTracker {
+		return $this->failure_tracker;
+	}
 
 	/**
 	 * Register all WooCommerce pricing hooks.
@@ -111,9 +126,14 @@ class ProductPricingIntegration {
 		try {
 			return $this->adapter->get_adjusted_price( $product );
 		} catch ( Throwable $e ) {
-			$this->log_error( 'Failed to calculate Tierza price for product #' . $product_id, $e );
+			$error_code   = $this->classify_exception( $e );
+			$safe_message = $this->sanitize_error_message( $e );
+
+			$this->failure_tracker->record_failure( $product_id, $error_code, $safe_message );
+			$this->log_error( 'Failed to calculate Tierza price for product #' . $product_id, $error_code, $safe_message );
+
 			if ( function_exists( 'do_action' ) ) {
-				do_action( 'tierza_pricing_calculation_failed', $product_id, $e );
+				do_action( 'tierza_pricing_calculation_failed', $product_id, $error_code, $safe_message );
 			}
 			return (string) $price;
 		} finally {
@@ -181,9 +201,15 @@ class ProductPricingIntegration {
 		try {
 			return $this->adapter->get_price_html( (string) $price_html, $product );
 		} catch ( Throwable $e ) {
-			$this->log_error( 'Failed to format price HTML for product #' . $product->get_id(), $e );
+			$product_id   = (int) $product->get_id();
+			$error_code   = $this->classify_exception( $e );
+			$safe_message = $this->sanitize_error_message( $e );
+
+			$this->failure_tracker->record_failure( $product_id, $error_code, $safe_message );
+			$this->log_error( 'Failed to format price HTML for product #' . $product_id, $error_code, $safe_message );
+
 			if ( function_exists( 'do_action' ) ) {
-				do_action( 'tierza_pricing_html_failed', (int) $product->get_id(), $e );
+				do_action( 'tierza_pricing_html_failed', $product_id, $error_code, $safe_message );
 			}
 			return (string) $price_html;
 		}
@@ -390,18 +416,50 @@ class ProductPricingIntegration {
 	}
 
 	/**
+	 * Classify exception into machine-readable safe error code.
+	 *
+	 * @param Throwable $e Exception instance.
+	 * @return string Error code constant.
+	 */
+	private function classify_exception( Throwable $e ): string {
+		if ( $e instanceof DatabaseQueryException ) {
+			return PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE;
+		}
+		if ( $e instanceof PricingCalculationException ) {
+			return PricingFailureTracker::CODE_CALCULATION_FAILED;
+		}
+		if ( $e instanceof InvalidPricingContextException || $e instanceof InvalidMoneyException ) {
+			return PricingFailureTracker::CODE_INVALID_CONTEXT;
+		}
+		return PricingFailureTracker::CODE_UNEXPECTED;
+	}
+
+	/**
+	 * Sanitize exception message to avoid exposing SQL, credentials, or internal paths.
+	 *
+	 * @param Throwable $e Exception instance.
+	 * @return string Sanitized safe message.
+	 */
+	private function sanitize_error_message( Throwable $e ): string {
+		$msg = $e->getMessage();
+		$msg = (string) preg_replace( '/(password|pwd|secret|token)=[^&\\s]+/i', '$1=***', $msg );
+		$msg = (string) preg_replace( '/(FROM|INTO|UPDATE|TABLE)\s+`?[a-zA-Z0-9_]+`?/i', '$1 [table]', $msg );
+		return substr( trim( $msg ), 0, 255 );
+	}
+
+	/**
 	 * Safely log error without leaking sensitive SQL, passwords, or internal tokens.
 	 *
-	 * @param string    $message Safe log message.
-	 * @param Throwable $e       Caught exception.
+	 * @param string $context      Context description.
+	 * @param string $error_code   Machine-readable error code.
+	 * @param string $safe_message Sanitized safe message.
 	 */
-	private function log_error( string $message, Throwable $e ): void {
+	private function log_error( string $context, string $error_code, string $safe_message ): void {
 		if ( function_exists( 'wc_get_logger' ) ) {
 			$logger = wc_get_logger();
 			if ( method_exists( $logger, 'error' ) ) {
-				$safe_detail = (string) preg_replace( '/(password|pwd|secret|token)=[^&\\s]+/i', '$1=***', $e->getMessage() );
 				$logger->error(
-					sprintf( '%s: %s', $message, $safe_detail ),
+					sprintf( '%s [%s]: %s', $context, $error_code, $safe_message ),
 					[ 'source' => 'tierza-pricing' ]
 				);
 			}

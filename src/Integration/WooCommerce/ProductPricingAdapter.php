@@ -91,14 +91,9 @@ class ProductPricingAdapter {
 	}
 
 	public function can_override_customer_identity(): bool {
-		if ( $this->test_mode ) {
-			return true;
-		}
-		// phpcs:ignore WordPress.WP.Capabilities.Unknown
-		if ( function_exists( 'current_user_can' ) && current_user_can( 'manage_woocommerce' ) ) {
-			return true;
-		}
-		return false;
+		// Public adapter pricing strictly forbids arbitrary runtime customer impersonation.
+		// Customer overrides are strictly confined to isolated test mode.
+		return $this->test_mode;
 	}
 
 	/**
@@ -403,24 +398,22 @@ class ProductPricingAdapter {
 	 *
 	 * Derived strictly from WordPress authentication state; never trusts
 	 * query parameters or user-submitted input in production storefront contexts.
-	 * Explicit overrides are permitted only when can_override_customer_identity() is true.
+	 * Explicit overrides are permitted strictly in isolated test mode.
 	 *
-	 * @param int|null $explicit_id Optional explicit customer ID.
+	 * @param int|null $explicit_id Optional explicit customer ID (ignored in production).
 	 * @return int Positive user ID or 0 for guest.
 	 */
 	public function resolve_customer_id( ?int $explicit_id = null ): int {
-		if ( null !== $this->test_customer_id ) {
-			return max( 0, $this->test_customer_id );
-		}
-
-		if ( null !== $explicit_id ) {
-			if ( $this->can_override_customer_identity() ) {
+		if ( $this->test_mode ) {
+			if ( null !== $this->test_customer_id ) {
+				return max( 0, $this->test_customer_id );
+			}
+			if ( null !== $explicit_id ) {
 				return max( 0, $explicit_id );
 			}
-			// Security boundary: unauthorized impersonation attempts are discarded in production storefront.
-			return function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
 		}
 
+		// Security boundary: in production execution, always derive strictly from authenticated WordPress session.
 		if ( function_exists( 'get_current_user_id' ) ) {
 			return (int) get_current_user_id();
 		}

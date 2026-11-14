@@ -74,18 +74,16 @@ Registers and manages all WooCommerce WordPress hooks with strict safety boundar
 Customer identity is strictly derived from verified WordPress session authentication in production storefront requests. Explicit customer overrides are strictly restricted to authorized administrators (`manage_woocommerce`) or isolated test environments (`can_override_customer_identity()`):
 ```php
 public function resolve_customer_id( ?int $explicit_id = null ): int {
-    if ( null !== $this->test_customer_id ) {
-        return max( 0, $this->test_customer_id );
-    }
-
-    if ( null !== $explicit_id ) {
-        if ( $this->can_override_customer_identity() ) {
+    if ( $this->test_mode ) {
+        if ( null !== $this->test_customer_id ) {
+            return max( 0, $this->test_customer_id );
+        }
+        if ( null !== $explicit_id ) {
             return max( 0, $explicit_id );
         }
-        // Security boundary: unauthorized client overrides discarded in storefront.
-        return function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
     }
 
+    // Security boundary: in production storefront execution, strictly derive from authenticated WordPress session.
     if ( function_exists( 'get_current_user_id' ) ) {
         return (int) get_current_user_id();
     }
@@ -93,17 +91,22 @@ public function resolve_customer_id( ?int $explicit_id = null ): int {
     return 0;
 }
 ```
-Query parameters, headers, or client requests are never trusted to impersonate customer groups.
+Query parameters, headers, or client requests are never trusted to impersonate customer groups. Even logged-in administrators browsing the storefront have their prices resolved for their own user account, completely ignoring any passed customer ID parameter. Administrative simulation is decoupled and managed exclusively via `AdminPricingSimulationService` with explicit capability checks (`manage_woocommerce`).
 
-### Variation Cache Segregation & Invalidation
-WooCommerce variable products cache price ranges in WordPress transients using `wc_var_prices_{$product_id}`.
+### Variation Cache Segregation & Invalidation Under Persistent Object Caches
+WooCommerce variable products cache price ranges in transients using `wc_var_prices_{$product_id}`.
 Tierza ensures zero cross-customer leakage and immediate invalidation across mutations via `VariationPriceCacheInvalidator`:
-1. **Hash Segregation (`woocommerce_get_variation_prices_hash`):**
-   Appends customer ID, group ID, active status, and the current atomic `tierza_version` to the transient hash.
-2. **Transient Purging on Mutations:**
-   Whenever a pricing rule, group status, or customer assignment is created, updated, or removed:
-   - The atomic version counter in options (`tierza_var_price_version`) is incremented.
-   - Associated transients (`_transient_wc_var_prices_*`) are actively purged, preventing unbounded database bloat and ensuring instant updates even with external persistent object caches (Redis/Memcached).
+1. **Concurrency-Safe Atomic Monotonic Versioning:**
+   - Invalidation executes an atomic upsert `INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('tierza_var_price_version', '2', 'no') ON DUPLICATE KEY UPDATE option_value = CAST(COALESCE(NULLIF(option_value, ''), '1') AS UNSIGNED) + 1`.
+   - Row-level locking on `UNIQUE KEY option_name` prevents lost updates when multiple administrators save rules concurrently.
+   - Database write failures throw `DatabaseQueryException` and never falsely report success.
+   - Cleans WordPress options object cache (`clean_option_cache`, `wp_cache_delete`) to maintain cross-process coherence.
+2. **Transient Hash Segregation (`woocommerce_get_variation_prices_hash`):**
+   - Appends customer ID, group ID, active status, and the current atomic `tierza_version` to the transient hash.
+   - Because the hash key changes monotonically, all variation price ranges across Redis, Memcached, APCu, or database transients are instantly and logically invalidated on the next request.
+3. **Persistent Object Cache & Database Cleanup:**
+   - On targeted rule changes (product/variation scope): `clean_product_transient( $product_id )` deletes `wc_var_prices_{$product_id}` transients via supported WordPress API (`delete_transient()` and `wc_delete_product_transients()`). Under Redis/Memcached, `delete_transient` calls `wp_cache_delete()`, purging the cache entry in memory.
+   - On broad changes (global rules, category rules, group status changes, customer reassignment): calls `WC_Cache_Helper::get_transient_version( 'product', true )` to increment WooCommerce's product transient group version, invalidating all product transients across Redis/Memcached, while running database garbage collection on `wp_options`.
 
 ### Pure-PHP Fallback & Shared Hosting Compatibility
 Direct BCMath functions (`bccomp`) have been completely eliminated from the integration adapter and replaced with `DecimalMath::comp()`. Tierza guarantees 100% calculation and rounding fidelity on minimal shared hosting platforms lacking the PHP `ext-bcmath` extension.
@@ -113,11 +116,14 @@ Products assigned only to child categories automatically traverse their taxonomy
 - Ancestor category IDs (parent, grandparent, etc.) are included in the pricing context.
 - Exact taxonomy depths are computed to guarantee that more specific child category rules override parent category rules according to Tierza's 9-level resolution hierarchy.
 
-### Fail-Closed Production Error Handling
+### Fail-Closed Production Error Handling & Failure Tracking
 If an unexpected runtime failure or database exception occurs during price calculation:
-- Tierza fails closed to the product's original raw price (never $0.00).
-- Safe error logging sanitizes messages and strips passwords, database prefixes, or internal tokens.
-- Fires `tierza_pricing_calculation_failed` or `tierza_pricing_html_failed` action hooks for monitoring and alerting.
+- Tierza distinguishes legitimate no-rule fallback (where no Tierza rule matches and standard catalog price applies) from operational/calculation failures.
+- Records failures in `PricingFailureTracker` with machine-readable error codes (`TRZ_ERR_CALCULATION_FAILED`, `TRZ_ERR_REPOSITORY_UNAVAILABLE`, `TRZ_ERR_INVALID_CONTEXT`, `TRZ_ERR_UNEXPECTED`).
+- Returns the product's original raw price as a degraded storefront fallback so the public shop does not crash or display an invented $0.00 price.
+- Crucially, because the failure state is tracked in `PricingFailureTracker`, downstream adapters in TRZ-011 (cart, checkout, order placement) consume this signal to block unauthorized purchase of degraded fallback prices.
+- Safe error logging sanitizes messages and strips passwords, database table names, or internal tokens.
+- Fires `tierza_pricing_calculation_failed` or `tierza_pricing_html_failed` action hooks with sanitized error codes and messages—never leaking raw `Throwable` / `Exception` objects to public hooks.
 
 ---
 

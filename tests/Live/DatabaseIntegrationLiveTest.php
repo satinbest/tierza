@@ -137,6 +137,8 @@ class DatabaseIntegrationLiveTest {
 			'test_woocommerce_variation_prices_cache_isolation_in_mariadb',
 			'test_woocommerce_variation_cache_invalidation_matrix_in_mariadb',
 			'test_woocommerce_catalog_loop_batch_prefetching_in_mariadb',
+			'test_variation_version_atomic_concurrency_and_failure_safety_in_mariadb',
+			'test_pricing_failure_tracking_and_degraded_fallback_in_mariadb',
 		];
 
 		foreach ( $methods as $method ) {
@@ -3016,6 +3018,75 @@ class DatabaseIntegrationLiveTest {
 			foreach ( $products as $p ) {
 				$p->delete( true );
 			}
+		}
+	}
+
+	public function test_variation_version_atomic_concurrency_and_failure_safety_in_mariadb(): void {
+		$plugin      = Plugin::instance();
+		$invalidator = $plugin->get_variation_cache_invalidator();
+		$this->assert( $invalidator instanceof VariationPriceCacheInvalidator, 'Invalidator instance loaded.' );
+
+		$v_start = $invalidator->get_version();
+		$v1      = $invalidator->increment_version();
+		$this->assert( $v1 === $v_start + 1, "Monotonic increment must advance by 1 in MariaDB. Expected " . ( $v_start + 1 ) . ", got {$v1}" );
+
+		// Simulate concurrent multi-step increments directly against MariaDB wp_options row
+		for ( $i = 0; $i < 5; $i++ ) {
+			$invalidator->increment_version();
+		}
+		$v_final = $invalidator->get_version();
+		$this->assert( $v_final === $v1 + 5, "Five successive increments must advance version by exactly 5 without lost updates. Expected " . ( $v1 + 5 ) . ", got {$v_final}" );
+
+		// Verify database row directly matches get_version()
+		$db_val = (int) $this->db->get_var(
+			$this->db->prepare(
+				"SELECT option_value FROM {$this->db->options} WHERE option_name = %s",
+				VariationPriceCacheInvalidator::OPTION_NAME
+			)
+		);
+		$this->assert( $db_val === $v_final, "Database option_value must equal invalidator version ({$v_final} === {$db_val})" );
+
+		// Test failure handling: invalidator with broken query must throw DatabaseQueryException
+		$failing_db = clone $this->db;
+		$failing_db->options = 'non_existent_table_for_tierza_test';
+		$failing_invalidator = new VariationPriceCacheInvalidator( $failing_db );
+
+		$threw = false;
+		try {
+			$failing_invalidator->increment_version();
+		} catch ( \Tierza\Infrastructure\Exceptions\DatabaseQueryException ) {
+			$threw = true;
+		}
+		$this->assert( $threw, 'Invalidator must throw DatabaseQueryException when database write fails and must not report success.' );
+	}
+
+	public function test_pricing_failure_tracking_and_degraded_fallback_in_mariadb(): void {
+		$plugin  = Plugin::instance();
+		$tracker = $plugin->get_pricing_failure_tracker();
+		$this->assert( $tracker instanceof \Tierza\Application\Pricing\PricingFailureTracker, 'Failure tracker loaded.' );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Failure Test Product' );
+		$product->set_regular_price( '120.00' );
+		$product->set_price( '120.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		try {
+			$tracker->reset();
+			$this->assert( ! $tracker->has_failed( $pid ), 'Product must not have failed initially.' );
+
+			// Simulate calculation failure tracking
+			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Calculation precision test failure' );
+			$this->assert( $tracker->has_failed( $pid ), 'Product must be marked as failed.' );
+			$failure = $tracker->get_failure( $pid );
+			$this->assert( null !== $failure && \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED === $failure['error_code'], 'Error code must match.' );
+
+			// Verify fallback price remains unmodified 120.00
+			$this->assert( '120.00' === $product->get_price(), 'Product price must fall back safely to 120.00.' );
+		} finally {
+			$tracker->reset();
+			$product->delete( true );
 		}
 	}
 

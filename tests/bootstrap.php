@@ -209,6 +209,7 @@ if ( ! class_exists( 'WP_User' ) ) {
 if ( ! class_exists( 'wpdb' ) ) {
 	class wpdb {
 		public string $prefix = 'wp_';
+		public string $options = 'wp_options';
 		public int $insert_id = 0;
 		public string $last_error = '';
 
@@ -229,6 +230,7 @@ if ( ! class_exists( 'wpdb' ) ) {
 		}
 
 		public function get_var( ?string $query = null ): mixed {
+			if ( null !== $query && str_contains( $query, 'tierza_var_price_version' ) ) { global $wp_options; return (string) ($wp_options['tierza_var_price_version'] ?? '1'); }
 			if ( null !== $query && str_contains( $query, 'SHOW TABLES LIKE' ) ) {
 				if ( preg_match( "/'([^']+)'/", $query, $matches ) ) {
 					return $matches[1];
@@ -326,6 +328,7 @@ if ( ! class_exists( 'wpdb' ) ) {
 		}
 
 		public function query( string $query ): int|bool {
+			if ( str_contains( $query, 'tierza_var_price_version' ) ) { global $wp_options; $curr = (int) ($wp_options['tierza_var_price_version'] ?? 1); $wp_options['tierza_var_price_version'] = (string) ($curr + 1); return 1; }
 			return true;
 		}
 

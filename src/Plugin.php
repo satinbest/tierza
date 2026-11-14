@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace Tierza;
 
 use Tierza\Admin\AdminMenu;
+use Tierza\Application\Pricing\AdminPricingSimulationService;
 use Tierza\Application\Pricing\AuthoritativePriceCalculator;
 use Tierza\Application\Pricing\Batch\PricingBatchPrefetcher;
 use Tierza\Application\Pricing\Cache\RequestPricingCache;
 use Tierza\Application\Pricing\Cache\VariationPriceCacheInvalidator;
 use Tierza\Application\Pricing\DeterministicRuleResolver;
+use Tierza\Application\Pricing\PricingFailureTracker;
 use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
 use Tierza\Domain\Repositories\GroupRepositoryInterface;
 use Tierza\Domain\Repositories\RuleRepositoryInterface;
@@ -40,13 +42,15 @@ final class Plugin {
 	/**
 	 * Repository, cache, and pricing integration instances.
 	 */
-	private ?GroupRepositoryInterface $group_repository                  = null;
-	private ?RuleRepositoryInterface $rule_repository                    = null;
-	private ?UserGroupRepositoryInterface $user_group_repository         = null;
-	private ?PricingCacheInterface $pricing_cache                        = null;
-	private ?VariationPriceCacheInvalidator $variation_cache_invalidator = null;
-	private ?ProductPricingAdapter $pricing_adapter                      = null;
-	private ?ProductPricingIntegration $pricing_integration              = null;
+	private ?GroupRepositoryInterface $group_repository                      = null;
+	private ?RuleRepositoryInterface $rule_repository                        = null;
+	private ?UserGroupRepositoryInterface $user_group_repository             = null;
+	private ?PricingCacheInterface $pricing_cache                            = null;
+	private ?VariationPriceCacheInvalidator $variation_cache_invalidator     = null;
+	private ?ProductPricingAdapter $pricing_adapter                          = null;
+	private ?ProductPricingIntegration $pricing_integration                  = null;
+	private ?PricingFailureTracker $pricing_failure_tracker                  = null;
+	private ?AdminPricingSimulationService $admin_pricing_simulation_service = null;
 
 	/**
 	 * Whether the plugin has been initialized.
@@ -130,7 +134,7 @@ final class Plugin {
 		$calculator       = new AuthoritativePriceCalculator();
 		$batch_prefetcher = new PricingBatchPrefetcher( $this->rule_repository, $this->pricing_cache );
 
-		$this->pricing_adapter     = new ProductPricingAdapter(
+		$this->pricing_adapter         = new ProductPricingAdapter(
 			$resolver,
 			$calculator,
 			$this->group_repository,
@@ -139,8 +143,11 @@ final class Plugin {
 			$batch_prefetcher,
 			$this->variation_cache_invalidator
 		);
-		$this->pricing_integration = new ProductPricingIntegration( $this->pricing_adapter );
+		$this->pricing_failure_tracker = new PricingFailureTracker();
+		$this->pricing_integration     = new ProductPricingIntegration( $this->pricing_adapter, $this->pricing_failure_tracker );
 		$this->pricing_integration->register();
+
+		$this->admin_pricing_simulation_service = new AdminPricingSimulationService( $this->pricing_adapter );
 
 		if ( is_admin() ) {
 			$this->admin_menu = new AdminMenu();
@@ -279,6 +286,20 @@ final class Plugin {
 	 */
 	public function get_pricing_integration(): ?ProductPricingIntegration {
 		return $this->pricing_integration;
+	}
+
+	/**
+	 * Get pricing failure tracker.
+	 */
+	public function get_pricing_failure_tracker(): ?PricingFailureTracker {
+		return $this->pricing_failure_tracker;
+	}
+
+	/**
+	 * Get administrative pricing simulation service.
+	 */
+	public function get_admin_pricing_simulation_service(): ?AdminPricingSimulationService {
+		return $this->admin_pricing_simulation_service;
 	}
 
 	/**

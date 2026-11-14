@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tierza\Application\Pricing\Cache;
 
 use Tierza\Domain\Entities\PricingRule;
+use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use wpdb;
 
 /**
@@ -12,9 +13,10 @@ use wpdb;
  *
  * WooCommerce caches variation price ranges in transients ('wc_var_prices_{$product_id}').
  * This service ensures that when Tierza pricing rules, groups, or customer assignments change:
- * 1. An atomic version counter is incremented, altering the hash in 'woocommerce_get_variation_prices_hash'.
- * 2. Associated WooCommerce transients are actively purged to avoid unbounded database bloat.
- * 3. Works seamlessly with both standard MySQL transients and persistent object caches (Redis/Memcached).
+ * 1. An atomic, monotonic version counter in MariaDB/MySQL is incremented to prevent race conditions.
+ * 2. Invalidation hooks through WC_Cache_Helper and delete_transient purge external object caches (Redis/Memcached).
+ * 3. Database transients are actively purged to avoid unbounded database bloat.
+ * 4. Stale cache versions in memory are reset, ensuring runtime consistency.
  */
 class VariationPriceCacheInvalidator {
 
@@ -35,13 +37,27 @@ class VariationPriceCacheInvalidator {
 	/**
 	 * Retrieve current pricing version counter.
 	 *
-	 * Cached in-memory per request to avoid redundant get_option() database lookups.
+	 * Cached in-memory per request to avoid redundant database lookups.
 	 *
 	 * @return int Positive integer version.
 	 */
 	public function get_version(): int {
 		if ( null !== $this->cached_version ) {
 			return $this->cached_version;
+		}
+
+		if ( ! empty( $this->db->options ) ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$raw = $this->db->get_var(
+				$this->db->prepare(
+					"SELECT option_value FROM {$this->db->options} WHERE option_name = %s",
+					self::OPTION_NAME
+				)
+			);
+			if ( null !== $raw && is_numeric( $raw ) ) {
+				$this->cached_version = max( 1, (int) $raw );
+				return $this->cached_version;
+			}
 		}
 
 		if ( function_exists( 'get_option' ) ) {
@@ -56,20 +72,69 @@ class VariationPriceCacheInvalidator {
 	}
 
 	/**
-	 * Increment pricing version counter and flush runtime cache.
+	 * Atomically increment pricing version counter using a monotonic database upsert.
 	 *
-	 * @return int New incremented version.
+	 * Concurrency-safe: Executes a single atomic INSERT ... ON DUPLICATE KEY UPDATE
+	 * with row-level locks on UNIQUE KEY option_name, eliminating lost updates when multiple
+	 * administrators modify pricing rules simultaneously.
+	 *
+	 * @return int Authoritative incremented version.
+	 * @throws DatabaseQueryException If database write or verification fails.
 	 */
 	public function increment_version(): int {
-		$current = $this->get_version();
-		$new_ver = $current + 1;
+		if ( ! empty( $this->db->options ) ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$sql = $this->db->prepare(
+				"INSERT INTO {$this->db->options} (option_name, option_value, autoload)
+				 VALUES (%s, '2', 'no')
+				 ON DUPLICATE KEY UPDATE option_value = CAST(COALESCE(NULLIF(option_value, ''), '1') AS UNSIGNED) + 1",
+				self::OPTION_NAME
+			);
 
-		if ( function_exists( 'update_option' ) ) {
-			update_option( self::OPTION_NAME, $new_ver, false );
+			$result = $this->db->query( $sql );
+			if ( false === $result || ! empty( $this->db->last_error ) ) {
+				$err_msg = ! empty( $this->db->last_error ) ? $this->db->last_error : 'Unknown database error';
+				throw new DatabaseQueryException(
+					sprintf( 'Failed to increment variation cache version: %s', $err_msg )
+				);
+			}
+
+			// Read back newly updated authoritative version.
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$new_ver_raw = $this->db->get_var(
+				$this->db->prepare(
+					"SELECT option_value FROM {$this->db->options} WHERE option_name = %s",
+					self::OPTION_NAME
+				)
+			);
+
+			if ( null === $new_ver_raw || ! is_numeric( $new_ver_raw ) ) {
+				throw new DatabaseQueryException( 'Failed to verify updated variation cache version from database.' );
+			}
+
+			$new_version = max( 1, (int) $new_ver_raw );
+		} else {
+			// Fallback for non-table environments or testing stubs.
+			$new_version = $this->get_version() + 1;
+			if ( function_exists( 'update_option' ) ) {
+				$updated = update_option( self::OPTION_NAME, $new_version, false );
+				if ( false === $updated && $this->get_version() !== $new_version ) {
+					throw new DatabaseQueryException( 'Failed to update variation cache version option.' );
+				}
+			}
 		}
 
-		$this->cached_version = $new_ver;
-		return $new_ver;
+		// Ensure WordPress object caches and options caches are cleared to maintain coherence.
+		if ( function_exists( 'clean_option_cache' ) ) {
+			clean_option_cache( self::OPTION_NAME );
+		}
+		if ( function_exists( 'wp_cache_delete' ) ) {
+			wp_cache_delete( self::OPTION_NAME, 'options' );
+			wp_cache_delete( 'alloptions', 'options' );
+		}
+
+		$this->cached_version = $new_version;
+		return $new_version;
 	}
 
 	/**
@@ -120,6 +185,8 @@ class VariationPriceCacheInvalidator {
 	/**
 	 * Clean WooCommerce variation prices transient for a specific product.
 	 *
+	 * Supports persistent object cache through delete_transient() and native WooCommerce data stores.
+	 *
 	 * @param int $product_id Product ID.
 	 */
 	public function clean_product_transient( int $product_id ): void {
@@ -143,12 +210,20 @@ class VariationPriceCacheInvalidator {
 	}
 
 	/**
-	 * Delete all WooCommerce variation price transients in database.
+	 * Invalidate all WooCommerce variation price transients across database and persistent caches.
 	 *
-	 * Prevents unbounded persistent cache buildup after rule or group updates.
+	 * 1. Signals WooCommerce core via WC_Cache_Helper::get_transient_version('product', true)
+	 *    to invalidate product caches in persistent object stores (Redis/Memcached).
+	 * 2. Purges database transients from wp_options to prevent disk storage buildup.
 	 */
 	public function clean_all_variation_transients(): void {
-		if ( isset( $this->db->options ) && ! empty( $this->db->options ) ) {
+		// Invalidate WooCommerce persistent object cache group if available.
+		if ( class_exists( 'WC_Cache_Helper' ) ) {
+			\WC_Cache_Helper::get_transient_version( 'product', true );
+		}
+
+		// Purge transients in database.
+		if ( ! empty( $this->db->options ) ) {
 			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 			$this->db->query(
 				"DELETE FROM {$this->db->options} WHERE option_name LIKE '_transient_wc_var_prices_%' OR option_name LIKE '_transient_timeout_wc_var_prices_%'"

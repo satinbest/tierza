@@ -18,6 +18,7 @@ use RuntimeException;
 use Tierza\Application\Pricing\AuthoritativePriceCalculator;
 use Tierza\Application\Pricing\Batch\PricingBatchPrefetcher;
 use Tierza\Application\Pricing\Cache\RequestPricingCache;
+use Tierza\Application\Pricing\Cache\VariationPriceCacheInvalidator;
 use Tierza\Application\Pricing\DeterministicRuleResolver;
 use Tierza\Domain\Entities\PricingGroup;
 use Tierza\Domain\Entities\PricingRule;

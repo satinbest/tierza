@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tierza\Infrastructure\Repositories;
 
 use DateTimeImmutable;
+use Tierza\Application\Pricing\Cache\VariationPriceCacheInvalidator;
 use Tierza\Domain\Entities\UserGroupAssignment;
 use Tierza\Domain\Exceptions\InvalidAssignmentException;
 use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
@@ -23,6 +24,7 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 	private string $table_user_groups;
 	private EntityReferenceValidator $validator;
 	private ?PricingCacheInterface $cache;
+	private ?VariationPriceCacheInvalidator $variation_cache_invalidator;
 
 	/**
 	 * In-memory map of user_id => ?UserGroupAssignment for current request.
@@ -34,17 +36,23 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 	public function __construct(
 		?wpdb $db = null,
 		?EntityReferenceValidator $validator = null,
-		?PricingCacheInterface $cache = null
+		?PricingCacheInterface $cache = null,
+		?VariationPriceCacheInvalidator $variation_cache_invalidator = null
 	) {
 		global $wpdb;
-		$this->db                = $db ?? $GLOBALS['wpdb'];
-		$this->table_user_groups = Schema::user_groups_table( $this->db );
-		$this->validator         = $validator ?? new EntityReferenceValidator( $this->db );
-		$this->cache             = $cache;
+		$this->db                          = $db ?? $GLOBALS['wpdb'];
+		$this->table_user_groups           = Schema::user_groups_table( $this->db );
+		$this->validator                   = $validator ?? new EntityReferenceValidator( $this->db );
+		$this->cache                       = $cache;
+		$this->variation_cache_invalidator = $variation_cache_invalidator;
 	}
 
 	public function set_cache( ?PricingCacheInterface $cache ): void {
 		$this->cache = $cache;
+	}
+
+	public function set_variation_cache_invalidator( ?VariationPriceCacheInvalidator $invalidator ): void {
+		$this->variation_cache_invalidator = $invalidator;
 	}
 
 	public function cache(): ?PricingCacheInterface {
@@ -106,6 +114,7 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 		);
 		$this->user_assignments[ $user_id ] = $assigned;
 		$this->cache?->invalidate_customer( $user_id );
+		$this->variation_cache_invalidator?->invalidate_for_customer( $user_id );
 		return $assigned;
 	}
 
@@ -152,6 +161,7 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 		$assigned                           = $this->find_by_user_id( $user_id ) ?? $existing->reassign_to_group( $new_group_id );
 		$this->user_assignments[ $user_id ] = $assigned;
 		$this->cache?->invalidate_customer( $user_id );
+		$this->variation_cache_invalidator?->invalidate_for_customer( $user_id );
 		return $assigned;
 	}
 
@@ -228,6 +238,7 @@ final class WpUserGroupRepository implements UserGroupRepositoryInterface {
 		if ( $success ) {
 			unset( $this->user_assignments[ $user_id ] );
 			$this->cache?->invalidate_customer( $user_id );
+			$this->variation_cache_invalidator?->invalidate_for_customer( $user_id );
 		}
 
 		return $success;

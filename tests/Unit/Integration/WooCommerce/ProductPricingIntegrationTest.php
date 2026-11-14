@@ -244,9 +244,49 @@ class ProductPricingIntegrationTest extends TestCase {
 		$product->set_regular_price( '100.00' );
 		$product->set_price( '100.00' );
 
+		$action_fired = false;
+		if ( function_exists( 'add_action' ) ) {
+			add_action(
+				'tierza_pricing_calculation_failed',
+				function ( int $product_id, $e ) use ( &$action_fired ) {
+					$action_fired = true;
+				},
+				10,
+				2
+			);
+		}
+
 		// When failure occurs, it must return original price '100.00' safely!
 		$price = $integration->filter_product_price( '100.00', $product );
 		$this->assertSame( '100.00', $price );
+		$this->assertTrue( $action_fired, 'Failure hook tierza_pricing_calculation_failed must be fired!' );
+	}
+
+	public function test_safe_html_error_handling_falls_back(): void {
+		$failing_adapter = $this->createMock( ProductPricingAdapter::class );
+		$failing_adapter->method( 'get_price_html' )
+			->willThrowException( new RuntimeException( 'Simulated HTML rendering exception' ) );
+
+		$integration = new ProductPricingIntegration( $failing_adapter );
+
+		$product = new WC_Product( 101 );
+		$product->set_regular_price( '100.00' );
+
+		$action_fired = false;
+		if ( function_exists( 'add_action' ) ) {
+			add_action(
+				'tierza_pricing_html_failed',
+				function ( int $product_id, $e ) use ( &$action_fired ) {
+					$action_fired = true;
+				},
+				10,
+				2
+			);
+		}
+
+		$html = $integration->filter_price_html( '$100.00', $product );
+		$this->assertSame( '$100.00', $html );
+		$this->assertTrue( $action_fired, 'Failure hook tierza_pricing_html_failed must be fired!' );
 	}
 
 	public function test_scope_boundaries_protect_admin_and_import(): void {
@@ -277,6 +317,12 @@ class ProductPricingIntegrationTest extends TestCase {
 		$_REQUEST['action'] = 'woocommerce_save_variations';
 		$this->assertFalse( $this->integration->should_apply_pricing( $product ) );
 		unset( $_REQUEST['action'] );
+
+		// 6. CSV Product Export -> disallowed
+		$_GET['action'] = 'export_products';
+		$this->assertFalse( $this->integration->should_apply_pricing( $product ) );
+		unset( $_GET['action'] );
+
 		$wp_doing_ajax_mock = false;
 		$wp_is_admin        = false;
 	}

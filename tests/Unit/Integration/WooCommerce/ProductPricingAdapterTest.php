@@ -9,14 +9,17 @@ use PHPUnit\Framework\TestCase;
 use Tierza\Application\Pricing\AuthoritativePriceCalculator;
 use Tierza\Application\Pricing\Batch\PricingBatchPrefetcher;
 use Tierza\Application\Pricing\Cache\RequestPricingCache;
+use Tierza\Application\Pricing\Cache\VariationPriceCacheInvalidator;
 use Tierza\Application\Pricing\DeterministicRuleResolver;
 use Tierza\Domain\Entities\PricingGroup;
 use Tierza\Domain\Entities\PricingRule;
 use Tierza\Domain\Entities\UserGroupAssignment;
+use Tierza\Domain\Exceptions\InvalidMoneyException;
 use Tierza\Domain\Pricing\PricingContext;
 use Tierza\Domain\Pricing\PricingResult;
 use Tierza\Domain\Repositories\GroupRepositoryInterface;
 use Tierza\Domain\Repositories\UserGroupRepositoryInterface;
+use Tierza\Domain\ValueObjects\DecimalMath;
 use Tierza\Domain\ValueObjects\Money;
 use Tierza\Domain\ValueObjects\PricingValue;
 use Tierza\Domain\ValueObjects\RuleScope;
@@ -511,5 +514,200 @@ class ProductPricingAdapterTest extends TestCase {
 		$this->assertSame( '200.00', $this->adapter->get_adjusted_price( $p2, $customer_id ) );
 
 		$this->assertSame( 1, $this->rule_repo->query_count() );
+	}
+
+	public function test_bcmath_and_php_driver_parity(): void {
+		$customer_id = 42;
+		$product     = new WC_Product( 101 );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+
+		$this->rule_repo->save(
+			new PricingRule(
+				RuleTarget::user( $customer_id ),
+				RuleScope::product( 101 ),
+				PricingValue::percentage( '15.000000' )
+			)
+		);
+
+		// With pure-PHP driver
+		$this->adapter->set_math_driver( DecimalMath::DRIVER_PHP );
+		$this->adapter->enable_test_mode( true );
+		$php_price = $this->adapter->get_adjusted_price( $product, $customer_id );
+
+		// With BCMath driver (if extension loaded)
+		if ( extension_loaded( 'bcmath' ) ) {
+			$this->adapter->set_math_driver( DecimalMath::DRIVER_BCMATH );
+			$bc_price = $this->adapter->get_adjusted_price( $product, $customer_id );
+			$this->assertSame( $bc_price, $php_price );
+		}
+
+		$this->assertSame( '85.00', $php_price );
+	}
+
+	public function test_active_price_without_native_sale_is_honored_as_base(): void {
+		$customer_id = 42;
+		$product     = new WC_Product( 101 );
+		// Raw regular price is 100, but active unfiltered price is 90 (e.g. from custom plugin/import, no WC sale)
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '90.00' );
+		$product->set_sale_price( '' );
+
+		// 10% discount for customer
+		$this->rule_repo->save(
+			new PricingRule(
+				RuleTarget::user( $customer_id ),
+				RuleScope::product( 101 ),
+				PricingValue::percentage( '10.000000' )
+			)
+		);
+
+		$this->adapter->enable_test_mode( true );
+		// 90 - 10% = 81.00 (NOT 100 - 10% = 90.00!)
+		$price = $this->adapter->get_adjusted_price( $product, $customer_id );
+		$this->assertSame( '81.00', $price );
+	}
+
+	public function test_invalid_monetary_values_throw_exception(): void {
+		$product = new WC_Product( 101 );
+		$product->set_regular_price( 'invalid_price' );
+		$product->set_price( 'invalid_price' );
+
+		$this->expectException( InvalidMoneyException::class );
+		$this->adapter->get_pricing_context( $product );
+	}
+
+	public function test_genuine_zero_dollar_price_supported(): void {
+		$product = new WC_Product( 101 );
+		$product->set_regular_price( '0.00' );
+		$product->set_price( '0.00' );
+
+		$context = $this->adapter->get_pricing_context( $product );
+		$this->assertNotNull( $context );
+		$this->assertSame( '0.000000', $context->base_price()->amount() );
+
+		$price = $this->adapter->get_adjusted_price( $product );
+		$this->assertSame( '0.00', $price );
+	}
+
+	public function test_unpriced_product_returns_null_context_and_preserves_raw(): void {
+		$product = new WC_Product( 101 );
+		$product->set_regular_price( '' );
+		$product->set_price( '' );
+
+		$context = $this->adapter->get_pricing_context( $product );
+		$this->assertNull( $context );
+
+		$price = $this->adapter->get_adjusted_price( $product );
+		$this->assertSame( '', $price );
+	}
+
+	public function test_category_ancestor_inheritance_and_depth(): void {
+		global $wp_terms_mock, $wp_ancestors_mock;
+
+		// Category 1 = Electronics (root, depth 0)
+		// Category 2 = Computers (depth 1, parent 1)
+		// Category 3 = Laptops (depth 2, parent 2)
+		$wp_terms_mock[105] = [
+			new class() extends WP_Term {
+				public int $term_id = 3;
+			},
+		];
+		$wp_ancestors_mock[3] = [ 2, 1 ];
+		$wp_ancestors_mock[2] = [ 1 ];
+		$wp_ancestors_mock[1] = [];
+
+		$product = new WC_Product( 105 );
+		$product->set_regular_price( '1000.00' );
+		$product->set_price( '1000.00' );
+
+		$customer_id = 42;
+		$this->adapter->enable_test_mode( true );
+
+		// Rule 1: 10% discount on root Category 1 (depth 0)
+		$this->rule_repo->save(
+			new PricingRule(
+				RuleTarget::user( $customer_id ),
+				RuleScope::category( 1 ),
+				PricingValue::percentage( '10.000000' )
+			)
+		);
+
+		// Product assigned only to Category 3 should inherit Category 1 rule!
+		$this->assertSame( '900.00', $this->adapter->get_adjusted_price( $product, $customer_id ) );
+
+		// Rule 2: 25% discount on leaf Category 3 (depth 2)
+		$this->rule_repo->save(
+			new PricingRule(
+				RuleTarget::user( $customer_id ),
+				RuleScope::category( 3 ),
+				PricingValue::percentage( '25.000000' )
+			)
+		);
+
+		// Invalidate cache and reset adapter category cache to re-read terms
+		$this->cache->invalidate_rules();
+		$this->adapter->clear_runtime_cache();
+
+		// Category 3 rule (depth 2) wins over Category 1 rule (depth 0)!
+		$this->assertSame( '750.00', $this->adapter->get_adjusted_price( $product, $customer_id ) );
+	}
+
+	public function test_customer_impersonation_protection(): void {
+		global $current_user_id_mock, $wp_mock_user_caps;
+		$current_user_id_mock = 10;
+		$wp_mock_user_caps    = [ 'manage_woocommerce' => false ];
+
+		$this->adapter->enable_test_mode( false );
+
+		// Without permission or test mode, explicit customer ID 42 is discarded and authenticated user 10 is used
+		$resolved = $this->adapter->resolve_customer_id( 42 );
+		$this->assertSame( 10, $resolved );
+
+		// With test mode enabled, explicit customer ID is respected
+		$this->adapter->enable_test_mode( true );
+		$resolved_test = $this->adapter->resolve_customer_id( 42 );
+		$this->assertSame( 42, $resolved_test );
+
+		// With manage_woocommerce capability, explicit customer ID is respected even without test mode
+		$this->adapter->enable_test_mode( false );
+		$wp_mock_user_caps = [ 'manage_woocommerce' => true ];
+		$this->assertSame( 42, $this->adapter->resolve_customer_id( 42 ) );
+	}
+
+	public function test_zero_percent_rule_does_not_render_sale_strikethrough(): void {
+		$customer_id = 42;
+		$product     = new WC_Product( 101 );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+
+		// 0% discount rule
+		$this->rule_repo->save(
+			new PricingRule(
+				RuleTarget::user( $customer_id ),
+				RuleScope::product( 101 ),
+				PricingValue::percentage( '0.000000' )
+			)
+		);
+
+		$this->adapter->enable_test_mode( true );
+		$html = $this->adapter->get_price_html( '$100.00', $product, $customer_id );
+
+		// Final price is 100.00 which equals regular price 100.00 -> must NOT show <del> or sale markup!
+		$this->assertStringNotContainsString( '<del>', $html );
+		$this->assertSame( '$100.00', $html );
+	}
+
+	public function test_variation_prices_hash_data_contains_version(): void {
+		$invalidator = new VariationPriceCacheInvalidator();
+		$this->adapter->set_variation_cache_invalidator( $invalidator );
+
+		$hash = $this->adapter->get_variation_prices_hash_data();
+		$this->assertArrayHasKey( 'tierza_version', $hash );
+		$this->assertSame( 1, $hash['tierza_version'] );
+
+		$invalidator->increment_version();
+		$hash_updated = $this->adapter->get_variation_prices_hash_data();
+		$this->assertSame( 2, $hash_updated['tierza_version'] );
 	}
 }

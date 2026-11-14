@@ -114,3 +114,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Playwright E2E browser test suite (`tests/e2e/storefront-pricing.spec.ts`) verifying live storefront price display for guests, wholesale B2B users, and incognito sessions (TRZ-010).
 - Dedicated architecture guide (`docs/architecture/woocommerce-product-integration.md`) (TRZ-010).
 - Expanded automated test suite to 529 PHPUnit tests (5,459 assertions), 52 live MariaDB integration tests (654 assertions), and 7 Playwright E2E tests passing at 100% (TRZ-010).
+- Hardened WooCommerce product pricing integration against critical review findings (TRZ-010):
+  - Removed all direct `bccomp()` dependencies in `ProductPricingAdapter`, replacing them with `DecimalMath::comp()` with pure-PHP driver parity for minimal shared hosting compatibility.
+  - Implemented cross-request variation price transient cache invalidator (`VariationPriceCacheInvalidator`), purging `_transient_wc_var_prices_*` and incrementing atomic cache versions on rule saves/deletions, group status toggles, and user group assignments/reassignments.
+  - Resolved category taxonomy hierarchy inheritance by traversing all term ancestors via `get_ancestors('product_cat')`, assigning correct hierarchy depths for PRD-compliant category rule resolution.
+  - Hardened customer impersonation protection: strictly rejected storefront customer overrides, restricting test customer overrides to isolated test environments via `can_override_customer_identity()`.
+  - Suppressed misleading `<del>` strikethrough markup in `get_price_html()` when 0% discount rules apply or when final calculated price equals regular price.
+  - Hardened active base price acquisition: strictly validated numeric strings, threw `InvalidMoneyException` on malformed amounts, and correctly distinguished unpriced products from genuine $0.00 free items.
+  - Hardened execution context boundary filters: strictly confined pricing calculation to storefront, customer AJAX, and Store API GET requests, bypassing admin saves, CSV exports, webhooks, and REST mutations.
+  - Safe error containment and observability: caught calculation/HTML exceptions without credential leaks, triggered `tierza_pricing_calculation_failed` and `tierza_pricing_html_failed` actions, and failed closed to raw prices.
+  - Expanded automated test suite to 545 PHPUnit tests (5,493 assertions), 53 live MariaDB integration tests (662 assertions), and 7 Playwright E2E tests passing at 100% (TRZ-010).

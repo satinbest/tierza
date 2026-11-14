@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Tierza\Integration\WooCommerce;
 
 use Tierza\Application\Pricing\Batch\PricingBatchPrefetcherInterface;
+use Tierza\Application\Pricing\Cache\VariationPriceCacheInvalidator;
 use Tierza\Domain\Entities\PricingGroup;
+use Tierza\Domain\Exceptions\InvalidMoneyException;
 use Tierza\Domain\Pricing\Contracts\PriceCalculatorInterface;
 use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
 use Tierza\Domain\Pricing\Contracts\RuleResolverInterface;
@@ -13,6 +15,7 @@ use Tierza\Domain\Pricing\PricingContext;
 use Tierza\Domain\Pricing\PricingResult;
 use Tierza\Domain\Repositories\GroupRepositoryInterface;
 use Tierza\Domain\Repositories\UserGroupRepositoryInterface;
+use Tierza\Domain\ValueObjects\DecimalMath;
 use Tierza\Domain\ValueObjects\Money;
 use WC_Product;
 use WC_Product_Variation;
@@ -39,21 +42,26 @@ class ProductPricingAdapter {
 	private array $category_cache = [];
 
 	/**
-	 * In-memory map of customer_id => ?PricingGroup for current request.
-	 *
-	 * @var array<int, ?PricingGroup>
+	 * Whether the adapter is running in test/diagnostic mode (allowing customer identity simulation).
 	 */
-	private array $customer_groups = [];
+	private bool $test_mode = false;
+
+	/**
+	 * Explicit test customer ID override for testing environments.
+	 */
+	private ?int $test_customer_id = null;
 
 	/**
 	 * Constructor.
 	 *
-	 * @param RuleResolverInterface                $rule_resolver          Authoritative rule resolver.
-	 * @param PriceCalculatorInterface             $price_calculator       Authoritative price calculator.
-	 * @param GroupRepositoryInterface             $group_repository       Group persistence repository.
-	 * @param UserGroupRepositoryInterface         $user_group_repository  User-group assignment repository.
-	 * @param PricingCacheInterface                $cache                  Request-scoped pricing cache.
-	 * @param PricingBatchPrefetcherInterface|null $batch_prefetcher       Optional batch prefetch service.
+	 * @param RuleResolverInterface                $rule_resolver               Authoritative rule resolver.
+	 * @param PriceCalculatorInterface             $price_calculator            Authoritative price calculator.
+	 * @param GroupRepositoryInterface             $group_repository            Group persistence repository.
+	 * @param UserGroupRepositoryInterface         $user_group_repository       User-group assignment repository.
+	 * @param PricingCacheInterface                $cache                       Request-scoped pricing cache.
+	 * @param PricingBatchPrefetcherInterface|null $batch_prefetcher            Optional batch prefetch service.
+	 * @param VariationPriceCacheInvalidator|null  $variation_cache_invalidator Optional variation price cache invalidator.
+	 * @param string|null                          $math_driver                 Optional arithmetic driver ('bcmath', 'php', or null for auto).
 	 */
 	public function __construct(
 		private readonly RuleResolverInterface $rule_resolver,
@@ -61,8 +69,37 @@ class ProductPricingAdapter {
 		private readonly GroupRepositoryInterface $group_repository,
 		private readonly UserGroupRepositoryInterface $user_group_repository,
 		private readonly PricingCacheInterface $cache,
-		private readonly ?PricingBatchPrefetcherInterface $batch_prefetcher = null
+		private readonly ?PricingBatchPrefetcherInterface $batch_prefetcher = null,
+		private ?VariationPriceCacheInvalidator $variation_cache_invalidator = null,
+		private ?string $math_driver = null
 	) {}
+
+	public function set_variation_cache_invalidator( ?VariationPriceCacheInvalidator $invalidator ): void {
+		$this->variation_cache_invalidator = $invalidator;
+	}
+
+	public function set_math_driver( ?string $driver ): void {
+		$this->math_driver = $driver;
+	}
+
+	public function set_test_customer_id( ?int $id ): void {
+		$this->test_customer_id = $id;
+	}
+
+	public function enable_test_mode( bool $enabled = true ): void {
+		$this->test_mode = $enabled;
+	}
+
+	public function can_override_customer_identity(): bool {
+		if ( $this->test_mode ) {
+			return true;
+		}
+		// phpcs:ignore WordPress.WP.Capabilities.Unknown
+		if ( function_exists( 'current_user_can' ) && current_user_can( 'manage_woocommerce' ) ) {
+			return true;
+		}
+		return false;
+	}
 
 	/**
 	 * Obtain calculated B2B price for a WooCommerce product.
@@ -112,10 +149,32 @@ class ProductPricingAdapter {
 		$raw_reg   = (string) $product->get_regular_price( 'edit' );
 		$raw_sale  = (string) $product->get_sale_price( 'edit' );
 
-		// If product has no price set in WooCommerce, return null.
+		// If product has no price set in WooCommerce (both price and regular price are empty strings), return null.
 		if ( '' === $raw_price && '' === $raw_reg ) {
 			return null;
 		}
+
+		// Validate raw monetary values strictly to reject malformed data early.
+		if ( '' !== $raw_price && ! DecimalMath::is_valid( $raw_price ) ) {
+			throw new InvalidMoneyException(
+				sprintf( 'Product #%d has invalid price "%s".', $product->get_id(), $raw_price )
+			);
+		}
+
+		if ( '' !== $raw_reg && ! DecimalMath::is_valid( $raw_reg ) ) {
+			throw new InvalidMoneyException(
+				sprintf( 'Product #%d has invalid regular price "%s".', $product->get_id(), $raw_reg )
+			);
+		}
+
+		if ( '' !== $raw_sale && ! DecimalMath::is_valid( $raw_sale ) ) {
+			throw new InvalidMoneyException(
+				sprintf( 'Product #%d has invalid sale price "%s".', $product->get_id(), $raw_sale )
+			);
+		}
+
+		// Base price candidate: unfiltered active price is primary; fall back to regular price if empty.
+		$base_price_candidate = '' !== $raw_price ? $raw_price : $raw_reg;
 
 		// Establish product and variation relationship.
 		$variation_id = null;
@@ -148,19 +207,16 @@ class ProductPricingAdapter {
 		// Native WooCommerce sale awareness.
 		$is_native_sale = $this->is_product_on_sale( $product, $raw_reg, $raw_sale );
 
-		if ( $is_native_sale && '' !== $raw_sale && is_numeric( $raw_sale ) ) {
+		if ( $is_native_sale && '' !== $raw_sale ) {
 			// When active native sale exists, percentage discounts apply to the active sale price.
 			$base_price    = Money::from( $raw_sale, $currency );
-			$regular_price = '' !== $raw_reg && is_numeric( $raw_reg ) ? Money::from( $raw_reg, $currency ) : null;
+			$regular_price = '' !== $raw_reg ? Money::from( $raw_reg, $currency ) : null;
 			$sale_price    = Money::from( $raw_sale, $currency );
 			$is_on_sale    = true;
 		} else {
-			$base_price_str = '' !== $raw_reg && is_numeric( $raw_reg ) ? $raw_reg : $raw_price;
-			if ( '' === $base_price_str || ! is_numeric( $base_price_str ) ) {
-				return null;
-			}
-			$base_price    = Money::from( $base_price_str, $currency );
-			$regular_price = '' !== $raw_reg && is_numeric( $raw_reg ) ? Money::from( $raw_reg, $currency ) : null;
+			// When not on native sale, active price (even if different from regular price) is the base candidate.
+			$base_price    = Money::from( $base_price_candidate, $currency );
+			$regular_price = '' !== $raw_reg ? Money::from( $raw_reg, $currency ) : null;
 			$sale_price    = null;
 			$is_on_sale    = false;
 		}
@@ -244,20 +300,23 @@ class ProductPricingAdapter {
 
 		$final_price = $result->final_price()->amount();
 		$reg_money   = $context->regular_price();
+		$decimals    = $context->currency_decimals();
 		$suffix      = $product->get_price_suffix();
+		$price_args  = [ 'decimals' => $decimals ];
 
-		// If a discount was applied relative to the regular price, show strike-through sale style.
-		if ( null !== $reg_money && bccomp( $reg_money->amount(), $final_price, 6 ) > 0 ) {
+		// If a discount was applied relative to the regular price, show strike-through sale style,
+		// UNLESS the final price equals the regular price (e.g. an explicit 0% discount rule).
+		if ( null !== $reg_money && DecimalMath::comp( $reg_money->amount(), $final_price, $decimals, $this->math_driver ) > 0 ) {
 			if ( function_exists( 'wc_format_sale_price' ) && function_exists( 'wc_price' ) ) {
-				$formatted_reg   = wc_price( (float) $reg_money->amount() );
-				$formatted_final = wc_price( (float) $final_price );
+				$formatted_reg   = wc_price( $reg_money->amount(), $price_args );
+				$formatted_final = wc_price( $final_price, $price_args );
 				return wc_format_sale_price( $formatted_reg, $formatted_final ) . $suffix;
 			}
 		}
 
-		// Standard price formatting.
+		// Standard price formatting without float conversion.
 		if ( function_exists( 'wc_price' ) ) {
-			return wc_price( (float) $final_price ) . $suffix;
+			return wc_price( $final_price, $price_args ) . $suffix;
 		}
 
 		return $original_html;
@@ -335,6 +394,7 @@ class ProductPricingAdapter {
 			'tierza_customer_id' => $resolved_customer_id,
 			'tierza_group_id'    => $resolved_group?->id() ?? 0,
 			'tierza_is_active'   => $resolved_group?->is_active() ?? false,
+			'tierza_version'     => $this->variation_cache_invalidator?->get_version() ?? 1,
 		];
 	}
 
@@ -342,14 +402,23 @@ class ProductPricingAdapter {
 	 * Establish current trusted customer ID.
 	 *
 	 * Derived strictly from WordPress authentication state; never trusts
-	 * query parameters or user-submitted input.
+	 * query parameters or user-submitted input in production storefront contexts.
+	 * Explicit overrides are permitted only when can_override_customer_identity() is true.
 	 *
 	 * @param int|null $explicit_id Optional explicit customer ID.
 	 * @return int Positive user ID or 0 for guest.
 	 */
 	public function resolve_customer_id( ?int $explicit_id = null ): int {
-		if ( null !== $explicit_id && $explicit_id >= 0 ) {
-			return $explicit_id;
+		if ( null !== $this->test_customer_id ) {
+			return max( 0, $this->test_customer_id );
+		}
+
+		if ( null !== $explicit_id ) {
+			if ( $this->can_override_customer_identity() ) {
+				return max( 0, $explicit_id );
+			}
+			// Security boundary: unauthorized impersonation attempts are discarded in production storefront.
+			return function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
 		}
 
 		if ( function_exists( 'get_current_user_id' ) ) {
@@ -370,13 +439,8 @@ class ProductPricingAdapter {
 			return null;
 		}
 
-		if ( array_key_exists( $customer_id, $this->customer_groups ) ) {
-			return $this->customer_groups[ $customer_id ];
-		}
-
 		$assignment = $this->user_group_repository->find_by_user_id( $customer_id );
 		if ( null === $assignment ) {
-			$this->customer_groups[ $customer_id ] = null;
 			return null;
 		}
 
@@ -386,10 +450,8 @@ class ProductPricingAdapter {
 		$cached_status = $this->cache->get_group_status( $group_id );
 		if ( null !== $cached_status ) {
 			if ( $cached_status['exists'] && $cached_status['is_active'] && null !== $cached_status['group'] ) {
-				$this->customer_groups[ $customer_id ] = $cached_status['group'];
 				return $cached_status['group'];
 			}
-			$this->customer_groups[ $customer_id ] = null;
 			return null;
 		}
 
@@ -400,9 +462,7 @@ class ProductPricingAdapter {
 
 		$this->cache->set_group_status( $group_id, $exists, $is_active, $is_active ? $group : null );
 
-		$resolved                              = $is_active ? $group : null;
-		$this->customer_groups[ $customer_id ] = $resolved;
-		return $resolved;
+		return $is_active ? $group : null;
 	}
 
 	/**
@@ -417,16 +477,16 @@ class ProductPricingAdapter {
 	 * @return bool True if active native sale is ongoing.
 	 */
 	private function is_product_on_sale( WC_Product $product, string $raw_reg_price, string $raw_sale_price ): bool {
-		if ( '' === $raw_sale_price || ! is_numeric( $raw_sale_price ) ) {
+		if ( '' === $raw_sale_price || ! DecimalMath::is_valid( $raw_sale_price ) ) {
 			return false;
 		}
 
-		if ( '' === $raw_reg_price || ! is_numeric( $raw_reg_price ) ) {
+		if ( '' === $raw_reg_price || ! DecimalMath::is_valid( $raw_reg_price ) ) {
 			return false;
 		}
 
 		// Sale price must be strictly lower than regular price.
-		if ( bccomp( $raw_reg_price, $raw_sale_price, 6 ) <= 0 ) {
+		if ( DecimalMath::comp( $raw_reg_price, $raw_sale_price, 6, $this->math_driver ) <= 0 ) {
 			return false;
 		}
 
@@ -449,6 +509,10 @@ class ProductPricingAdapter {
 	/**
 	 * Extract product category IDs and taxonomy hierarchy depths.
 	 *
+	 * Products assigned only to a leaf/child category automatically inherit rules defined
+	 * on ancestor categories (parent, grandparent, etc.), with depths accurately recorded
+	 * to ensure leaf rules take precedence according to Tierza's 9-level resolution hierarchy.
+	 *
 	 * @param int $product_id Main product post ID.
 	 * @return array{0: int[], 1: array<int, int>} [ category_ids, category_depths ]
 	 */
@@ -463,7 +527,7 @@ class ProductPricingAdapter {
 
 		/** @var array<mixed>|false $terms */
 		$terms = get_the_terms( $product_id, 'product_cat' );
-		if ( ! is_array( $terms ) || empty( $terms ) ) {
+		if ( ( function_exists( 'is_wp_error' ) && is_wp_error( $terms ) ) || ! is_array( $terms ) || empty( $terms ) ) {
 			$this->category_cache[ $product_id ] = [ [], [] ];
 			return $this->category_cache[ $product_id ];
 		}
@@ -475,14 +539,30 @@ class ProductPricingAdapter {
 			if ( ! $term instanceof WP_Term ) {
 				continue;
 			}
-			$cid            = (int) $term->term_id;
-			$category_ids[] = $cid;
+			$cid = (int) $term->term_id;
+			if ( $cid <= 0 ) {
+				continue;
+			}
 
 			// In WordPress, count( get_ancestors( $cid, 'product_cat' ) ) gives taxonomy depth.
-			/** @var array<int> $ancestors */
-			$ancestors               = function_exists( 'get_ancestors' ) ? (array) get_ancestors( $cid, 'product_cat' ) : [];
-			$depth                   = count( $ancestors );
-			$category_depths[ $cid ] = $depth;
+			$ancestors    = function_exists( 'get_ancestors' ) ? (array) get_ancestors( $cid, 'product_cat' ) : [];
+			$ancestor_ids = array_map( 'intval', $ancestors );
+			$depth        = count( $ancestor_ids );
+
+			$category_ids[]          = $cid;
+			$category_depths[ $cid ] = isset( $category_depths[ $cid ] ) ? max( $category_depths[ $cid ], $depth ) : $depth;
+
+			// Traverse all ancestors so child category products inherit parent category rules.
+			foreach ( $ancestor_ids as $anc_id ) {
+				if ( $anc_id <= 0 ) {
+					continue;
+				}
+				$category_ids[] = $anc_id;
+				if ( ! isset( $category_depths[ $anc_id ] ) ) {
+					$anc_ancestors              = function_exists( 'get_ancestors' ) ? (array) get_ancestors( $anc_id, 'product_cat' ) : [];
+					$category_depths[ $anc_id ] = count( array_map( 'intval', $anc_ancestors ) );
+				}
+			}
 		}
 
 		$category_ids = array_values( array_unique( $category_ids ) );
@@ -495,8 +575,7 @@ class ProductPricingAdapter {
 	 * Reset in-memory adapter request caches.
 	 */
 	public function clear_runtime_cache(): void {
-		$this->category_cache  = [];
-		$this->customer_groups = [];
+		$this->category_cache = [];
 	}
 
 	/**

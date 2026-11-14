@@ -23,6 +23,29 @@ if ( ! class_exists( 'WP_Term' ) ) {
 	}
 }
 
+if ( ! class_exists( 'WP_Error' ) ) {
+	class WP_Error {
+		/** @var array<string, array<string>> */
+		public array $errors = [];
+
+		public function __construct( string $code = '', string $message = '' ) {
+			if ( '' !== $code ) {
+				$this->errors[ $code ][] = $message;
+			}
+		}
+
+		public function get_error_message(): string {
+			return reset( $this->errors )[0] ?? '';
+		}
+	}
+}
+
+if ( ! function_exists( 'is_wp_error' ) ) {
+	function is_wp_error( mixed $thing ): bool {
+		return $thing instanceof WP_Error;
+	}
+}
+
 if ( ! class_exists( 'WP_Query' ) ) {
 	class WP_Query {
 		/** @var array<WP_Post|int> */

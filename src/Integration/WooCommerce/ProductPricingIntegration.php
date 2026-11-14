@@ -112,6 +112,9 @@ class ProductPricingIntegration {
 			return $this->adapter->get_adjusted_price( $product );
 		} catch ( Throwable $e ) {
 			$this->log_error( 'Failed to calculate Tierza price for product #' . $product_id, $e );
+			if ( function_exists( 'do_action' ) ) {
+				do_action( 'tierza_pricing_calculation_failed', $product_id, $e );
+			}
 			return (string) $price;
 		} finally {
 			unset( $this->active_resolutions[ $product_id ] );
@@ -179,6 +182,9 @@ class ProductPricingIntegration {
 			return $this->adapter->get_price_html( (string) $price_html, $product );
 		} catch ( Throwable $e ) {
 			$this->log_error( 'Failed to format price HTML for product #' . $product->get_id(), $e );
+			if ( function_exists( 'do_action' ) ) {
+				do_action( 'tierza_pricing_html_failed', (int) $product->get_id(), $e );
+			}
 			return (string) $price_html;
 		}
 	}
@@ -259,8 +265,29 @@ class ProductPricingIntegration {
 			return false;
 		}
 
-		// 2. Prevent interference during WooCommerce product import or export.
+		// 2. Prevent interference during WooCommerce product import, restore, or batch export.
 		if ( defined( 'WC_DOING_PRODUCT_IMPORT' ) && WC_DOING_PRODUCT_IMPORT ) {
+			return false;
+		}
+
+		if ( defined( 'WC_DOING_PRODUCT_RESTORE' ) && WC_DOING_PRODUCT_RESTORE ) {
+			return false;
+		}
+
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended
+		$raw_get_action = '';
+		if ( isset( $_GET['action'] ) && is_string( $_GET['action'] ) ) {
+			$unslashed_get_action = wp_unslash( $_GET['action'] );
+			if ( is_string( $unslashed_get_action ) ) {
+				$raw_get_action = sanitize_text_field( $unslashed_get_action );
+			}
+		}
+		if ( in_array( $raw_get_action, [ 'export_products', 'woocommerce_do_ajax_product_export' ], true ) ) {
+			return false;
+		}
+
+		// Prevent modifying prices during webhook delivery or background synchronization.
+		if ( function_exists( 'did_action' ) && did_action( 'woocommerce_webhook_delivery' ) ) {
 			return false;
 		}
 
@@ -273,24 +300,42 @@ class ProductPricingIntegration {
 		if ( is_admin() ) {
 			// Frontend AJAX requests require pricing (e.g. variation selections, cart fragments).
 			if ( wp_doing_ajax() ) {
-				// Admin AJAX saving actions must not filter prices.
-				// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-				$raw_action = $_REQUEST['action'] ?? '';
-				if ( is_string( $raw_action ) && '' !== $raw_action ) {
+				$raw_action = '';
+				if ( isset( $_REQUEST['action'] ) && is_string( $_REQUEST['action'] ) ) {
+					$unslashed_action = wp_unslash( $_REQUEST['action'] );
+					if ( is_string( $unslashed_action ) ) {
+						$raw_action = sanitize_text_field( $unslashed_action );
+					}
+				}
+				if ( '' !== $raw_action ) {
 					$admin_actions = [
 						'woocommerce_save_variations',
 						'woocommerce_add_variation',
+						'woocommerce_bulk_edit_variations',
 						'inline-save',
 						'editpost',
+						'save-post',
 					];
-					$unslashed     = wp_unslash( $raw_action );
-					if ( is_string( $unslashed ) ) {
-						$action = sanitize_text_field( $unslashed );
-						if ( in_array( $action, $admin_actions, true ) ) {
-							return false;
-						}
+					if ( in_array( $raw_action, $admin_actions, true ) ) {
+						return false;
 					}
 				}
+
+				// If caller has product edit capability and referer is an admin editing screen, do not filter.
+				// phpcs:ignore WordPress.WP.Capabilities.Unknown
+				if ( function_exists( 'current_user_can' ) && current_user_can( 'edit_products' ) ) {
+					$referer = '';
+					if ( isset( $_SERVER['HTTP_REFERER'] ) && is_string( $_SERVER['HTTP_REFERER'] ) ) {
+						$unslashed_referer = wp_unslash( $_SERVER['HTTP_REFERER'] );
+						if ( is_string( $unslashed_referer ) ) {
+							$referer = sanitize_text_field( $unslashed_referer );
+						}
+					}
+					if ( '' !== $referer && false !== strpos( $referer, '/wp-admin/' ) && false !== strpos( $referer, 'post.php' ) ) {
+						return false;
+					}
+				}
+
 				return true;
 			}
 
@@ -305,12 +350,32 @@ class ProductPricingIntegration {
 
 		// 5. REST API context boundaries.
 		if ( defined( 'REST_REQUEST' ) && REST_REQUEST ) {
+			$method = 'GET';
+			if ( isset( $_SERVER['REQUEST_METHOD'] ) && is_string( $_SERVER['REQUEST_METHOD'] ) ) {
+				$unslashed_method = wp_unslash( $_SERVER['REQUEST_METHOD'] );
+				if ( is_string( $unslashed_method ) ) {
+					$method = strtoupper( sanitize_text_field( $unslashed_method ) );
+				}
+			}
+			// Non-GET REST operations (POST, PUT, PATCH, DELETE) write to the database or mutate orders; do not filter product prices to avoid corrupting catalog data.
+			if ( 'GET' !== $method && 'HEAD' !== $method ) {
+				return false;
+			}
+
 			// If request context is 'edit' and caller is an admin, preserve database prices.
-			// phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.WP.Capabilities.Unknown
-			if ( isset( $_GET['context'] ) && 'edit' === $_GET['context'] && current_user_can( 'manage_woocommerce' ) ) {
+			$context = '';
+			if ( isset( $_GET['context'] ) && is_string( $_GET['context'] ) ) {
+				$unslashed_context = wp_unslash( $_GET['context'] );
+				if ( is_string( $unslashed_context ) ) {
+					$context = sanitize_text_field( $unslashed_context );
+				}
+			}
+			// phpcs:ignore WordPress.WP.Capabilities.Unknown
+			if ( 'edit' === $context && function_exists( 'current_user_can' ) && current_user_can( 'manage_woocommerce' ) ) {
 				return false;
 			}
 		}
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
 
 		return true;
 	}
@@ -325,7 +390,7 @@ class ProductPricingIntegration {
 	}
 
 	/**
-	 * Safely log error without leaking sensitive SQL or internals.
+	 * Safely log error without leaking sensitive SQL, passwords, or internal tokens.
 	 *
 	 * @param string    $message Safe log message.
 	 * @param Throwable $e       Caught exception.
@@ -334,8 +399,9 @@ class ProductPricingIntegration {
 		if ( function_exists( 'wc_get_logger' ) ) {
 			$logger = wc_get_logger();
 			if ( method_exists( $logger, 'error' ) ) {
+				$safe_detail = (string) preg_replace( '/(password|pwd|secret|token)=[^&\\s]+/i', '$1=***', $e->getMessage() );
 				$logger->error(
-					sprintf( '%s: %s', $message, $e->getMessage() ),
+					sprintf( '%s: %s', $message, $safe_detail ),
 					[ 'source' => 'tierza-pricing' ]
 				);
 			}

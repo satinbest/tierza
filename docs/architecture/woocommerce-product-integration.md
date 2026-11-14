@@ -71,28 +71,53 @@ Registers and manages all WooCommerce WordPress hooks with strict safety boundar
 ## 4. Security & Isolation Guarantees
 
 ### Customer Identity Verification
-Customer identity is strictly derived from verified WordPress session authentication:
+Customer identity is strictly derived from verified WordPress session authentication in production storefront requests. Explicit customer overrides are strictly restricted to authorized administrators (`manage_woocommerce`) or isolated test environments (`can_override_customer_identity()`):
 ```php
 public function resolve_customer_id( ?int $explicit_id = null ): int {
-    if ( null !== $explicit_id && $explicit_id > 0 ) {
-        return $explicit_id;
+    if ( null !== $this->test_customer_id ) {
+        return max( 0, $this->test_customer_id );
     }
+
+    if ( null !== $explicit_id ) {
+        if ( $this->can_override_customer_identity() ) {
+            return max( 0, $explicit_id );
+        }
+        // Security boundary: unauthorized client overrides discarded in storefront.
+        return function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0;
+    }
+
     if ( function_exists( 'get_current_user_id' ) ) {
         return (int) get_current_user_id();
     }
+
     return 0;
 }
 ```
 Query parameters, headers, or client requests are never trusted to impersonate customer groups.
 
-### Variation Cache Segregation
-WooCommerce variable products cache price ranges in WordPress transients using `wc_var_prices_{$product_id}`. Without isolation, Customer A (Wholesale) viewing a product would populate the transient with wholesale prices, which would subsequently be served to guest visitors!
+### Variation Cache Segregation & Invalidation
+WooCommerce variable products cache price ranges in WordPress transients using `wc_var_prices_{$product_id}`.
+Tierza ensures zero cross-customer leakage and immediate invalidation across mutations via `VariationPriceCacheInvalidator`:
+1. **Hash Segregation (`woocommerce_get_variation_prices_hash`):**
+   Appends customer ID, group ID, active status, and the current atomic `tierza_version` to the transient hash.
+2. **Transient Purging on Mutations:**
+   Whenever a pricing rule, group status, or customer assignment is created, updated, or removed:
+   - The atomic version counter in options (`tierza_var_price_version`) is incremented.
+   - Associated transients (`_transient_wc_var_prices_*`) are actively purged, preventing unbounded database bloat and ensuring instant updates even with external persistent object caches (Redis/Memcached).
 
-Tierza hooks into `woocommerce_get_variation_prices_hash` to append user-group identity:
-```php
-add_filter( 'woocommerce_get_variation_prices_hash', [ $this, 'filter_variation_prices_hash' ], 10, 3 );
-```
-This guarantees separate transient caches for guests, individual customers, and B2B pricing groups.
+### Pure-PHP Fallback & Shared Hosting Compatibility
+Direct BCMath functions (`bccomp`) have been completely eliminated from the integration adapter and replaced with `DecimalMath::comp()`. Tierza guarantees 100% calculation and rounding fidelity on minimal shared hosting platforms lacking the PHP `ext-bcmath` extension.
+
+### Category Hierarchy Ancestor Inheritance
+Products assigned only to child categories automatically traverse their taxonomy tree using `get_ancestors()`:
+- Ancestor category IDs (parent, grandparent, etc.) are included in the pricing context.
+- Exact taxonomy depths are computed to guarantee that more specific child category rules override parent category rules according to Tierza's 9-level resolution hierarchy.
+
+### Fail-Closed Production Error Handling
+If an unexpected runtime failure or database exception occurs during price calculation:
+- Tierza fails closed to the product's original raw price (never $0.00).
+- Safe error logging sanitizes messages and strips passwords, database prefixes, or internal tokens.
+- Fires `tierza_pricing_calculation_failed` or `tierza_pricing_html_failed` action hooks for monitoring and alerting.
 
 ---
 

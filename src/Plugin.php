@@ -8,6 +8,7 @@ use Tierza\Admin\AdminMenu;
 use Tierza\Application\Pricing\AuthoritativePriceCalculator;
 use Tierza\Application\Pricing\Batch\PricingBatchPrefetcher;
 use Tierza\Application\Pricing\Cache\RequestPricingCache;
+use Tierza\Application\Pricing\Cache\VariationPriceCacheInvalidator;
 use Tierza\Application\Pricing\DeterministicRuleResolver;
 use Tierza\Domain\Pricing\Contracts\PricingCacheInterface;
 use Tierza\Domain\Repositories\GroupRepositoryInterface;
@@ -39,12 +40,13 @@ final class Plugin {
 	/**
 	 * Repository, cache, and pricing integration instances.
 	 */
-	private ?GroupRepositoryInterface $group_repository          = null;
-	private ?RuleRepositoryInterface $rule_repository            = null;
-	private ?UserGroupRepositoryInterface $user_group_repository = null;
-	private ?PricingCacheInterface $pricing_cache                = null;
-	private ?ProductPricingAdapter $pricing_adapter              = null;
-	private ?ProductPricingIntegration $pricing_integration      = null;
+	private ?GroupRepositoryInterface $group_repository                  = null;
+	private ?RuleRepositoryInterface $rule_repository                    = null;
+	private ?UserGroupRepositoryInterface $user_group_repository         = null;
+	private ?PricingCacheInterface $pricing_cache                        = null;
+	private ?VariationPriceCacheInvalidator $variation_cache_invalidator = null;
+	private ?ProductPricingAdapter $pricing_adapter                      = null;
+	private ?ProductPricingIntegration $pricing_integration              = null;
 
 	/**
 	 * Whether the plugin has been initialized.
@@ -117,10 +119,11 @@ final class Plugin {
 		Schema::maybe_upgrade();
 
 		// Instantiate cache and repositories.
-		$this->pricing_cache         = new RequestPricingCache();
-		$this->group_repository      = new WpGroupRepository( null, $this->pricing_cache );
-		$this->rule_repository       = new WpRuleRepository( null, null, $this->pricing_cache );
-		$this->user_group_repository = new WpUserGroupRepository( null, null, $this->pricing_cache );
+		$this->pricing_cache               = new RequestPricingCache();
+		$this->variation_cache_invalidator = new VariationPriceCacheInvalidator();
+		$this->group_repository            = new WpGroupRepository( null, $this->pricing_cache, $this->variation_cache_invalidator );
+		$this->rule_repository             = new WpRuleRepository( null, null, $this->pricing_cache, $this->variation_cache_invalidator );
+		$this->user_group_repository       = new WpUserGroupRepository( null, null, $this->pricing_cache, $this->variation_cache_invalidator );
 
 		// Instantiate pricing engine & WooCommerce product integration.
 		$resolver         = new DeterministicRuleResolver( $this->rule_repository, $this->group_repository, $this->pricing_cache );
@@ -133,7 +136,8 @@ final class Plugin {
 			$this->group_repository,
 			$this->user_group_repository,
 			$this->pricing_cache,
-			$batch_prefetcher
+			$batch_prefetcher,
+			$this->variation_cache_invalidator
 		);
 		$this->pricing_integration = new ProductPricingIntegration( $this->pricing_adapter );
 		$this->pricing_integration->register();
@@ -254,6 +258,13 @@ final class Plugin {
 	 */
 	public function get_pricing_cache(): ?PricingCacheInterface {
 		return $this->pricing_cache;
+	}
+
+	/**
+	 * Get variation price cache invalidator.
+	 */
+	public function get_variation_cache_invalidator(): ?VariationPriceCacheInvalidator {
+		return $this->variation_cache_invalidator;
 	}
 
 	/**

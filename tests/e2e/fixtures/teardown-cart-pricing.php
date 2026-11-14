@@ -36,4 +36,29 @@ if ( $user ) {
 $wpdb->query( "DELETE FROM {$wpdb->prefix}tierza_rules WHERE active_key LIKE 'group:%'" );
 $wpdb->query( "DELETE FROM {$wpdb->prefix}tierza_groups WHERE slug LIKE 'e2e-cart-b2b-group%'" );
 
+// Restore original cart & checkout page content
+$cart_pid = wc_get_page_id( 'cart' );
+if ( $cart_pid > 0 ) {
+	$orig_cart = get_post_meta( $cart_pid, '_tierza_e2e_orig_content', true );
+	if ( $orig_cart ) {
+		wp_update_post( [
+			'ID'           => $cart_pid,
+			'post_content' => $orig_cart,
+		] );
+		delete_post_meta( $cart_pid, '_tierza_e2e_orig_content' );
+	}
+}
+
+$checkout_pid = wc_get_page_id( 'checkout' );
+if ( $checkout_pid > 0 ) {
+	$orig_checkout = get_post_meta( $checkout_pid, '_tierza_e2e_orig_content', true );
+	if ( $orig_checkout ) {
+		wp_update_post( [
+			'ID'           => $checkout_pid,
+			'post_content' => $orig_checkout,
+		] );
+		delete_post_meta( $checkout_pid, '_tierza_e2e_orig_content' );
+	}
+}
+
 echo 'TEARDOWN_OK';

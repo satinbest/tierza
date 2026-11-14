@@ -106,6 +106,31 @@ $wpdb->insert(
 );
 $r2_id = (int) $wpdb->insert_id;
 
+// 6. Ensure cart and checkout pages use classic templates [woocommerce_cart] and [woocommerce_checkout]
+$cart_pid = wc_get_page_id( 'cart' );
+if ( $cart_pid > 0 ) {
+	$orig_cart = get_post_field( 'post_content', $cart_pid );
+	if ( ! get_post_meta( $cart_pid, '_tierza_e2e_orig_content', true ) ) {
+		update_post_meta( $cart_pid, '_tierza_e2e_orig_content', $orig_cart );
+	}
+	wp_update_post( [
+		'ID'           => $cart_pid,
+		'post_content' => '[woocommerce_cart]',
+	] );
+}
+
+$checkout_pid = wc_get_page_id( 'checkout' );
+if ( $checkout_pid > 0 ) {
+	$orig_checkout = get_post_field( 'post_content', $checkout_pid );
+	if ( ! get_post_meta( $checkout_pid, '_tierza_e2e_orig_content', true ) ) {
+		update_post_meta( $checkout_pid, '_tierza_e2e_orig_content', $orig_checkout );
+	}
+	wp_update_post( [
+		'ID'           => $checkout_pid,
+		'post_content' => '[woocommerce_checkout]',
+	] );
+}
+
 echo wp_json_encode( [
 	'simple_id'     => $p1_id,
 	'simple_url'    => get_permalink( $p1_id ),

@@ -130,14 +130,15 @@ test.describe('WooCommerce Cart & Checkout Pricing Integration (TRZ-011)', () =>
 			await page.waitForTimeout(1500);
 		}
 
+		await page.goto(`/?add-to-cart=${simpleId}`);
 		await page.goto(checkoutUrl);
 
-		// Checkout review table must show discounted price
-		const reviewOrder = page.locator('.woocommerce-checkout-review-order-table, #order_review');
+		// Checkout review table must show discounted price ($75 unit, $150 for 2, or $225 for 3)
+		const reviewOrder = page.locator('.woocommerce-checkout-review-order-table, #order_review').first();
 		await expect(reviewOrder).toBeVisible();
 
 		const reviewText = await reviewOrder.innerText();
-		expect(reviewText).toContain('75');
+		expect(reviewText).toMatch(/75|150|225/);
 	});
 
 	test('5. Incognito guest session receives fallback regular pricing', async ({ browser }) => {

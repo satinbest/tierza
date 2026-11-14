@@ -3061,6 +3061,35 @@ class DatabaseIntegrationLiveTest {
 			$this->db->suppress_errors( $suppress );
 		}
 		$this->assert( $threw, 'Invalidator must throw DatabaseQueryException when database write fails and must not report success.' );
+
+		// Test read failure handling: invalidator with broken query on get_version() must throw DatabaseQueryException
+		$invalidator->reset_memory();
+		$read_threw = false;
+		$suppress   = $this->db->suppress_errors( true );
+		try {
+			$this->db->options = 'non_existent_table_for_tierza_test';
+			$invalidator->get_version();
+		} catch ( \Tierza\Infrastructure\Exceptions\DatabaseQueryException ) {
+			$read_threw = true;
+		} finally {
+			$this->db->options = $orig_options;
+			$this->db->suppress_errors( $suppress );
+		}
+		$this->assert( $read_threw, 'Invalidator must throw DatabaseQueryException when database read fails on get_version() and must not silently fall back.' );
+
+		// Test transient cleanup failure handling: clean_all_variation_transients() must throw DatabaseQueryException on failure
+		$clean_threw = false;
+		$suppress    = $this->db->suppress_errors( true );
+		try {
+			$this->db->options = 'non_existent_table_for_tierza_test';
+			$invalidator->clean_all_variation_transients();
+		} catch ( \Tierza\Infrastructure\Exceptions\DatabaseQueryException ) {
+			$clean_threw = true;
+		} finally {
+			$this->db->options = $orig_options;
+			$this->db->suppress_errors( $suppress );
+		}
+		$this->assert( $clean_threw, 'Invalidator must throw DatabaseQueryException when transient deletion fails and must not report success.' );
 	}
 
 	public function test_pricing_failure_tracking_and_degraded_fallback_in_mariadb(): void {

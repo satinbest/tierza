@@ -94,11 +94,17 @@ class VariationPriceCacheInvalidatorTest extends TestCase {
 		$failing_db = $this->createMock( wpdb::class );
 		$failing_db->options = 'wp_options';
 		$failing_db->method( 'prepare' )->willReturnCallback( fn( $q ) => $q );
-		$failing_db->method( 'query' )->willReturn( false );
-		$failing_db->last_error = 'Simulated connection lost error';
+		$failing_db->method( 'get_var' )->willReturn( '5' );
+		$failing_db->method( 'query' )->willReturnCallback(
+			function() use ( $failing_db ) {
+				$failing_db->last_error = 'Simulated connection lost error';
+				return false;
+			}
+		);
 
 		$invalidator = new VariationPriceCacheInvalidator( $failing_db );
 		$initial_version = $invalidator->get_version();
+		$this->assertSame( 5, $initial_version );
 
 		$this->expectException( \Tierza\Infrastructure\Exceptions\DatabaseQueryException::class );
 		$this->expectExceptionMessage( 'Failed to increment variation cache version' );
@@ -124,5 +130,53 @@ class VariationPriceCacheInvalidatorTest extends TestCase {
 		$this->expectExceptionMessage( 'Failed to verify updated variation cache version' );
 
 		$invalidator->increment_version();
+	}
+
+	public function test_get_version_throws_database_query_exception_on_sql_read_failure_and_does_not_fallback(): void {
+		$failing_db = $this->createMock( wpdb::class );
+		$failing_db->options = 'wp_options';
+		$failing_db->method( 'prepare' )->willReturnCallback( fn( $q ) => $q );
+		$failing_db->method( 'get_var' )->willReturnCallback(
+			function() use ( $failing_db ) {
+				$failing_db->last_error = 'Table wp_options does not exist';
+				return null;
+			}
+		);
+
+		$invalidator = new VariationPriceCacheInvalidator( $failing_db );
+
+		$this->expectException( \Tierza\Infrastructure\Exceptions\DatabaseQueryException::class );
+		$this->expectExceptionMessage( 'Failed to read variation cache version from database: Table wp_options does not exist' );
+
+		$invalidator->get_version();
+	}
+
+	public function test_get_version_initializes_to_one_on_clean_empty_table(): void {
+		$clean_db = $this->createMock( wpdb::class );
+		$clean_db->options = 'wp_options';
+		$clean_db->last_error = '';
+		$clean_db->method( 'prepare' )->willReturnCallback( fn( $q ) => $q );
+		$clean_db->method( 'get_var' )->willReturn( null ); // Clean query, 0 rows
+
+		$invalidator = new VariationPriceCacheInvalidator( $clean_db );
+		$this->assertSame( 1, $invalidator->get_version() );
+	}
+
+	public function test_clean_all_variation_transients_throws_database_query_exception_on_delete_failure(): void {
+		$failing_db = $this->createMock( wpdb::class );
+		$failing_db->options = 'wp_options';
+		$failing_db->method( 'query' )->willReturnCallback(
+			function() use ( $failing_db ) {
+				$failing_db->last_error = 'Deadlock found when trying to get lock';
+				return false;
+			}
+		);
+
+		$invalidator = new VariationPriceCacheInvalidator( $failing_db );
+
+		$this->expectException( \Tierza\Infrastructure\Exceptions\DatabaseQueryException::class );
+		$this->expectExceptionMessage( 'Failed to clean variation transients from database: Deadlock found' );
+
+		$invalidator->clean_all_variation_transients();
 	}
 }

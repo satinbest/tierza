@@ -17,6 +17,7 @@ use Tierza\Domain\Repositories\GroupRepositoryInterface;
 use Tierza\Domain\Repositories\UserGroupRepositoryInterface;
 use Tierza\Domain\ValueObjects\DecimalMath;
 use Tierza\Domain\ValueObjects\Money;
+use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
 use WC_Product;
 use WC_Product_Variation;
 use WP_Term;
@@ -385,11 +386,18 @@ class ProductPricingAdapter {
 		$resolved_customer_id = $this->resolve_customer_id( $customer_id );
 		$resolved_group       = $this->resolve_customer_group( $resolved_customer_id );
 
+		try {
+			$version = $this->variation_cache_invalidator?->get_version() ?? 1;
+		} catch ( DatabaseQueryException ) {
+			// Ephemeral uncacheable fallback: prevent caching stale or default data on database failure.
+			$version = 'err_' . ( function_exists( 'wp_generate_uuid4' ) ? wp_generate_uuid4() : bin2hex( random_bytes( 8 ) ) );
+		}
+
 		return [
 			'tierza_customer_id' => $resolved_customer_id,
 			'tierza_group_id'    => $resolved_group?->id() ?? 0,
 			'tierza_is_active'   => $resolved_group?->is_active() ?? false,
-			'tierza_version'     => $this->variation_cache_invalidator?->get_version() ?? 1,
+			'tierza_version'     => $version,
 		];
 	}
 

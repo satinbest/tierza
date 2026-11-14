@@ -40,6 +40,7 @@ class VariationPriceCacheInvalidator {
 	 * Cached in-memory per request to avoid redundant database lookups.
 	 *
 	 * @return int Positive integer version.
+	 * @throws DatabaseQueryException If database read fails.
 	 */
 	public function get_version(): int {
 		if ( null !== $this->cached_version ) {
@@ -54,10 +55,21 @@ class VariationPriceCacheInvalidator {
 					self::OPTION_NAME
 				)
 			);
-			if ( null !== $raw && is_numeric( $raw ) ) {
+
+			if ( ! empty( $this->db->last_error ) ) {
+				throw new DatabaseQueryException(
+					sprintf( 'Failed to read variation cache version from database: %s', $this->db->last_error )
+				);
+			}
+
+			if ( null !== $raw && '' !== $raw && is_numeric( $raw ) ) {
 				$this->cached_version = max( 1, (int) $raw );
 				return $this->cached_version;
 			}
+
+			// Clean query finding 0 rows: fresh installation where version row does not exist yet.
+			$this->cached_version = 1;
+			return 1;
 		}
 
 		if ( function_exists( 'get_option' ) ) {
@@ -215,6 +227,8 @@ class VariationPriceCacheInvalidator {
 	 * 1. Signals WooCommerce core via WC_Cache_Helper::get_transient_version('product', true)
 	 *    to invalidate product caches in persistent object stores (Redis/Memcached).
 	 * 2. Purges database transients from wp_options to prevent disk storage buildup.
+	 *
+	 * @throws DatabaseQueryException If database transient purge query fails.
 	 */
 	public function clean_all_variation_transients(): void {
 		// Invalidate WooCommerce persistent object cache group if available.
@@ -225,9 +239,15 @@ class VariationPriceCacheInvalidator {
 		// Purge transients in database.
 		if ( ! empty( $this->db->options ) ) {
 			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-			$this->db->query(
+			$result = $this->db->query(
 				"DELETE FROM {$this->db->options} WHERE option_name LIKE '_transient_wc_var_prices_%' OR option_name LIKE '_transient_timeout_wc_var_prices_%'"
 			);
+			if ( false === $result || ! empty( $this->db->last_error ) ) {
+				$err_msg = ! empty( $this->db->last_error ) ? $this->db->last_error : 'Unknown database error';
+				throw new DatabaseQueryException(
+					sprintf( 'Failed to clean variation transients from database: %s', $err_msg )
+				);
+			}
 		}
 	}
 

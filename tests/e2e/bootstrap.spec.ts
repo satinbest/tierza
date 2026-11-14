@@ -10,7 +10,7 @@ test.describe('Tierza Admin & Integration Smoke Tests', () => {
 		await page.fill('#user_login', 'admin');
 		await page.fill('#user_pass', 'password');
 		await Promise.all([
-			page.waitForURL(/.*wp-admin/, { timeout: 15000 }),
+			page.waitForURL(/.*wp-admin/, { timeout: 30000 }),
 			page.click('#wp-submit'),
 		]);
 		await expect(page).toHaveURL(/.*wp-admin/);

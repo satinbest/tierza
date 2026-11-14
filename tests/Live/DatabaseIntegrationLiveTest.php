@@ -46,6 +46,7 @@ use Tierza\Infrastructure\Repositories\WpGroupRepository;
 use Tierza\Infrastructure\Repositories\WpRuleRepository;
 use Tierza\Infrastructure\Repositories\WpUserGroupRepository;
 use Tierza\Infrastructure\Validation\EntityReferenceValidator;
+use Tierza\Plugin;
 
 class DatabaseIntegrationLiveTest {
 
@@ -64,9 +65,14 @@ class DatabaseIntegrationLiveTest {
 		global $wpdb;
 		$this->db              = $wpdb;
 		$this->validator       = new EntityReferenceValidator( $this->db );
-		$this->group_repo      = new WpGroupRepository( $this->db );
-		$this->rule_repo       = new WpRuleRepository( $this->db, $this->validator );
-		$this->user_group_repo = new WpUserGroupRepository( $this->db, $this->validator );
+
+		$plugin                = Plugin::instance();
+		$cache                 = $plugin->get_pricing_cache();
+		$invalidator           = $plugin->get_variation_cache_invalidator();
+
+		$this->group_repo      = $plugin->get_group_repository() instanceof WpGroupRepository ? $plugin->get_group_repository() : new WpGroupRepository( $this->db, $cache, $invalidator );
+		$this->rule_repo       = $plugin->get_rule_repository() instanceof WpRuleRepository ? $plugin->get_rule_repository() : new WpRuleRepository( $this->db, $this->validator, $cache, $invalidator );
+		$this->user_group_repo = $plugin->get_user_group_repository() instanceof WpUserGroupRepository ? $plugin->get_user_group_repository() : new WpUserGroupRepository( $this->db, $this->validator, $cache, $invalidator );
 	}
 
 	public function run(): int {
@@ -124,6 +130,13 @@ class DatabaseIntegrationLiveTest {
 			'test_pricing_cache_customer_privacy_and_isolation_in_mariadb',
 			'test_pricing_cache_heterogeneous_batch_in_mariadb',
 			'test_pricing_cache_group_status_eviction_and_isolation_in_mariadb',
+			'test_woocommerce_simple_product_frontend_pricing_and_no_db_mutation',
+			'test_woocommerce_native_sale_product_pricing_in_mariadb',
+			'test_woocommerce_category_hierarchy_pricing_in_mariadb',
+			'test_woocommerce_variable_product_and_variation_ranges_in_mariadb',
+			'test_woocommerce_variation_prices_cache_isolation_in_mariadb',
+			'test_woocommerce_variation_cache_invalidation_matrix_in_mariadb',
+			'test_woocommerce_catalog_loop_batch_prefetching_in_mariadb',
 		];
 
 		foreach ( $methods as $method ) {
@@ -750,9 +763,10 @@ class DatabaseIntegrationLiveTest {
 			$this->user_group_repo->remove( $user_id );
 			$this->assert( null === $this->user_group_repo->find_by_user_id( $user_id ), 'Removed user assignment must be null.' );
 		} finally {
+			$this->user_group_repo->remove( $user_id );
+			$this->delete_test_user( $user_id );
 			$this->group_repo->delete( (int) $group_a->id() );
 			$this->group_repo->delete( (int) $group_b->id() );
-			$this->delete_test_user( $user_id );
 		}
 	}
 
@@ -2512,6 +2526,496 @@ class DatabaseIntegrationLiveTest {
 			$this->rule_repo->delete( (int) $rule->id() );
 			$this->group_repo->delete( $group_id );
 			$this->db->delete( $this->db->prefix . 'posts', [ 'ID' => $product_id ] );
+		}
+	}
+
+	public function test_woocommerce_simple_product_frontend_pricing_and_no_db_mutation(): void {
+		$plugin      = Plugin::instance();
+		$integration = $plugin->get_pricing_integration();
+		$this->assert( null !== $integration, 'Pricing integration must be registered in Plugin.' );
+		$integration->set_allow_cli_pricing( true );
+
+		$group = $this->group_repo->save( new PricingGroup( 'Live Simple Group', 'live-simple-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'simple_user', 'simple_user@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Live WC Simple Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		// Group 20% discount on product
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		try {
+			// Frontend context for customer
+			wp_set_current_user( $uid );
+			$fresh_prod = wc_get_product( $pid );
+			$this->assert( null !== $fresh_prod, 'Product must be loadable.' );
+
+			$price = $fresh_prod->get_price();
+			$this->assert( '80.00' === $price, "Logged-in customer must receive 20% B2B discount ($80.00), got: {$price}" );
+
+			$html = $fresh_prod->get_price_html();
+			$this->assert( str_contains( $html, '<del' ) && str_contains( $html, '<ins' ), 'Price HTML must render standard sale markup with struck regular price.' );
+
+			// Guest context
+			wp_set_current_user( 0 );
+			$guest_prod = wc_get_product( $pid );
+			$this->assert( null !== $guest_prod, 'Product must be loadable for guest.' );
+			$guest_price = $guest_prod->get_price();
+			$this->assert( '100.00' === $guest_price, "Guest must receive fallback catalog price ($100.00), got: {$guest_price}" );
+
+			// CRITICAL INVARIANT: Database immutability check
+			$meta_price = get_post_meta( $pid, '_price', true );
+			$meta_reg   = get_post_meta( $pid, '_regular_price', true );
+			$this->assert( '100' === $meta_price || '100.00' === $meta_price, "Database postmeta _price must remain original, got: {$meta_price}" );
+			$this->assert( '100' === $meta_reg || '100.00' === $meta_reg, "Database postmeta _regular_price must remain original, got: {$meta_reg}" );
+		} finally {
+			wp_set_current_user( 0 );
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_native_sale_product_pricing_in_mariadb(): void {
+		$plugin      = Plugin::instance();
+		$integration = $plugin->get_pricing_integration();
+		if ( null !== $integration ) {
+			$integration->set_allow_cli_pricing( true );
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Live Native Sale Group', 'live-native-sale-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'sale_user', 'sale_user@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Live WC Sale Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_sale_price( '80.00' );
+		$product->set_price( '80.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		// 10% group discount on active sale product
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '10.000000' )
+		) );
+
+		try {
+			// Customer logged in: 10% discount from active sale price ($80.00) = $72.00
+			wp_set_current_user( $uid );
+			$prod = wc_get_product( $pid );
+			$this->assert( null !== $prod, 'Product must load.' );
+
+			$price = $prod->get_price();
+			$this->assert( '72.00' === $price, "Percentage discount must apply to active sale price ($72.00), got: {$price}" );
+
+			// Guest: gets native sale price ($80.00)
+			wp_set_current_user( 0 );
+			$guest_prod = wc_get_product( $pid );
+			$this->assert( null !== $guest_prod, 'Guest product must load.' );
+			$guest_price = $guest_prod->get_price();
+			$this->assert( '80.00' === $guest_price, "Guest must get native sale price ($80.00), got: {$guest_price}" );
+		} finally {
+			wp_set_current_user( 0 );
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_category_hierarchy_pricing_in_mariadb(): void {
+		$plugin      = Plugin::instance();
+		$integration = $plugin->get_pricing_integration();
+		if ( null !== $integration ) {
+			$integration->set_allow_cli_pricing( true );
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Live Cat Group', 'live-cat-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'cat_user', 'cat_user@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		// Real taxonomy terms
+		$t1 = wp_insert_term( 'Live Parent Cat ' . uniqid(), 'product_cat' );
+		$this->assert( is_array( $t1 ) && isset( $t1['term_id'] ), 'Parent category must create.' );
+		$parent_cid = (int) $t1['term_id'];
+
+		$t2 = wp_insert_term( 'Live Child Cat ' . uniqid(), 'product_cat', [ 'parent' => $parent_cid ] );
+		$this->assert( is_array( $t2 ) && isset( $t2['term_id'] ), 'Child category must create.' );
+		$child_cid = (int) $t2['term_id'];
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Live Cat Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->set_category_ids( [ $child_cid ] );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		// Parent category rule: 10%
+		$r_parent = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::category( $parent_cid ),
+			PricingValue::percentage( '10.000000' )
+		) );
+
+		$r_child = null;
+
+		try {
+			wp_set_current_user( $uid );
+
+			// 1. Product assigned ONLY to child category inherits parent category rule (90.00).
+			$prod1 = wc_get_product( $pid );
+			$this->assert( null !== $prod1, 'Product must load.' );
+			$price1 = $prod1->get_price();
+			$this->assert( '90.00' === $price1, "Product assigned only to child category must inherit parent category 10% rule ($90.00), got: {$price1}" );
+
+			// 2. Child category rule: 18% (child rule at depth 1 overrides parent at depth 0)
+			$r_child = $this->rule_repo->save( new PricingRule(
+				RuleTarget::group( $gid ),
+				RuleScope::category( $child_cid ),
+				PricingValue::percentage( '18.000000' )
+			) );
+
+			$plugin = Plugin::instance();
+			$plugin->get_pricing_cache()?->clear();
+			$plugin->get_pricing_adapter()?->clear_runtime_cache();
+
+			$prod2 = wc_get_product( $pid );
+			$this->assert( null !== $prod2, 'Product must reload.' );
+			$price2 = $prod2->get_price();
+			$this->assert( '82.00' === $price2, "Deeper child category (depth 1) must win with 18% ($82.00), got: {$price2}" );
+		} finally {
+			wp_set_current_user( 0 );
+			$this->rule_repo->delete( (int) $r_parent->id() );
+			if ( null !== $r_child ) {
+				$this->rule_repo->delete( (int) $r_child->id() );
+			}
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+			wp_delete_term( $child_cid, 'product_cat' );
+			wp_delete_term( $parent_cid, 'product_cat' );
+		}
+	}
+
+	public function test_woocommerce_variable_product_and_variation_ranges_in_mariadb(): void {
+		$plugin      = Plugin::instance();
+		$integration = $plugin->get_pricing_integration();
+		if ( null !== $integration ) {
+			$integration->set_allow_cli_pricing( true );
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Live Var Group', 'live-var-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'var_user', 'var_user@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$var_product = new \WC_Product_Variable();
+		$var_product->set_name( 'Live Variable Shirt' );
+		$var_product->save();
+		$parent_id = (int) $var_product->get_id();
+
+		$var1 = new \WC_Product_Variation();
+		$var1->set_parent_id( $parent_id );
+		$var1->set_regular_price( '100.00' );
+		$var1->set_price( '100.00' );
+		$var1->save();
+		$v1_id = (int) $var1->get_id();
+
+		$var2 = new \WC_Product_Variation();
+		$var2->set_parent_id( $parent_id );
+		$var2->set_regular_price( '150.00' );
+		$var2->set_price( '150.00' );
+		$var2->save();
+		$v2_id = (int) $var2->get_id();
+
+		// Parent rule: 10% discount on parent product
+		$r_parent = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $parent_id ),
+			PricingValue::percentage( '10.000000' )
+		) );
+
+		// Variation 1 rule: 30% discount on variation 1
+		$r_v1 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::variation( $v1_id ),
+			PricingValue::percentage( '30.000000' )
+		) );
+
+		try {
+			wp_set_current_user( $uid );
+
+			$v1_fresh = wc_get_product( $v1_id );
+			$v2_fresh = wc_get_product( $v2_id );
+			$this->assert( null !== $v1_fresh && null !== $v2_fresh, 'Variations must load.' );
+			$this->assert( '70.00' === $v1_fresh->get_price(), 'Variation 1 must get 30% discount (70.00).' );
+			$this->assert( '135.00' === $v2_fresh->get_price(), 'Variation 2 must inherit parent 10% discount (135.00).' );
+
+			// Range on variable product
+			$parent_fresh = wc_get_product( $parent_id );
+			$this->assert( $parent_fresh instanceof \WC_Product_Variable, 'Parent must be WC_Product_Variable.' );
+			$prices_data  = $parent_fresh->get_variation_prices( true );
+			$min_price    = current( $prices_data['price'] );
+			$max_price    = end( $prices_data['price'] );
+			$this->assert( '70.00' === $min_price, "Min price must be 70.00, got: {$min_price}" );
+			$this->assert( '135.00' === $max_price, "Max price must be 135.00, got: {$max_price}" );
+		} finally {
+			wp_set_current_user( 0 );
+			$this->rule_repo->delete( (int) $r_parent->id() );
+			$this->rule_repo->delete( (int) $r_v1->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$var1->delete( true );
+			$var2->delete( true );
+			$var_product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_variation_prices_cache_isolation_in_mariadb(): void {
+		$plugin      = Plugin::instance();
+		$integration = $plugin->get_pricing_integration();
+		if ( null !== $integration ) {
+			$integration->set_allow_cli_pricing( true );
+		}
+
+		$g1 = $this->group_repo->save( new PricingGroup( 'Live VIP', 'live-vip' ) );
+		$g2 = $this->group_repo->save( new PricingGroup( 'Live Wholesale', 'live-wholesale' ) );
+
+		$u1 = $this->create_test_user( 'vip_user', 'vip_user@test.com' );
+		$u2 = $this->create_test_user( 'ws_user', 'ws_user@test.com' );
+		$this->user_group_repo->assign( $u1, (int) $g1->id() );
+		$this->user_group_repo->assign( $u2, (int) $g2->id() );
+
+		$var_product = new \WC_Product_Variable();
+		$var_product->set_name( 'Live Cache Iso Product' );
+		$var_product->save();
+		$parent_id = (int) $var_product->get_id();
+
+		$var1 = new \WC_Product_Variation();
+		$var1->set_parent_id( $parent_id );
+		$var1->set_regular_price( '100.00' );
+		$var1->set_price( '100.00' );
+		$var1->save();
+		$v1_id = (int) $var1->get_id();
+
+		// G1 gets 20% discount (price 80.00)
+		$r1 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( (int) $g1->id() ),
+			RuleScope::global(),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		// G2 gets 40% discount (price 60.00)
+		$r2 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( (int) $g2->id() ),
+			RuleScope::global(),
+			PricingValue::percentage( '40.000000' )
+		) );
+
+		try {
+			// Customer 1 queries variable prices:
+			wp_set_current_user( $u1 );
+			$p1 = wc_get_product( $parent_id );
+			$this->assert( $p1 instanceof \WC_Product_Variable, 'Parent product 1 loaded.' );
+			$prices1 = $p1->get_variation_prices( true );
+			$this->assert( '80.00' === current( $prices1['price'] ), 'Customer 1 must get 80.00.' );
+
+			// Customer 2 queries: must NOT get Customer 1 cached 80.00 transient!
+			wp_set_current_user( $u2 );
+			$p2 = wc_get_product( $parent_id );
+			$this->assert( $p2 instanceof \WC_Product_Variable, 'Parent product 2 loaded.' );
+			$prices2 = $p2->get_variation_prices( true );
+			$this->assert( '60.00' === current( $prices2['price'] ), 'Customer 2 must get 60.00 (never Customer 1 80.00).' );
+
+			// Guest queries: must NOT get cached discount!
+			wp_set_current_user( 0 );
+			$p_guest = wc_get_product( $parent_id );
+			$this->assert( $p_guest instanceof \WC_Product_Variable, 'Guest parent product loaded.' );
+			$prices_guest = $p_guest->get_variation_prices( true );
+			$this->assert( '100.00' === current( $prices_guest['price'] ), 'Guest must get fallback 100.00.' );
+		} finally {
+			wp_set_current_user( 0 );
+			$this->rule_repo->delete( (int) $r1->id() );
+			$this->rule_repo->delete( (int) $r2->id() );
+			$this->user_group_repo->remove( $u1 );
+			$this->user_group_repo->remove( $u2 );
+			$this->delete_test_user( $u1 );
+			$this->delete_test_user( $u2 );
+			$this->group_repo->delete( (int) $g1->id() );
+			$this->group_repo->delete( (int) $g2->id() );
+			$var1->delete( true );
+			$var_product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_variation_cache_invalidation_matrix_in_mariadb(): void {
+		$plugin      = Plugin::instance();
+		$integration = $plugin->get_pricing_integration();
+		if ( null !== $integration ) {
+			$integration->set_allow_cli_pricing( true );
+		}
+
+		$g1 = $this->group_repo->save( new PricingGroup( 'Live Inval G1', 'live-inval-g1' ) );
+		$g2 = $this->group_repo->save( new PricingGroup( 'Live Inval G2', 'live-inval-g2' ) );
+		$gid1 = (int) $g1->id();
+		$gid2 = (int) $g2->id();
+
+		$uid = $this->create_test_user( 'inval_user', 'inval_user@test.com' );
+		$this->user_group_repo->assign( $uid, $gid1 );
+
+		$var_product = new \WC_Product_Variable();
+		$var_product->set_name( 'Live Inval Product' );
+		$var_product->save();
+		$parent_id = (int) $var_product->get_id();
+
+		$var1 = new \WC_Product_Variation();
+		$var1->set_parent_id( $parent_id );
+		$var1->set_regular_price( '100.00' );
+		$var1->set_price( '100.00' );
+		$var1->save();
+		$v1_id = (int) $var1->get_id();
+
+		// Rule 1: 20% discount on variation for Group 1 (price 80.00)
+		$rule1 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid1 ),
+			RuleScope::variation( $v1_id ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		$rule2 = null;
+
+		try {
+			wp_set_current_user( $uid );
+			$p = wc_get_product( $parent_id );
+			$this->assert( $p instanceof \WC_Product_Variable, 'Parent product loaded.' );
+			$prices = $p->get_variation_prices( true );
+			$this->assert( '80.00' === current( $prices['price'] ), 'Initial variation price must be 80.00.' );
+
+			// 1. Invalidation via Rule Update: change discount to 35% (price 65.00)
+			$updated_rule1 = $this->rule_repo->save( $rule1->update_value( PricingValue::percentage( '35.000000' ) ) );
+			$p_fresh = wc_get_product( $parent_id );
+			$prices_fresh = $p_fresh->get_variation_prices( true );
+			$this->assert( '65.00' === current( $prices_fresh['price'] ), 'Variation cache must invalidate on rule update (65.00).' );
+
+			// 2. Invalidation via Rule Deactivation: set rule to inactive (price 100.00)
+			$this->rule_repo->save( $updated_rule1->deactivate() );
+			$p_deactivated = wc_get_product( $parent_id );
+			$prices_deactivated = $p_deactivated->get_variation_prices( true );
+			$this->assert( '100.00' === current( $prices_deactivated['price'] ), 'Variation cache must invalidate on rule deactivation (100.00).' );
+
+			// 3. Create active rule for Group 2 (50% discount)
+			$rule2 = $this->rule_repo->save( new PricingRule(
+				RuleTarget::group( $gid2 ),
+				RuleScope::variation( $v1_id ),
+				PricingValue::percentage( '50.000000' )
+			) );
+
+			// Invalidation via Customer Reassignment: reassign user to Group 2
+			$this->user_group_repo->reassign( $uid, $gid2 );
+			$p_reassigned = wc_get_product( $parent_id );
+			$prices_reassigned = $p_reassigned->get_variation_prices( true );
+			$this->assert( '50.00' === current( $prices_reassigned['price'] ), 'Variation cache must invalidate on customer reassignment (50.00).' );
+
+			// 4. Invalidation via Group Deactivation: deactivate Group 2
+			$this->group_repo->save( $g2->deactivate() );
+			$p_grp_inactive = wc_get_product( $parent_id );
+			$prices_grp_inactive = $p_grp_inactive->get_variation_prices( true );
+			$this->assert( '100.00' === current( $prices_grp_inactive['price'] ), 'Variation cache must invalidate on group deactivation (100.00).' );
+		} finally {
+			wp_set_current_user( 0 );
+			$this->rule_repo->delete( (int) $rule1->id() );
+			if ( null !== $rule2 ) {
+				$this->rule_repo->delete( (int) $rule2->id() );
+			}
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid1 );
+			$this->group_repo->delete( $gid2 );
+			$var1->delete( true );
+			$var_product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_catalog_loop_batch_prefetching_in_mariadb(): void {
+		$plugin      = Plugin::instance();
+		$integration = $plugin->get_pricing_integration();
+		if ( null !== $integration ) {
+			$integration->set_allow_cli_pricing( true );
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Live Loop Group', 'live-loop-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'loop_user', 'loop_user@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		// 20 products
+		$products = [];
+		for ( $i = 1; $i <= 20; $i++ ) {
+			$p = new \WC_Product_Simple();
+			$p->set_name( "Loop Prod {$i}" );
+			$p->set_regular_price( '100.00' );
+			$p->set_price( '100.00' );
+			$p->save();
+			$products[] = $p;
+		}
+
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::global(),
+			PricingValue::percentage( '15.000000' )
+		) );
+
+		try {
+			wp_set_current_user( $uid );
+
+			// Clear cache to simulate clean request
+			$plugin->get_pricing_cache()?->clear();
+			$plugin->get_pricing_adapter()?->clear_runtime_cache();
+
+			$q_before = $this->db->num_queries;
+			// Batch prefetch all 20 products
+			$plugin->get_pricing_adapter()?->prefetch_products( $products, $uid );
+			$q_prefetch = $this->db->num_queries - $q_before;
+
+			// Now iterate and get prices of all 20 products
+			$q_loop_before = $this->db->num_queries;
+			foreach ( $products as $prod ) {
+				$this->assert( '85.00' === $prod->get_price(), 'Price must be 85.00' );
+			}
+			$q_loop = $this->db->num_queries - $q_loop_before;
+
+			echo PHP_EOL . "   [Catalog Loop Test] q_prefetch: {$q_prefetch}, q_loop: {$q_loop}" . PHP_EOL;
+			$this->assert( 0 === $q_loop, "Looping through 20 products after prefetch must execute 0 additional queries, executed: {$q_loop}" );
+		} finally {
+			wp_set_current_user( 0 );
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			foreach ( $products as $p ) {
+				$p->delete( true );
+			}
 		}
 	}
 

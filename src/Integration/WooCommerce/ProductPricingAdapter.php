@@ -477,7 +477,7 @@ class ProductPricingAdapter {
 	 * @param string     $raw_sale_price Raw sale price string.
 	 * @return bool True if active native sale is ongoing.
 	 */
-	private function is_product_on_sale( WC_Product $product, string $raw_reg_price, string $raw_sale_price ): bool {
+	public function is_product_on_sale( WC_Product $product, string $raw_reg_price, string $raw_sale_price ): bool {
 		if ( '' === $raw_sale_price || ! DecimalMath::is_valid( $raw_sale_price ) ) {
 			return false;
 		}
@@ -517,7 +517,7 @@ class ProductPricingAdapter {
 	 * @param int $product_id Main product post ID.
 	 * @return array{0: int[], 1: array<int, int>} [ category_ids, category_depths ]
 	 */
-	private function get_category_data( int $product_id ): array {
+	public function get_category_data( int $product_id ): array {
 		if ( isset( $this->category_cache[ $product_id ] ) ) {
 			return $this->category_cache[ $product_id ];
 		}
@@ -584,7 +584,7 @@ class ProductPricingAdapter {
 	 *
 	 * @return string 3-character ISO currency code.
 	 */
-	private function get_store_currency(): string {
+	public function get_store_currency(): string {
 		if ( function_exists( 'get_woocommerce_currency' ) ) {
 			$curr = (string) get_woocommerce_currency();
 			if ( '' !== $curr ) {
@@ -599,7 +599,7 @@ class ProductPricingAdapter {
 	 *
 	 * @return int Number of decimal places (0 to 6).
 	 */
-	private function get_store_decimals(): int {
+	public function get_store_decimals(): int {
 		if ( function_exists( 'wc_get_price_decimals' ) ) {
 			$dec = wc_get_price_decimals();
 			return max( 0, min( 6, (int) $dec ) );

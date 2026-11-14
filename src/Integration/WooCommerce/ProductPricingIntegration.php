@@ -111,6 +111,11 @@ class ProductPricingIntegration {
 			return (string) $price;
 		}
 
+		// Cart pricing guard: if product has already been authoritatively priced by Tierza Cart, do not re-filter.
+		if ( CartPricingAdapter::is_cart_priced( $product ) ) {
+			return (string) $price;
+		}
+
 		// Reentrancy check: prevent infinite filter recursion if get_price() is called internally.
 		if ( isset( $this->active_resolutions[ $product_id ] ) ) {
 			return (string) $price;

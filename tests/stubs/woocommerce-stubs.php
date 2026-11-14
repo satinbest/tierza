@@ -34,8 +34,27 @@ if ( ! class_exists( 'WP_Error' ) ) {
 			}
 		}
 
-		public function get_error_message(): string {
-			return reset( $this->errors )[0] ?? '';
+		public function add( string $code, string $message ): void {
+			$this->errors[ $code ][] = $message;
+		}
+
+		public function has_errors(): bool {
+			return ! empty( $this->errors );
+		}
+
+		public function get_error_message( string $code = '' ): string {
+			if ( '' !== $code ) {
+				return $this->errors[ $code ][0] ?? '';
+			}
+			$first = reset( $this->errors );
+			return is_array( $first ) ? ( $first[0] ?? '' ) : '';
+		}
+
+		/**
+		 * @return string[]
+		 */
+		public function get_error_codes(): array {
+			return array_keys( $this->errors );
 		}
 	}
 }
@@ -62,8 +81,20 @@ if ( ! class_exists( 'WC_Product' ) ) {
 		protected ?DateTime $date_on_sale_from = null;
 		protected ?DateTime $date_on_sale_to = null;
 
-		public function __construct( int $id = 0 ) {
+		/**
+		 * @param array<string, mixed> $props
+		 */
+		public function __construct( int $id = 0, array $props = [] ) {
 			$this->id = $id;
+			if ( isset( $props['price'] ) ) {
+				$this->price = (string) $props['price'];
+			}
+			if ( isset( $props['regular_price'] ) ) {
+				$this->regular_price = (string) $props['regular_price'];
+			}
+			if ( isset( $props['sale_price'] ) ) {
+				$this->sale_price = (string) $props['sale_price'];
+			}
 		}
 
 		public function get_id(): int {
@@ -160,6 +191,16 @@ if ( ! class_exists( 'WC_Product' ) ) {
 if ( ! class_exists( 'WC_Product_Variation' ) ) {
 	class WC_Product_Variation extends WC_Product {
 		protected int $parent_id = 0;
+
+		/**
+		 * @param array<string, mixed> $props
+		 */
+		public function __construct( int $id = 0, array $props = [] ) {
+			parent::__construct( $id, $props );
+			if ( isset( $props['parent_id'] ) ) {
+				$this->parent_id = (int) $props['parent_id'];
+			}
+		}
 
 		public function get_type(): string {
 			return 'variation';
@@ -354,5 +395,129 @@ if ( ! class_exists( 'WC_Cache_Helper' ) ) {
 		public static function get_transient_version( string $group, bool $refresh = false ): string {
 			return '1.0';
 		}
+	}
+}
+
+if ( ! class_exists( 'WC_Cart' ) ) {
+	class WC_Cart {
+		/** @var array<string, array<string, mixed>> */
+		public array $cart_contents = [];
+		public float $total = 0.0;
+		public float $subtotal = 0.0;
+
+		/**
+		 * @return array<string, array<string, mixed>>
+		 */
+		public function get_cart(): array {
+			return $this->cart_contents;
+		}
+
+		/**
+		 * @param array<string, array<string, mixed>> $contents
+		 */
+		public function set_cart_contents( array $contents ): void {
+			$this->cart_contents = $contents;
+		}
+
+		public function calculate_totals(): void {
+			if ( function_exists( 'do_action' ) ) {
+				do_action( 'woocommerce_before_calculate_totals', $this );
+			}
+			$this->subtotal = 0.0;
+			foreach ( $this->cart_contents as $item ) {
+				if ( isset( $item['data'] ) && $item['data'] instanceof WC_Product ) {
+					$qty = isset( $item['quantity'] ) ? (int) $item['quantity'] : 1;
+					$this->subtotal += (float) $item['data']->get_price() * $qty;
+				}
+			}
+			$this->total = $this->subtotal;
+		}
+
+		public function is_empty(): bool {
+			return empty( $this->cart_contents );
+		}
+
+		public function empty_cart(): void {
+			$this->cart_contents = [];
+			$this->total         = 0.0;
+			$this->subtotal      = 0.0;
+		}
+	}
+}
+
+if ( ! class_exists( 'WC_Customer' ) ) {
+	class WC_Customer {
+		public int $id = 0;
+
+		public function __construct( int $id = 0 ) {
+			$this->id = $id;
+		}
+
+		public function get_id(): int {
+			return $this->id;
+		}
+	}
+}
+
+if ( ! class_exists( 'WC_Checkout' ) ) {
+	class WC_Checkout {
+		private static ?WC_Checkout $instance = null;
+
+		public static function instance(): self {
+			if ( null === self::$instance ) {
+				self::$instance = new self();
+			}
+			return self::$instance;
+		}
+	}
+}
+
+if ( ! function_exists( 'wc_add_notice' ) ) {
+	/**
+	 * @param string $message
+	 * @param string $notice_type
+	 * @param array<string, mixed> $data
+	 */
+	function wc_add_notice( string $message, string $notice_type = 'success', array $data = [] ): void {
+		global $wc_notices;
+		if ( ! is_array( $wc_notices ) ) {
+			$wc_notices = [];
+		}
+		$wc_notices[ $notice_type ][] = $message;
+	}
+}
+
+if ( ! function_exists( 'wc_get_notices' ) ) {
+	/**
+	 * @param string $notice_type
+	 * @return array<string, array<string>>
+	 */
+	function wc_get_notices( string $notice_type = '' ): array {
+		global $wc_notices;
+		if ( ! is_array( $wc_notices ) ) {
+			return [];
+		}
+		if ( '' !== $notice_type ) {
+			return $wc_notices[ $notice_type ] ?? [];
+		}
+		return $wc_notices;
+	}
+}
+
+if ( ! function_exists( 'wc_clear_notices' ) ) {
+	function wc_clear_notices(): void {
+		global $wc_notices;
+		$wc_notices = [];
+	}
+}
+
+if ( ! function_exists( 'WC' ) ) {
+	function WC(): stdClass {
+		static $wc;
+		if ( ! $wc ) {
+			$wc       = new stdClass();
+			$wc->cart = new WC_Cart();
+		}
+		return $wc;
 	}
 }

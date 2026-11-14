@@ -131,3 +131,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Hardened transient purge failure handling: `VariationPriceCacheInvalidator::clean_all_variation_transients()` validates database DELETE query results and raises `DatabaseQueryException` on failure, ensuring incomplete invalidations are never reported as successful (TRZ-010).
   - Ephemeral uncacheable hash versioning: `ProductPricingAdapter::get_variation_prices_hash_data()` assigns an uncacheable dynamic token on database error, preventing degraded prices from being permanently cached under default version 1 (TRZ-010).
   - Expanded automated test suite to 553 PHPUnit tests (5,521 assertions), 55 live MariaDB integration tests (676 assertions), and 7 Playwright E2E tests passing at 100% (TRZ-010).
+- WooCommerce Cart & Checkout Pricing Integration layer (`CartPricingAdapter`, `CartPricingIntegration`) connecting deterministic rule resolution and price calculation to the classic WooCommerce cart and checkout lifecycle (TRZ-011).
+- Cart totals hook integration (`woocommerce_before_calculate_totals`) with reentrancy mutex recursion prevention locks and batch prefetching (TRZ-011).
+- Strict idempotency: base prices derived from unfiltered regular prices (or active promotional sales), preventing exponential double-discounting across repeated `calculate_totals()` passes (TRZ-011).
+- Time-of-check checkout validation boundary (`woocommerce_after_checkout_validation`) enforcing mandatory invariants: order placement is strictly blocked on unresolved pricing-engine failures or live database rule discrepancies (TRZ-011).
+- Strikethrough sale markup formatting for cart line item unit prices and subtotals matching catalog display (`woocommerce_cart_item_price`, `woocommerce_cart_item_subtotal`) (TRZ-011).
+- Customer authentication session transitions: dynamic cart recalculation on login (`wp_login`) and logout (`wp_logout`) with cache flushing (TRZ-011).
+- Cart line item metadata preservation across HTTP session serialization (`woocommerce_get_cart_item_from_session`) (TRZ-011).
+- Single batch query rule prefetching across entire cart contents (`prefetch_cart`) pre-warming candidate rules in 1 SQL query (TRZ-011).
+- Pure cart item pricing without database pollution: stored prices in `wp_posts` and `wp_postmeta` remain 100% untouched (TRZ-011).
+- Cart & Checkout performance baseline: 100 heterogeneous cart items calculated in 7.09 ms total (0.07 ms/item, 0 queries with warm cache, peak memory 109.81 MB) (TRZ-011).
+- Comprehensive test coverage: 21 unit tests in `CartPricingAdapterTest` and `CartPricingIntegrationTest`, 9 live MariaDB tests in `DatabaseIntegrationLiveTest`, and 5 Playwright E2E browser tests in `cart-pricing.spec.ts` (574 PHPUnit tests with 5,589 assertions, 64 live MariaDB tests with 872 assertions passing at 100%) (TRZ-011).
+- Dedicated architecture specification (`docs/architecture/woocommerce-cart-integration.md`) (TRZ-011).

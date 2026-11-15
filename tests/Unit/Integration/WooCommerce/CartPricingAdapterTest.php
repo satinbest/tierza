@@ -60,6 +60,7 @@ class CartPricingAdapterTest extends TestCase {
 		$this->cache      = new RequestPricingCache();
 		$this->rule_repo  = new InMemoryRuleRepository();
 		$this->group_repo = new InMemoryGroupRepository();
+		CartPricingAdapter::clear_cart_priced_registry();
 
 		$this->assignments = [];
 		$assignments_ref   = &$this->assignments;
@@ -124,6 +125,11 @@ class CartPricingAdapterTest extends TestCase {
 			$this->batch_prefetcher,
 			'pure_php'
 		);
+	}
+
+	protected function tearDown(): void {
+		CartPricingAdapter::clear_cart_priced_registry();
+		parent::tearDown();
 	}
 
 	public function test_get_cart_item_pricing_context_builds_valid_context_with_quantity(): void {
@@ -468,5 +474,122 @@ class CartPricingAdapterTest extends TestCase {
 		$cart_regular   = [ 'data' => $product_regular ];
 		$html_reg       = $this->cart_adapter->format_cart_item_price_html( '$100.00', $cart_regular );
 		$this->assertSame( '$100.00', $html_reg );
+	}
+
+	public function test_active_base_90_regular_100_tierza_20_percent_matches_catalog(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Active Base Group', 'active-base-group' ) );
+		$this->user_group_repo->assign( 950, (int) $group->id() );
+
+		// Product has regular price 100.00, but active price is 90.00 (e.g. store promo without native sale object)
+		$product = new WC_Product( 9501, [
+			'price'         => '90.00',
+			'regular_price' => '100.00',
+			'sale_price'    => '',
+		] );
+
+		// 20% B2B discount
+		$this->rule_repo->save( new PricingRule(
+			RuleTarget::group( (int) $group->id() ),
+			RuleScope::product( 9501 ),
+			PricingValue::percentage( '20.000000' )
+		) );
+		$this->cache->clear();
+
+		// Catalog adjusted price must be 90 - 20% = 72.00
+		$catalog_price = $this->product_adapter->get_adjusted_price( $product, 950 );
+		$this->assertSame( '72.00', $catalog_price, 'Catalog must calculate 20% discount on active base 90.00.' );
+
+		// Cart item pricing must calculate identical 72.00
+		$cart_item = [
+			'data'     => $product,
+			'quantity' => 1,
+		];
+		$result = $this->cart_adapter->apply_cart_item_pricing( $cart_item, 950 );
+		$this->assertSame( '72.00', $product->get_price(), 'Cart item price must match catalog exactly at 72.00.' );
+		$this->assertSame( '72.000000', $result->final_price()->amount() );
+
+		// Idempotency: repeated passes must not stack discount (72 must not become 57.60)
+		for ( $pass = 2; $pass <= 4; $pass++ ) {
+			$this->cart_adapter->apply_cart_item_pricing( $cart_item, 950 );
+			$this->assertSame( '72.00', $product->get_price(), sprintf( 'Pass %d must retain 72.00 without discount stacking.', $pass ) );
+		}
+	}
+
+	public function test_native_sale_scheduled_active_and_expired(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Sale Lifecycle Group', 'sale-lifecycle-group' ) );
+		$this->user_group_repo->assign( 960, (int) $group->id() );
+
+		// 10% B2B discount
+		$this->rule_repo->save( new PricingRule(
+			RuleTarget::group( (int) $group->id() ),
+			RuleScope::product( 9601 ),
+			PricingValue::percentage( '10.000000' )
+		) );
+		$this->cache->clear();
+
+		// Case A: Active native sale (regular 100, sale 80) -> 80 - 10% = 72.00
+		$active_sale_product = new WC_Product( 9601, [
+			'price'         => '80.00',
+			'regular_price' => '100.00',
+			'sale_price'    => '80.00',
+		] );
+		$cart_item_a = [ 'data' => $active_sale_product, 'quantity' => 1 ];
+		$this->cart_adapter->apply_cart_item_pricing( $cart_item_a, 960 );
+		$this->assertSame( '72.00', $active_sale_product->get_price() );
+
+		// Case B: Expired native sale (regular 100, expired sale 80 in DB, but active price is 100) -> 100 - 10% = 90.00
+		$expired_sale_product = new WC_Product( 9602, [
+			'price'         => '100.00',
+			'regular_price' => '100.00',
+			'sale_price'    => '',
+		] );
+		$this->rule_repo->save( new PricingRule(
+			RuleTarget::group( (int) $group->id() ),
+			RuleScope::product( 9602 ),
+			PricingValue::percentage( '10.000000' )
+		) );
+		$this->cache->clear();
+		$cart_item_b = [ 'data' => $expired_sale_product, 'quantity' => 1 ];
+		$this->cart_adapter->apply_cart_item_pricing( $cart_item_b, 960 );
+		$this->assertSame( '90.00', $expired_sale_product->get_price() );
+	}
+
+	public function test_legitimate_zero_priced_product_preserved(): void {
+		$product = new WC_Product( 9701, [
+			'price'         => '0.00',
+			'regular_price' => '0.00',
+		] );
+		$cart_item = [ 'data' => $product, 'quantity' => 1 ];
+
+		$base = $this->cart_adapter->get_unfiltered_base_price( $product, $cart_item );
+		$this->assertSame( '0.00', $base );
+
+		$res = $this->cart_adapter->apply_cart_item_pricing( $cart_item, 0 );
+		$this->assertSame( '0.00', $product->get_price() );
+	}
+
+	public function test_invalid_monetary_inputs_reject_without_substituting_regular(): void {
+		$invalid_product = new WC_Product( 9801, [
+			'price'         => 'not-a-number',
+			'regular_price' => '100.00',
+		] );
+		$cart_item = [ 'data' => $invalid_product, 'quantity' => 1 ];
+
+		$this->expectException( InvalidMoneyException::class );
+		$this->cart_adapter->get_unfiltered_base_price( $invalid_product, $cart_item );
+	}
+
+	public function test_revalidate_checkout_fails_closed_on_corrupted_cart_items(): void {
+		$cart = new WC_Cart();
+		$cart->set_cart_contents( [
+			'corrupted_item' => [
+				'data'     => null, // Corrupted item without WC_Product
+				'quantity' => 1,
+			],
+		] );
+
+		$report = $this->cart_adapter->revalidate_checkout( $cart, 0 );
+		$this->assertFalse( $report['valid'], 'Checkout must fail closed when cart contains corrupted item.' );
+		$this->assertNotEmpty( $report['errors'] );
 	}
 }

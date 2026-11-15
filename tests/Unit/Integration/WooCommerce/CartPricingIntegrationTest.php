@@ -279,4 +279,86 @@ class CartPricingIntegrationTest extends TestCase {
 		$this->assertStringContainsString( '$200.00', $html );
 		$this->assertStringContainsString( '$160.00', $html );
 	}
+
+	public function test_prefetch_cart_failure_is_caught_classified_and_releases_reentrancy_guard(): void {
+		$mock_prefetcher = $this->createMock( \Tierza\Application\Pricing\Batch\PricingBatchPrefetcherInterface::class );
+		$mock_prefetcher->method( 'prefetch_contexts' )
+			->willThrowException( new \Tierza\Infrastructure\Exceptions\DatabaseQueryException( 'SQLSTATE[HY000]: Lost connection' ) );
+
+		$adapter = new CartPricingAdapter(
+			$this->product_adapter,
+			$this->calculator,
+			$this->resolver,
+			$this->cache,
+			$this->failure_tracker,
+			$mock_prefetcher
+		);
+		$integration = new CartPricingIntegration( $adapter, $this->failure_tracker );
+
+		$product = new WC_Product( 750, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
+		$cart = new WC_Cart();
+		$cart->set_cart_contents( [
+			'line_750' => [
+				'data'     => $product,
+				'quantity' => 1,
+			],
+		] );
+
+		// Execute calculation: prefetch failure must not crash with unhandled exception
+		$integration->on_before_calculate_totals( $cart );
+
+		// Failure must be classified as repository unavailable and recorded in tracker
+		$this->assertTrue( $this->failure_tracker->has_failed( 750 ) );
+		$failure = $this->failure_tracker->get_failure( 750 );
+		$this->assertSame( PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, $failure['error_code'] );
+
+		// Reentrancy guard must be released: a subsequent call must not be blocked by mutex
+		$ref = new \ReflectionClass( $integration );
+		$prop = $ref->getProperty( 'is_calculating' );
+		$prop->setAccessible( true );
+		$this->assertFalse( $prop->getValue( $integration ), 'Reentrancy guard must be cleanly released.' );
+	}
+
+	public function test_failure_recovery_lifecycle_sequence(): void {
+		$product_1 = new WC_Product( 810, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
+		$product_2 = new WC_Product( 820, [ 'price' => '50.00', 'regular_price' => '50.00' ] );
+
+		$cart = new WC_Cart();
+		$cart->set_cart_contents( [
+			'line_1' => [ 'data' => $product_1, 'quantity' => 1 ],
+			'line_2' => [ 'data' => $product_2, 'quantity' => 2 ],
+		] );
+		WC()->cart = $cart;
+
+		// 1. Initial state: simulate repository failure on product 810
+		$this->failure_tracker->record_failure( 810, PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'DB error', 42, 'line_1' );
+
+		// 2. Checkout must be blocked
+		$errors_step1 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step1 );
+		$this->assertTrue( $errors_step1->has_errors(), 'Step 2: Checkout must be blocked on failure.' );
+
+		// 3. Partial recalculation: product 820 succeeds, but 810 remains failed
+		$this->failure_tracker->clear_failure( 820, 42, 'line_2' );
+		$errors_step3 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step3 );
+		$this->assertTrue( $errors_step3->has_errors(), 'Step 3: Partial recalculation must still block checkout.' );
+
+		// 4. Recovery: product 810 authoritatively recalculates and clears failure
+		$this->failure_tracker->clear_failure( 810, 42, 'line_1' );
+		$errors_step4 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step4 );
+		$this->assertFalse( $errors_step4->has_errors(), 'Step 4: Authoritative recovery must restore checkout approval.' );
+
+		// 5. Customer identity isolation: failure for customer 42 must not block customer 99
+		$this->failure_tracker->record_failure( 810, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Err', 42, 'line_1' );
+		$this->assertTrue( $this->failure_tracker->has_failed( 810, 42 ), 'Customer 42 has failed product.' );
+		$this->assertFalse( $this->failure_tracker->has_failed( 810, 99 ), 'Customer 99 must remain isolated and clean.' );
+
+		// 6. New failure occurs on recovered cart
+		$this->failure_tracker->record_failure( 820, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Precision err', 0 );
+		$errors_step6 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step6 );
+		$this->assertTrue( $errors_step6->has_errors(), 'Step 6: New failure must block checkout again.' );
+	}
 }

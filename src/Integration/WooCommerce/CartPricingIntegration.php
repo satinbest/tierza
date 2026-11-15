@@ -4,28 +4,28 @@ declare(strict_types=1);
 
 namespace Tierza\Integration\WooCommerce;
 
+use Throwable;
 use Tierza\Application\Pricing\PricingFailureTracker;
 use Tierza\Domain\Exceptions\InvalidMoneyException;
 use Tierza\Domain\Exceptions\InvalidPricingContextException;
 use Tierza\Domain\Exceptions\PricingCalculationException;
 use Tierza\Infrastructure\Exceptions\DatabaseQueryException;
-use Throwable;
 use WC_Cart;
 use WC_Product;
 use WP_Error;
 use WP_User;
 
 /**
- * WooCommerce integration layer wiring CartPricingAdapter into WooCommerce classic cart and checkout hooks.
+ * Connects CartPricingAdapter with the WooCommerce cart & checkout lifecycle hooks.
  *
- * Hook Map:
- * - woocommerce_before_calculate_totals: Recalculates cart item prices with reentrancy protection and batch prefetch.
- * - woocommerce_cart_item_price: Formats cart item price HTML matching catalog strikethrough styling.
- * - woocommerce_cart_item_subtotal: Formats cart item subtotal HTML.
- * - woocommerce_after_checkout_validation: Revalidates prices at the checkout boundary, blocking checkout on failures.
- * - woocommerce_check_cart_items: Emits shopper notices on cart/checkout pages if pricing errors exist.
- * - wp_login / wp_logout: Invalidates runtime caches and triggers recalculation upon customer identity changes.
- * - woocommerce_get_cart_item_from_session: Restores Tierza pricing metadata upon cart session hydration.
+ * Hook interactions:
+ * - 'woocommerce_before_calculate_totals': calculates authoritative line prices before totals.
+ * - 'woocommerce_cart_item_price': formats unit price with strikethrough.
+ * - 'woocommerce_cart_item_subtotal': formats line subtotal with tax and strikethrough.
+ * - 'woocommerce_after_checkout_validation': blocks order creation on unresolved failures or discrepancies.
+ * - 'woocommerce_check_cart_items': displays customer-facing error notices.
+ * - 'wp_login' & 'wp_logout': handles session and customer identity transitions.
+ * - 'woocommerce_get_cart_item_from_session': safely restores session data without trusting stale prices.
  */
 class CartPricingIntegration {
 
@@ -33,9 +33,9 @@ class CartPricingIntegration {
 	private PricingFailureTracker $failure_tracker;
 	private bool $is_calculating = false;
 
-	public function __construct( CartPricingAdapter $adapter, ?PricingFailureTracker $failure_tracker = null ) {
+	public function __construct( CartPricingAdapter $adapter, PricingFailureTracker $failure_tracker ) {
 		$this->adapter         = $adapter;
-		$this->failure_tracker = $failure_tracker ?? $adapter->get_failure_tracker();
+		$this->failure_tracker = $failure_tracker;
 	}
 
 	public function get_adapter(): CartPricingAdapter {
@@ -54,9 +54,9 @@ class CartPricingIntegration {
 		add_filter( 'woocommerce_cart_item_price', [ $this, 'filter_cart_item_price' ], 10, 3 );
 		add_filter( 'woocommerce_cart_item_subtotal', [ $this, 'filter_cart_item_subtotal' ], 10, 3 );
 		add_action( 'woocommerce_after_checkout_validation', [ $this, 'on_after_checkout_validation' ], 10, 2 );
-		add_action( 'woocommerce_check_cart_items', [ $this, 'on_check_cart_items' ], 10 );
+		add_action( 'woocommerce_check_cart_items', [ $this, 'on_check_cart_items' ], 10, 0 );
 		add_action( 'wp_login', [ $this, 'on_user_login' ], 10, 2 );
-		add_action( 'wp_logout', [ $this, 'on_user_logout' ], 10 );
+		add_action( 'wp_logout', [ $this, 'on_user_logout' ], 10, 0 );
 		add_filter( 'woocommerce_get_cart_item_from_session', [ $this, 'on_get_cart_item_from_session' ], 10, 3 );
 	}
 
@@ -110,13 +110,35 @@ class CartPricingIntegration {
 		$this->is_calculating = true;
 
 		try {
-			// 1. Batch-prefetch candidate rules for all items in 1 single query.
-			$this->adapter->prefetch_cart( $cart_contents );
+			$customer_id     = $this->adapter->resolve_customer_id();
+			$prefetch_failed = false;
+
+			// 1. Batch-prefetch candidate rules for all items with explicit error trapping.
+			try {
+				$this->adapter->prefetch_cart( $cart_contents );
+			} catch ( Throwable $e ) {
+				$prefetch_failed = true;
+				$code            = $this->classify_exception( $e );
+				$safe_message    = $this->sanitize_error_message( $e );
+				$this->log_error( 'Batch prefetch failed for cart contents', $code, $safe_message );
+
+				// Mark all cart items as unverified in PricingFailureTracker:
+				foreach ( $cart_contents as $key => $item ) {
+					$p   = $item['data'] ?? null;
+					$pid = $p instanceof WC_Product ? (int) $p->get_id() : 0;
+					$this->failure_tracker->record_failure( $pid, $code, $safe_message, $customer_id, (string) $key );
+				}
+
+				if ( function_exists( 'do_action' ) ) {
+					do_action( 'tierza_cart_prefetch_failed', $cart_contents, $code, $safe_message );
+				}
+			}
 
 			// 2. Iterate and apply authoritative price to each cart item.
 			foreach ( $cart->cart_contents as $key => &$cart_item ) {
 				$product = $cart_item['data'] ?? null;
-				if ( ! $product instanceof WC_Product ) {
+				if ( ! $product instanceof WC_Product || $product->get_id() <= 0 ) {
+					$this->failure_tracker->record_failure( 0, PricingFailureTracker::CODE_INVALID_CONTEXT, 'Invalid cart item product data.', $customer_id, (string) $key );
 					continue;
 				}
 
@@ -124,11 +146,15 @@ class CartPricingIntegration {
 
 				try {
 					$this->adapter->apply_cart_item_pricing( $cart_item );
+					// Authoritative recalculation succeeded only if batch prefetch succeeded:
+					if ( ! $prefetch_failed ) {
+						$this->failure_tracker->clear_failure( $pid, $customer_id, (string) $key );
+					}
 				} catch ( Throwable $e ) {
 					$code         = $this->classify_exception( $e );
 					$safe_message = $this->sanitize_error_message( $e );
 
-					$this->failure_tracker->record_failure( $pid, $code, $safe_message );
+					$this->failure_tracker->record_failure( $pid, $code, $safe_message, $customer_id, (string) $key );
 					$this->log_error( 'Cart item pricing failed for product #' . $pid, $code, $safe_message );
 
 					if ( function_exists( 'do_action' ) ) {
@@ -164,6 +190,9 @@ class CartPricingIntegration {
 	/**
 	 * Filter cart item subtotal HTML.
 	 *
+	 * Shows standard strikethrough (<del>regular</del> <ins>discounted</ins>)
+	 * while preserving WooCommerce tax display modes and coupon-adjusted subtotal values.
+	 *
 	 * Hooked to 'woocommerce_cart_item_subtotal'.
 	 *
 	 * @param mixed $subtotal_html Original HTML.
@@ -182,9 +211,8 @@ class CartPricingIntegration {
 			return $subtotal_html;
 		}
 
-		$quantity = isset( $cart_item['quantity'] ) ? max( 1, (int) $cart_item['quantity'] ) : 1;
-		$raw_reg  = (string) $product->get_regular_price( 'edit' );
-		$price    = (string) $product->get_price( 'edit' );
+		$raw_reg = (string) $product->get_regular_price( 'edit' );
+		$price   = (string) $product->get_price( 'edit' );
 
 		if ( '' === $raw_reg || ! \Tierza\Domain\ValueObjects\DecimalMath::is_valid( $raw_reg ) ) {
 			return $subtotal_html;
@@ -193,24 +221,33 @@ class CartPricingIntegration {
 			return $subtotal_html;
 		}
 
-		$decimals   = $this->adapter->get_product_adapter()->get_store_decimals();
-		$price_args = [ 'decimals' => $decimals ];
+		$decimals = $this->adapter->get_product_adapter()->get_store_decimals();
 
-		$reg_subtotal   = \Tierza\Domain\ValueObjects\DecimalMath::mul( $raw_reg, (string) $quantity, $decimals );
-		$final_subtotal = \Tierza\Domain\ValueObjects\DecimalMath::mul( $price, (string) $quantity, $decimals );
-
-		if ( \Tierza\Domain\ValueObjects\DecimalMath::comp( $reg_subtotal, $final_subtotal, $decimals ) > 0 ) {
+		// Only show strike-through when discounted below regular price:
+		if ( \Tierza\Domain\ValueObjects\DecimalMath::comp( $raw_reg, $price, $decimals ) > 0 ) {
 			if ( function_exists( 'wc_format_sale_price' ) && function_exists( 'wc_price' ) ) {
-				$formatted_reg   = wc_price( $reg_subtotal, $price_args );
-				$formatted_final = wc_price( $final_subtotal, $price_args );
-				return wc_format_sale_price( $formatted_reg, $formatted_final );
+				$quantity   = isset( $cart_item['quantity'] ) ? max( 1, (int) $cart_item['quantity'] ) : 1;
+				$price_args = [ 'decimals' => $decimals ];
+
+				if ( function_exists( 'wc_get_price_to_display' ) ) {
+					$display_reg_subtotal = wc_get_price_to_display(
+						$product,
+						[
+							'price' => $raw_reg,
+							'qty'   => $quantity,
+						]
+					);
+					$formatted_reg        = wc_price( $display_reg_subtotal, $price_args );
+				} else {
+					$reg_subtotal  = \Tierza\Domain\ValueObjects\DecimalMath::mul( $raw_reg, (string) $quantity, $decimals );
+					$formatted_reg = wc_price( $reg_subtotal, $price_args );
+				}
+
+				return wc_format_sale_price( $formatted_reg, $subtotal_html );
 			}
 		}
 
-		if ( function_exists( 'wc_price' ) ) {
-			return wc_price( $final_subtotal, $price_args );
-		}
-
+		// When price equals regular price or is zero-discount, return native subtotal HTML:
 		return $subtotal_html;
 	}
 
@@ -265,10 +302,12 @@ class CartPricingIntegration {
 			return;
 		}
 
+		$customer_id = $this->adapter->resolve_customer_id();
 		$has_failure = false;
-		foreach ( $cart_contents as $item ) {
+		foreach ( $cart_contents as $key => $item ) {
 			$product = $item['data'] ?? null;
-			if ( $product instanceof WC_Product && $this->failure_tracker->has_failed( (int) $product->get_id() ) ) {
+			$pid     = $product instanceof WC_Product ? (int) $product->get_id() : 0;
+			if ( $this->failure_tracker->has_failed( $pid, $customer_id, (string) $key ) ) {
 				$has_failure = true;
 				break;
 			}
@@ -292,9 +331,11 @@ class CartPricingIntegration {
 	 */
 	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.FoundAfterLastUsed
 	public function on_user_login( string $user_login, WP_User $user ): void {
+		$uid = (int) $user->ID;
+		$this->failure_tracker->reset_customer( $uid );
+		$this->failure_tracker->reset_customer( 0 ); // guest
 		CartPricingAdapter::clear_cart_priced_registry();
 		$this->adapter->get_product_adapter()->clear_runtime_cache();
-		$this->failure_tracker->reset();
 
 		if ( function_exists( 'WC' ) && isset( WC()->cart ) && WC()->cart instanceof WC_Cart ) {
 			WC()->cart->calculate_totals();
@@ -307,9 +348,9 @@ class CartPricingIntegration {
 	 * Hooked to 'wp_logout'.
 	 */
 	public function on_user_logout(): void {
+		$this->failure_tracker->reset();
 		CartPricingAdapter::clear_cart_priced_registry();
 		$this->adapter->get_product_adapter()->clear_runtime_cache();
-		$this->failure_tracker->reset();
 
 		if ( function_exists( 'WC' ) && isset( WC()->cart ) && WC()->cart instanceof WC_Cart ) {
 			WC()->cart->calculate_totals();

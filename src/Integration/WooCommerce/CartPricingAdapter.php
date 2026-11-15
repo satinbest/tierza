@@ -24,7 +24,7 @@ use WC_Product_Variation;
  *
  * Responsibilities:
  * 1. Deterministic reconstruction of PricingContext for cart items including line quantity.
- * 2. Unfiltered original active price preservation (preventing double discounting across recalculations).
+ * 2. Unfiltered original active store price preservation (preventing double discounting across recalculations).
  * 3. Authoritative price application to cart item instances ($cart_item['data']->set_price()).
  * 4. High-performance batch prefetching across heterogeneous cart lines.
  * 5. Time-of-check / time-of-use revalidation at the checkout boundary (preventing order creation with invalid prices).
@@ -39,8 +39,31 @@ class CartPricingAdapter {
 	private ?PricingBatchPrefetcherInterface $batch_prefetcher;
 	private string $math_driver;
 
-	/** @var array<int, bool> */
-	private static array $cart_priced_product_ids = [];
+	/** @var \WeakMap<WC_Product, bool>|null */
+	private static ?\WeakMap $cart_priced_products = null;
+
+	/** @var \WeakMap<WC_Product, array{price: string, regular: string, sale: string}>|null */
+	private static ?\WeakMap $original_product_prices = null;
+
+	/**
+	 * @return \WeakMap<WC_Product, bool>
+	 */
+	private static function get_cart_priced_map(): \WeakMap {
+		if ( null === self::$cart_priced_products ) {
+			self::$cart_priced_products = new \WeakMap();
+		}
+		return self::$cart_priced_products;
+	}
+
+	/**
+	 * @return \WeakMap<WC_Product, array{price: string, regular: string, sale: string}>
+	 */
+	private static function get_original_prices_map(): \WeakMap {
+		if ( null === self::$original_product_prices ) {
+			self::$original_product_prices = new \WeakMap();
+		}
+		return self::$original_product_prices;
+	}
 
 	/**
 	 * Mark a product instance as authoritatively priced for cart calculation.
@@ -48,7 +71,7 @@ class CartPricingAdapter {
 	 * @param WC_Product $product Product instance.
 	 */
 	public static function mark_as_cart_priced( WC_Product $product ): void {
-		self::$cart_priced_product_ids[ spl_object_id( $product ) ] = true;
+		self::get_cart_priced_map()->offsetSet( $product, true );
 	}
 
 	/**
@@ -58,14 +81,39 @@ class CartPricingAdapter {
 	 * @return bool True if already priced for cart.
 	 */
 	public static function is_cart_priced( WC_Product $product ): bool {
-		return isset( self::$cart_priced_product_ids[ spl_object_id( $product ) ] );
+		return self::get_cart_priced_map()->offsetExists( $product );
 	}
 
 	/**
-	 * Reset cart-priced product registry.
+	 * Record clean original prices for a product instance before modification.
+	 *
+	 * @param WC_Product                                         $product Product instance.
+	 * @param array{price: string, regular: string, sale: string} $prices  Clean prices.
+	 */
+	public static function record_original_product_prices( WC_Product $product, array $prices ): void {
+		self::get_original_prices_map()->offsetSet( $product, $prices );
+	}
+
+	/**
+	 * Retrieve clean original prices for a product instance.
+	 *
+	 * @param WC_Product $product Product instance.
+	 * @return array{price: string, regular: string, sale: string}|null Clean prices or null if not recorded.
+	 */
+	public static function get_original_product_prices( WC_Product $product ): ?array {
+		$map = self::get_original_prices_map();
+		if ( ! $map->offsetExists( $product ) ) {
+			return null;
+		}
+		return $map->offsetGet( $product );
+	}
+
+	/**
+	 * Reset cart-priced product and original price registries.
 	 */
 	public static function clear_cart_priced_registry(): void {
-		self::$cart_priced_product_ids = [];
+		self::$cart_priced_products    = new \WeakMap();
+		self::$original_product_prices = new \WeakMap();
 	}
 
 	public function __construct(
@@ -122,25 +170,76 @@ class CartPricingAdapter {
 	}
 
 	/**
-	 * Retrieve unfiltered original store price for a cart item product.
+	 * Retrieve unfiltered original active store price for a cart item product.
 	 *
-	 * Critical for idempotency: Repeated calls to WC_Cart::calculate_totals() or
-	 * quantity changes must never apply discounts on top of previously discounted prices.
-	 *
-	 * In WooCommerce, calling $product->set_price() modifies the active price property
-	 * on the cart product instance, but regular_price and sale_price properties are preserved.
+	 * Restores authoritative original active-price semantics:
+	 * 1. Prioritizes genuine unfiltered active WooCommerce base price.
+	 * 2. If native sale is active ($is_native_sale), uses sale_price.
+	 * 3. If no native sale, uses active base price (even if different from regular price).
+	 * 4. Preserves clean original price state across repeated calculate_totals() passes,
+	 *    preventing double-discounting on already-discounted product instances.
+	 * 5. Re-reads fresh database prices safely after product updates.
+	 * 6. Preserves legitimate zero-priced items ('0' / '0.00').
+	 * 7. Strictly validates monetary strings and rejects invalid inputs with InvalidMoneyException.
 	 *
 	 * @param WC_Product           $product   Cart line item product instance.
 	 * @param array<string, mixed> $cart_item Cart line item payload.
 	 * @return string Arbitrary-precision decimal string.
 	 * @throws InvalidMoneyException If monetary value cannot be extracted or is malformed.
 	 */
+	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.FoundAfterLastUsed
 	public function get_unfiltered_base_price( WC_Product $product, array $cart_item ): string {
-		// 1. If previously recorded base price is present on the cart item, verify against product regular price:
-		$raw_reg  = (string) $product->get_regular_price( 'edit' );
-		$raw_sale = (string) $product->get_sale_price( 'edit' );
+		$recorded = self::get_original_product_prices( $product );
 
-		// Validate syntax if present.
+		// 1. If product instance has already been priced by Tierza in current request,
+		// retrieve preserved original store prices from registry:
+		if ( self::is_cart_priced( $product ) && null !== $recorded ) {
+			$raw_price = $recorded['price'];
+			$raw_reg   = $recorded['regular'];
+			$raw_sale  = $recorded['sale'];
+		} elseif ( self::is_cart_priced( $product ) && function_exists( 'wc_get_product' ) && $product->get_id() > 0 ) {
+			// Fallback: reload clean product from store if available
+			$fresh = wc_get_product( $product->get_id() );
+			if ( $fresh instanceof WC_Product && ! self::is_cart_priced( $fresh ) ) {
+				$raw_price = (string) $fresh->get_price( 'edit' );
+				$raw_reg   = (string) $fresh->get_regular_price( 'edit' );
+				$raw_sale  = (string) $fresh->get_sale_price( 'edit' );
+				self::record_original_product_prices(
+					$product,
+					[
+						'price'   => $raw_price,
+						'regular' => $raw_reg,
+						'sale'    => $raw_sale,
+					]
+				);
+			} else {
+				$raw_price = (string) $product->get_price( 'edit' );
+				$raw_reg   = (string) $product->get_regular_price( 'edit' );
+				$raw_sale  = (string) $product->get_sale_price( 'edit' );
+			}
+		} else {
+			// Fresh unmutated product instance as provided by WooCommerce or session:
+			$raw_price = (string) $product->get_price( 'edit' );
+			$raw_reg   = (string) $product->get_regular_price( 'edit' );
+			$raw_sale  = (string) $product->get_sale_price( 'edit' );
+
+			// Preserve clean state for subsequent passes in this request:
+			self::record_original_product_prices(
+				$product,
+				[
+					'price'   => $raw_price,
+					'regular' => $raw_reg,
+					'sale'    => $raw_sale,
+				]
+			);
+		}
+
+		// 2. Strict syntax validation:
+		if ( '' !== $raw_price && ! DecimalMath::is_valid( $raw_price ) ) {
+			throw new InvalidMoneyException(
+				sprintf( 'Product #%d has invalid price "%s".', $product->get_id(), $raw_price )
+			);
+		}
 		if ( '' !== $raw_reg && ! DecimalMath::is_valid( $raw_reg ) ) {
 			throw new InvalidMoneyException(
 				sprintf( 'Product #%d has invalid regular price "%s".', $product->get_id(), $raw_reg )
@@ -152,39 +251,34 @@ class CartPricingAdapter {
 			);
 		}
 
-		// 2. Active scheduled promotional sale awareness.
+		// 3. Reject unpriced items:
+		if ( '' === $raw_price && '' === $raw_reg ) {
+			throw new InvalidMoneyException(
+				sprintf( 'Product #%d has no price configured in WooCommerce.', $product->get_id() )
+			);
+		}
+
+		// 4. Candidate active price: primary is unfiltered active price; fall back to regular price:
+		$base_price_candidate = '' !== $raw_price ? $raw_price : $raw_reg;
+
+		// 5. Active scheduled promotional sale awareness:
 		$is_native_sale = $this->product_adapter->is_product_on_sale( $product, $raw_reg, $raw_sale );
 		if ( $is_native_sale && '' !== $raw_sale ) {
 			return $raw_sale;
 		}
 
-		if ( '' !== $raw_reg ) {
-			return $raw_reg;
-		}
-
-		// 3. For custom items or products without regular_price set, use preserved original price if present.
-		if ( isset( $cart_item['tierza_pricing']['base_price'] ) && is_string( $cart_item['tierza_pricing']['base_price'] ) ) {
-			return $cart_item['tierza_pricing']['base_price'];
-		}
-
-		$raw_price = (string) $product->get_price( 'edit' );
-		if ( '' !== $raw_price && DecimalMath::is_valid( $raw_price ) ) {
-			return $raw_price;
-		}
-
-		throw new InvalidMoneyException(
-			sprintf( 'Unable to determine unfiltered base price for cart product #%d.', $product->get_id() )
-		);
+		return $base_price_candidate;
 	}
 
 	/**
-	 * Construct a strongly typed PricingContext for a WooCommerce cart line item.
+	 * Construct a strongly typed PricingContext from a cart line item.
 	 *
-	 * Incorporates line quantity, variation hierarchy, categories, and trusted identity.
+	 * Preserves original base price, quantity, customer, group, and category taxonomy.
 	 *
-	 * @param array<string, mixed> $cart_item   Cart item array from WC_Cart.
-	 * @param int|null             $customer_id Optional customer ID override (test mode only).
+	 * @param array<string, mixed> $cart_item   Cart line item array.
+	 * @param int|null             $customer_id Optional explicit customer ID (testing only).
 	 * @return PricingContext|null Strongly typed context or null if unpriced.
+	 * @throws InvalidMoneyException If price values are invalid.
 	 */
 	public function get_cart_item_pricing_context( array $cart_item, ?int $customer_id = null ): ?PricingContext {
 		$product = $cart_item['data'] ?? null;
@@ -193,8 +287,11 @@ class CartPricingAdapter {
 		}
 
 		$raw_base_price = $this->get_unfiltered_base_price( $product, $cart_item );
-		$raw_reg        = (string) $product->get_regular_price( 'edit' );
-		$raw_sale       = (string) $product->get_sale_price( 'edit' );
+
+		$obj_id   = spl_object_id( $product );
+		$prices   = self::get_original_product_prices( $product );
+		$raw_reg  = $prices['regular'] ?? (string) $product->get_regular_price( 'edit' );
+		$raw_sale = $prices['sale'] ?? (string) $product->get_sale_price( 'edit' );
 
 		// Establish product and variation relationship.
 		$variation_id = null;
@@ -298,25 +395,26 @@ class CartPricingAdapter {
 	}
 
 	/**
-	 * Prefetch candidate pricing rules for all items in a cart in a single batch query.
+	 * Batch prefetch candidate rules and taxonomic terms for all cart items in a single query.
 	 *
-	 * @param array<string, array<string, mixed>> $cart_contents Array of cart items.
+	 * @param array<string, array<string, mixed>> $cart_contents Cart contents array.
 	 * @param int|null                            $customer_id   Optional customer ID.
 	 */
 	public function prefetch_cart( array $cart_contents, ?int $customer_id = null ): void {
-		if ( empty( $cart_contents ) || null === $this->batch_prefetcher ) {
+		if ( null === $this->batch_prefetcher || empty( $cart_contents ) ) {
 			return;
 		}
 
+		$contexts  = [];
 		$products  = [];
 		$prime_ids = [];
-		$contexts  = [];
 
 		foreach ( $cart_contents as $key => $item ) {
 			$product = $item['data'] ?? null;
 			if ( ! $product instanceof WC_Product ) {
 				continue;
 			}
+
 			$products[]  = $product;
 			$prime_ids[] = (int) $product->get_id();
 
@@ -344,9 +442,10 @@ class CartPricingAdapter {
 	 * Time-of-check / time-of-use revalidation at the checkout boundary.
 	 *
 	 * Guarantees that:
-	 * 1. No unresolved calculation or repository failure permits order creation.
-	 * 2. Final cart line prices match currently active pricing rules.
-	 * 3. Stale customer identities or modified rules block checkout until reconciled.
+	 * 1. Fails closed: corrupted, missing, or unverifiable cart items block checkout.
+	 * 2. No unresolved calculation, repository, or prefetch failure permits order creation.
+	 * 3. Final cart line prices match currently active pricing rules.
+	 * 4. Stale customer identities or modified rules block checkout until reconciled.
 	 *
 	 * @param WC_Cart  $cart        WooCommerce cart instance.
 	 * @param int|null $customer_id Optional customer ID.
@@ -372,90 +471,88 @@ class CartPricingAdapter {
 			];
 		}
 
-		// 1. Check for previously recorded unresolved pricing failures on cart products.
-		foreach ( $cart_contents as $item ) {
+		$resolved_customer_id = $this->resolve_customer_id( $customer_id );
+
+		// 1. Fail closed on corrupted items or unresolved pricing failures:
+		foreach ( $cart_contents as $key => $item ) {
 			$product = $item['data'] ?? null;
-			if ( ! $product instanceof WC_Product ) {
+			if ( ! $product instanceof WC_Product || $product->get_id() <= 0 ) {
+				$errors[]             = sprintf( 'Cart line "%s" contains invalid or corrupted product data.', $key );
+				$failed_product_ids[] = 0;
 				continue;
 			}
+
 			$pid = (int) $product->get_id();
-			if ( $this->failure_tracker->has_failed( $pid ) ) {
+			if ( $this->failure_tracker->has_failed( $pid, $resolved_customer_id, (string) $key ) ) {
 				$failed_product_ids[] = $pid;
 				$errors[]             = sprintf( 'Product #%d has an unresolved pricing calculation error.', $pid );
 			}
 		}
 
-		// 2. Fresh re-evaluation of all cart items against current database rules.
+		// 2. Fresh re-evaluation of all cart items against current database rules:
 		foreach ( $cart_contents as $key => $item ) {
 			$product = $item['data'] ?? null;
-			if ( ! $product instanceof WC_Product ) {
-				continue;
+			if ( ! $product instanceof WC_Product || $product->get_id() <= 0 ) {
+				continue; // already flagged
 			}
+
 			$pid = (int) $product->get_id();
 
 			try {
-				$context = $this->get_cart_item_pricing_context( $item, $customer_id );
+				$context = $this->get_cart_item_pricing_context( $item, $resolved_customer_id );
 				if ( null === $context ) {
+					$errors[]             = sprintf( 'Product #%d in cart cannot be authoritatively verified.', $pid );
+					$failed_product_ids[] = $pid;
 					continue;
 				}
 
 				$resolution     = $this->rule_resolver->resolve( $context );
-				$pricing_result = $this->price_calculator->calculate( $context, $resolution );
-
+				$current_res    = $this->price_calculator->calculate( $context, $resolution );
 				$decimals       = $this->product_adapter->get_store_decimals();
-				$expected_price = $this->format_decimal( $pricing_result->final_price()->amount(), $decimals );
-				$actual_price   = (string) $product->get_price( 'edit' );
+				$expected_price = $this->format_decimal( $current_res->final_price()->amount(), $decimals );
 
-				if ( DecimalMath::comp( $expected_price, $actual_price, $decimals, $this->math_driver ) !== 0 ) {
-					$discrepancies[ $key ] = [
-						'cart_price'    => $actual_price,
+				$actual_cart_price = (string) $product->get_price( 'edit' );
+
+				if ( DecimalMath::comp( $expected_price, $actual_cart_price, $decimals, $this->math_driver ) !== 0 ) {
+					$discrepancies[ (string) $key ] = [
+						'cart_price'    => $actual_cart_price,
 						'current_price' => $expected_price,
 					];
-					$errors[]              = sprintf(
-						'Price discrepancy on product #%d: cart has %s, current rules evaluate to %s.',
+					$errors[]                       = sprintf(
+						'Price discrepancy on product #%d: cart price is %s but current rule yields %s.',
 						$pid,
-						$actual_price,
+						$actual_cart_price,
 						$expected_price
 					);
+					$failed_product_ids[]           = $pid;
 				}
 			} catch ( \Throwable $e ) {
 				$failed_product_ids[] = $pid;
-				$this->failure_tracker->record_failure(
-					$pid,
-					PricingFailureTracker::CODE_CALCULATION_FAILED,
-					$e->getMessage()
-				);
-				$errors[] = sprintf( 'Pricing engine failure during checkout validation on product #%d.', $pid );
+				$errors[]             = sprintf( 'Failed to verify current price for product #%d: %s', $pid, $e->getMessage() );
 			}
 		}
 
-		$is_valid = empty( $errors ) && empty( $failed_product_ids ) && empty( $discrepancies );
-
 		return [
-			'valid'              => $is_valid,
-			'errors'             => $errors,
+			'valid'              => empty( $errors ),
+			'errors'             => array_values( array_unique( $errors ) ),
 			'failed_product_ids' => array_values( array_unique( $failed_product_ids ) ),
 			'discrepancies'      => $discrepancies,
 		];
 	}
 
 	/**
-	 * Format cart item unit price HTML matching catalog strikethrough styling.
+	 * Format cart item unit price HTML.
 	 *
-	 * @param string               $original_html Original price HTML.
-	 * @param array<string, mixed> $cart_item    Cart line item payload.
-	 * @param int|null             $customer_id  Optional customer ID.
+	 * Shows standard WooCommerce strikethrough (<del>regular</del> <ins>sale</ins>)
+	 * when discounted, preserving WooCommerce tax display modes (inc/exc tax) and suffixes.
+	 *
+	 * @param string               $original_html Original formatted HTML.
+	 * @param array<string, mixed> $cart_item     Cart line item.
 	 * @return string Formatted price HTML.
 	 */
-	// phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.FoundAfterLastUsed
-	public function format_cart_item_price_html( string $original_html, array $cart_item, ?int $customer_id = null ): string {
+	public function format_cart_item_price_html( string $original_html, array $cart_item ): string {
 		$product = $cart_item['data'] ?? null;
 		if ( ! $product instanceof WC_Product ) {
-			return $original_html;
-		}
-
-		$raw_reg = (string) $product->get_regular_price( 'edit' );
-		if ( '' === $raw_reg || ! DecimalMath::is_valid( $raw_reg ) ) {
 			return $original_html;
 		}
 
@@ -464,22 +561,33 @@ class CartPricingAdapter {
 			return $original_html;
 		}
 
-		$decimals   = $this->product_adapter->get_store_decimals();
-		$price_args = [ 'decimals' => $decimals ];
+		$raw_reg = (string) $product->get_regular_price( 'edit' );
+		if ( '' === $raw_reg || ! DecimalMath::is_valid( $raw_reg ) ) {
+			return $original_html;
+		}
 
-		// If discount applied relative to regular price, show strikethrough sale format.
+		$decimals = $this->product_adapter->get_store_decimals();
+
+		// If current price is strictly less than regular price, show strikethrough:
 		if ( DecimalMath::comp( $raw_reg, $current_price, $decimals, $this->math_driver ) > 0 ) {
 			if ( function_exists( 'wc_format_sale_price' ) && function_exists( 'wc_price' ) ) {
-				$formatted_reg   = wc_price( $raw_reg, $price_args );
-				$formatted_final = wc_price( $current_price, $price_args );
-				return wc_format_sale_price( $formatted_reg, $formatted_final );
+				$price_args  = [ 'decimals' => $decimals ];
+				$reg_display = function_exists( 'wc_get_price_to_display' )
+					? wc_get_price_to_display( $product, [ 'price' => $raw_reg ] )
+					: $raw_reg;
+				$cur_display = function_exists( 'wc_get_price_to_display' )
+					? wc_get_price_to_display( $product, [ 'price' => $current_price ] )
+					: $current_price;
+
+				$formatted_reg   = wc_price( $reg_display, $price_args );
+				$formatted_final = wc_price( $cur_display, $price_args );
+				$suffix          = $product->get_price_suffix();
+
+				return wc_format_sale_price( $formatted_reg, $formatted_final ) . $suffix;
 			}
 		}
 
-		if ( function_exists( 'wc_price' ) ) {
-			return wc_price( $current_price, $price_args );
-		}
-
+		// When price equals regular price or is zero-discount, return original HTML untouched:
 		return $original_html;
 	}
 

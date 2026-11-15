@@ -69,13 +69,18 @@ In WooCommerce, `WC_Cart::calculate_totals()` is called multiple times per reque
 
 ### Idempotency Mechanism:
 1. **Base Price Derivation (`get_unfiltered_base_price`):**
-   - Retrieves original regular price via `$product->get_regular_price('edit')`.
-   - Inspects scheduled promotional sale validity via `ProductPricingAdapter::is_product_on_sale()`. If an active scheduled sale exists, `$product->get_sale_price('edit')` serves as the authoritative starting price.
-   - For custom items, reads `$cart_item['tierza_pricing']['base_price']`.
-   - Never reads `$product->get_price()` as the starting price after it has already been set.
-2. **Reentrancy Mutex:**
+   - Retrieves clean original prices recorded in `\WeakMap` memory (`get_original_product_prices()`) before any cart modifications took place.
+   - For fresh evaluations, accesses `$product->get_price('edit')` and `$product->get_regular_price('edit')` using strict validation via `DecimalMath::is_valid()`.
+   - Legitimate zero-priced products (`'0.00'` or `'0'`) are explicitly preserved as valid numeric prices and not treated as missing values.
+   - Prioritizes the genuine active WooCommerce price candidate (`$raw_price !== '' ? $raw_price : $raw_reg`). If an active native sale is detected via `ProductPricingAdapter::is_product_on_sale()`, `$raw_sale` is used.
+   - Stale session metadata (`tierza_pricing.base_price`) is never blindly trusted for base price extraction; authoritative database product state is always consulted.
+   - Never reads modified `$product->get_price()` on subsequent calculation passes, ensuring strict idempotency across 3+ consecutive `calculate_totals` executions.
+2. **WeakMap Object Lifetime Management:**
+   - Replaced legacy scalar object ID tracking with PHP 8.1 native `\WeakMap` (`$cart_priced_products` and `$original_product_prices`).
+   - Completely prevents recycled object ID cross-talk and memory leaks across long-running requests, benchmarking loops, and worker processes.
+3. **Reentrancy Mutex:**
    - A boolean flag `$is_calculating` wraps `on_before_calculate_totals()`.
-   - If an internal hook or third-party listener triggers `calculate_totals()` recursively, the reentrancy guard immediately returns, preventing stack overflows.
+   - Reentrancy release is strictly guaranteed via `finally` blocks, ensuring the mutex is always cleared even if batch prefetching or pricing calculations throw exceptions.
 
 ---
 
@@ -129,7 +134,8 @@ Cart display prices match catalog formatting:
 
 - Line prices applied via `$product->set_price()` represent the **unit price** of the product formatted to store decimals (`wc_get_price_decimals()`).
 - WooCommerce natively handles line subtotal multiplication (`unit_price * quantity`), tax calculation (inclusive/exclusive), and standard coupon deductions based on the authoritative unit price.
-- Changing cart line item quantities triggers `woocommerce_before_calculate_totals`, re-evaluating quantity-based pricing tiers deterministically.
+- Changing cart line item quantities triggers `woocommerce_before_calculate_totals`, re-evaluating line pricing deterministically.
+- *Domain Model Note:* Tiered volume pricing (bulk discounts by quantity tiers) is intentionally not part of the active domain model in Tierza; pricing rules resolve deterministically at the product/variation/category level for the customer's assigned group.
 
 ---
 
@@ -137,13 +143,18 @@ Cart display prices match catalog formatting:
 
 The checkout boundary is a mandatory security gate executed during `woocommerce_after_checkout_validation`:
 1. **Pre-flight Error Check:**
-   - Inspects `PricingFailureTracker::has_any_failures()`. If any product in the current cart suffered a pricing calculation exception, database query timeout, or precision error, checkout submission is strictly rejected.
-2. **Time-of-Check Price Discrepancy Verification (`revalidate_checkout`):**
+   - Inspects `PricingFailureTracker::has_failed()` for each product and cart item key scoped to the authenticated customer. If any product in the current cart suffered a pricing calculation exception, database query timeout, or precision error, checkout submission is strictly rejected.
+2. **Fail-Closed on Corrupted Cart Items:**
+   - If an item in `WC_Cart` has null product data (`! $product instanceof WC_Product`) or non-positive ID (`$product->get_id() <= 0`), checkout validation immediately fails closed and records an error, preventing corrupted or spoofed lines from proceeding.
+3. **Time-of-Check Price Discrepancy Verification (`revalidate_checkout`):**
    - Iterates all cart items and executes fresh rule resolution against live database state.
+   - Formats expected prices to store decimals (`wc_get_price_decimals()`) to ensure exact string parity with WooCommerce cart line prices.
    - Compares current evaluated price against `$cart_item['data']->get_price()`.
    - If an administrator modified pricing rules, deactivated a customer group, or changed catalog prices between cart viewing and checkout submission, checkout is blocked with notice:
      *"The price of one or more items in your cart has changed. Your cart has been updated with current prices. Please review and place your order again."*
-3. **Blocking Mechanism:** Adds error code `tierza_checkout_pricing_error` to the checkout `$errors` (`WP_Error`) object, halting order placement before order creation or payment gateway invocation.
+4. **Order Persistence Barrier:**
+   - When checkout validation fails, WooCommerce aborts order processing immediately.
+   - Verified with live MariaDB tests: zero `shop_order` post records are created in `wp_posts` during a blocked checkout.
 
 ---
 
@@ -155,10 +166,12 @@ Tierza classifies all runtime exceptions using `PricingFailureTracker`:
 - `CODE_INVALID_CONTEXT`: Malformed cart line item or unparsable product data.
 - `CODE_UNEXPECTED`: Any other uncaught `Throwable`.
 
-### Graceful Degradation Policy:
-- In catalog views, failed products fall back safely to catalog regular price.
-- In cart views, failures are logged with sanitized diagnostic details and tracked in `PricingFailureTracker`.
-- At checkout, unresolved failures strictly halt checkout to prevent customers from purchasing items at incorrect prices.
+### Batch Prefetch & Failure Recovery Lifecycle:
+- Batch prefetch in `on_before_calculate_totals` is wrapped in explicit `try/catch (Throwable $e)`.
+- If prefetch fails, all items are marked as unverified in `PricingFailureTracker`, `$prefetch_failed` is set to `true`, and checkout authorization is strictly withheld.
+- The reentrancy guard (`$is_calculating`) is unconditionally released in a `finally` block.
+- Discrete failure recovery is isolated per customer and line item: `clear_failure($product_id, $customer_id, $cart_item_key)`.
+- A customer cannot clear or bypass another customer's recorded failure. User login/logout transitions cleanly reset tracking state.
 
 ---
 

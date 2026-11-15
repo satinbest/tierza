@@ -15,7 +15,8 @@ This guide details how to set up, run, and test Tierza in local development and 
 - **Git**: `2.x`
 
 ### Containerization (For Live WordPress Test Environment)
-- **Docker Desktop**: Required to run the official `@wordpress/env` stack.
+- **Kiri (Recommended)**: Ultra-lightweight container runtime alternative to Docker Desktop with >90% lower host RAM usage and 97% lower idle disk footprint. See [Kiri Setup Guide](kiri-setup.md) for installation and usage.
+- **Docker Desktop**: Standard container runtime for `@wordpress/env` stack.
   - Windows: WSL2 backend enabled.
   - Linux/macOS: Docker Engine with Docker Compose v2.
 

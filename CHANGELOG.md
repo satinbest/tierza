@@ -153,3 +153,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Hardened cart item price and subtotal HTML display compatibility with `wc_get_price_to_display()` respecting tax-inclusive/tax-exclusive settings and price suffixes, preserving native markup when no discount applies.
   - Clarified that tiered volume quantity pricing is intentionally not part of the active domain model in Tierza; pricing rules resolve deterministically at the product/variation/category level for customer groups.
   - Expanded automated test suite to 581 PHPUnit tests (5,611 assertions) and 69 live MariaDB integration tests (891 assertions) passing at 100%.
+- WooCommerce Blocks & Store API Integration layer (`StoreApiPricingIntegration`) connecting authoritative Tierza pricing to Gutenberg Cart & Checkout Blocks via `/wp-json/wc/store/v1/` (TRZ-012).
+- Store API lifecycle integration with `woocommerce_store_api_cart_errors`, `woocommerce_store_api_checkout_update_order_meta`, and `woocommerce_store_api_checkout_order_processed` (TRZ-012).
+- Minor-units currency formatting (`prices->price`, `totals->line_total`) consistent with Store API and decimal order totals (TRZ-012).
+- Fail-closed Store API checkout boundary throwing `InvalidCartException` (HTTP 409) and `RouteException` (HTTP 400) on pricing failures or discrepancies, preventing unauthorized order persistence (TRZ-012).
+- Complete prevention of sensitive information disclosure with generic translated shopper error messages, internal redacted diagnostic logging, and sanitized error payloads on `tierza_store_api_checkout_pricing_validation_failed` (TRZ-012).
+- Zero database mutation of catalog prices in `wp_posts` and `wp_postmeta` during Store API cart calculations and draft order creation (TRZ-012).
+- Store API performance baseline benchmark: 100 items processed in 31.37 ms total (0.31 ms/item, peak memory 107.23 MB) with candidate rules prefetched in a single SQL query (TRZ-012).
+- Expanded automated test suite to 608 PHPUnit tests (5,754 assertions), 72 live MariaDB integration tests (960 assertions), and 17 Playwright E2E browser tests passing at 100% (TRZ-012).
+- Comprehensive architecture specification (`docs/architecture/woocommerce-blocks-store-api.md`) (TRZ-012).

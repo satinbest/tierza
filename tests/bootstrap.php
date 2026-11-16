@@ -389,6 +389,7 @@ if ( ! function_exists( 'dbDelta' ) ) {
 }
 
 require_once __DIR__ . '/stubs/woocommerce-stubs.php';
+require_once __DIR__ . '/stubs/store-api-stubs.php';
 
 // Include plugin entry point to declare constants.
 require_once dirname( __DIR__ ) . '/tierza.php';

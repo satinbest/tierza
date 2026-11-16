@@ -25,6 +25,7 @@ use Tierza\Integration\WooCommerce\CartPricingAdapter;
 use Tierza\Integration\WooCommerce\CartPricingIntegration;
 use Tierza\Integration\WooCommerce\ProductPricingAdapter;
 use Tierza\Integration\WooCommerce\ProductPricingIntegration;
+use Tierza\Integration\WooCommerce\StoreApiPricingIntegration;
 
 /**
  * Main Tierza plugin singleton coordinator.
@@ -53,6 +54,7 @@ final class Plugin {
 	private ?ProductPricingIntegration $pricing_integration                  = null;
 	private ?CartPricingAdapter $cart_pricing_adapter                        = null;
 	private ?CartPricingIntegration $cart_pricing_integration                = null;
+	private ?StoreApiPricingIntegration $store_api_pricing_integration       = null;
 	private ?PricingFailureTracker $pricing_failure_tracker                  = null;
 	private ?AdminPricingSimulationService $admin_pricing_simulation_service = null;
 
@@ -161,6 +163,9 @@ final class Plugin {
 		);
 		$this->cart_pricing_integration = new CartPricingIntegration( $this->cart_pricing_adapter, $this->pricing_failure_tracker );
 		$this->cart_pricing_integration->register();
+
+		$this->store_api_pricing_integration = new StoreApiPricingIntegration( $this->cart_pricing_adapter, $this->pricing_failure_tracker );
+		$this->store_api_pricing_integration->register();
 
 		$this->admin_pricing_simulation_service = new AdminPricingSimulationService( $this->pricing_adapter );
 
@@ -315,6 +320,13 @@ final class Plugin {
 	 */
 	public function get_cart_pricing_integration(): ?CartPricingIntegration {
 		return $this->cart_pricing_integration;
+	}
+
+	/**
+	 * Get WooCommerce Store API & Blocks pricing integration.
+	 */
+	public function get_store_api_pricing_integration(): ?StoreApiPricingIntegration {
+		return $this->store_api_pricing_integration;
 	}
 
 	/**

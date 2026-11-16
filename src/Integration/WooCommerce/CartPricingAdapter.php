@@ -482,7 +482,11 @@ class CartPricingAdapter {
 			PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE => __( 'Pricing repository unavailable.', 'tierza' ),
 			PricingFailureTracker::CODE_CALCULATION_FAILED     => __( 'Pricing calculation failed.', 'tierza' ),
 			PricingFailureTracker::CODE_INVALID_CONTEXT        => __( 'Invalid pricing context or monetary value.', 'tierza' ),
-			'TRZ_ERR_PRICE_DISCREPANCY'                        => __( 'Cart price does not match current pricing rules.', 'tierza' ),
+			'TRZ_ERR_PRICE_DISCREPANCY',
+			'price_discrepancy',
+			'order_price_mismatch'                             => __( 'There was an issue verifying prices for items in your cart. Please review your cart and try again.', 'tierza' ),
+			'unresolved_pricing_failure',
+			'tierza_checkout_pricing_failed'                   => __( 'There was an issue verifying prices for items in your cart. Please review your cart and try again.', 'tierza' ),
 			default                                            => __( 'An unexpected error occurred during pricing evaluation.', 'tierza' ),
 		};
 	}

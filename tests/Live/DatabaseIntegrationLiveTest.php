@@ -42,6 +42,7 @@ use Tierza\Domain\ValueObjects\PricingValue;
 use Tierza\Domain\ValueObjects\RuleScope;
 use Tierza\Domain\ValueObjects\RuleStatus;
 use Tierza\Domain\ValueObjects\RuleTarget;
+use Tierza\Application\Pricing\PricingFailureTracker;
 use Tierza\Infrastructure\Database\Schema;
 use Tierza\Infrastructure\Repositories\WpGroupRepository;
 use Tierza\Infrastructure\Repositories\WpRuleRepository;
@@ -140,6 +141,21 @@ class DatabaseIntegrationLiveTest {
 			'test_woocommerce_catalog_loop_batch_prefetching_in_mariadb',
 			'test_variation_version_atomic_concurrency_and_failure_safety_in_mariadb',
 			'test_pricing_failure_tracking_and_degraded_fallback_in_mariadb',
+			'test_woocommerce_cart_pricing_customer_isolation_and_fallback_in_mariadb',
+			'test_woocommerce_cart_totals_idempotence_three_consecutive_recalculations_in_mariadb',
+			'test_woocommerce_cart_repricing_on_customer_login_in_mariadb',
+			'test_woocommerce_cart_updates_on_rule_modification_or_group_deactivation_in_mariadb',
+			'test_woocommerce_checkout_validation_blocks_on_pricing_failures_and_discrepancies_in_mariadb',
+			'test_woocommerce_checkout_validation_recovery_restores_order_placement_in_mariadb',
+			'test_woocommerce_cart_zero_priced_item_supported_in_mariadb',
+			'test_woocommerce_cart_database_immutability_in_mariadb',
+			'test_woocommerce_cart_authoritative_active_base_90_matches_catalog_in_mariadb',
+			'test_woocommerce_cart_batch_prefetch_fault_injection_and_recovery_in_mariadb',
+			'test_woocommerce_failure_tracker_recovery_lifecycle_sequence_in_mariadb',
+			'test_woocommerce_checkout_barrier_blocks_real_order_persistence_in_mariadb',
+			'test_woocommerce_real_process_checkout_submission_lifecycle_in_mariadb',
+			'test_woocommerce_cart_fail_closed_on_invalid_or_corrupted_items_in_mariadb',
+			'test_woocommerce_cart_performance_baseline_benchmark_in_mariadb',
 		];
 
 		foreach ( $methods as $method ) {
@@ -3120,6 +3136,1327 @@ class DatabaseIntegrationLiveTest {
 			$tracker->reset();
 			$product->delete( true );
 		}
+	}
+
+	public function test_woocommerce_cart_pricing_customer_isolation_and_fallback_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group_a = $this->group_repo->save( new PricingGroup( 'Cart Group A', 'cart-group-a' ) );
+		$ga_id   = (int) $group_a->id();
+		$group_b = $this->group_repo->save( new PricingGroup( 'Cart Group B', 'cart-group-b' ) );
+		$gb_id   = (int) $group_b->id();
+
+		$uid_a = $this->create_test_user( 'cart_user_a', 'cart_a@test.com' );
+		$uid_b = $this->create_test_user( 'cart_user_b', 'cart_b@test.com' );
+		$this->user_group_repo->assign( $uid_a, $ga_id );
+		$this->user_group_repo->assign( $uid_b, $gb_id );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Live Cart Isolation Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		// Rule A: 20% discount on product for Group A (-> 80.00)
+		$rule_a = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $ga_id ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		// Rule B: 35% discount on product for Group B (-> 65.00)
+		$rule_b = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gb_id ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '35.000000' )
+		) );
+
+		try {
+			// 1. User A in Cart
+			wp_set_current_user( $uid_a );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			$cart_items = WC()->cart->get_cart();
+			$item_a     = reset( $cart_items );
+			$this->assert( '80.00' === $item_a['data']->get_price(), "User A cart item price must be 80.00, got: {$item_a['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_total( 'edit' ) === 80.0, 'User A cart total must be 80.00.' );
+
+			// 2. User B in Cart
+			wp_set_current_user( $uid_b );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			$cart_items = WC()->cart->get_cart();
+			$item_b     = reset( $cart_items );
+			$this->assert( '65.00' === $item_b['data']->get_price(), "User B cart item price must be 65.00, got: {$item_b['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_total( 'edit' ) === 65.0, 'User B cart total must be 65.00.' );
+
+			// 3. Guest in Cart
+			wp_set_current_user( 0 );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			$cart_items = WC()->cart->get_cart();
+			$item_guest = reset( $cart_items );
+			$this->assert( '100.00' === $item_guest['data']->get_price(), "Guest cart item price must be 100.00, got: {$item_guest['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_total( 'edit' ) === 100.0, 'Guest cart total must be 100.00.' );
+		} finally {
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule_a->id() );
+			$this->rule_repo->delete( (int) $rule_b->id() );
+			$this->user_group_repo->remove( $uid_a );
+			$this->user_group_repo->remove( $uid_b );
+			$this->delete_test_user( $uid_a );
+			$this->delete_test_user( $uid_b );
+			$this->group_repo->delete( $ga_id );
+			$this->group_repo->delete( $gb_id );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_cart_totals_idempotence_three_consecutive_recalculations_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Idempotence Group', 'idempotence-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'idem_user', 'idem@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Idempotence Test Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		// 20% discount on product (100 -> 80)
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 2 );
+
+			// Pass 1
+			WC()->cart->calculate_totals();
+			$items1 = WC()->cart->get_cart();
+			$item1  = reset( $items1 );
+			$this->assert( '80.00' === $item1['data']->get_price(), "Pass 1 item price must be 80.00, got {$item1['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_subtotal() === 160.0, 'Pass 1 subtotal must be 160.00.' );
+
+			// Pass 2 - Idempotency verification
+			WC()->cart->calculate_totals();
+			$items2 = WC()->cart->get_cart();
+			$item2  = reset( $items2 );
+			$this->assert( '80.00' === $item2['data']->get_price(), "Pass 2 item price must remain 80.00, got {$item2['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_subtotal() === 160.0, 'Pass 2 subtotal must remain 160.00 (no double discounting).' );
+
+			// Pass 3 - Idempotency verification
+			WC()->cart->calculate_totals();
+			$items3 = WC()->cart->get_cart();
+			$item3  = reset( $items3 );
+			$this->assert( '80.00' === $item3['data']->get_price(), "Pass 3 item price must remain 80.00, got {$item3['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_subtotal() === 160.0, 'Pass 3 subtotal must remain 160.00.' );
+
+			// Quantity change: increase from 2 to 3
+			foreach ( WC()->cart->get_cart() as $cart_key => $cart_item ) {
+				WC()->cart->set_quantity( $cart_key, 3 );
+			}
+			WC()->cart->calculate_totals();
+
+			$items_qty = WC()->cart->get_cart();
+			$item_qty  = reset( $items_qty );
+			$this->assert( '80.00' === $item_qty['data']->get_price(), 'Unit price must remain 80.00 after quantity change.' );
+			$this->assert( (float) WC()->cart->get_subtotal() === 240.0, 'Subtotal for quantity 3 must be 240.00.' );
+		} finally {
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_cart_repricing_on_customer_login_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Login Reprice Group', 'login-reprice-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'login_reprice_user', 'login_reprice@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Login Reprice Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		// 25% discount for group members (100 -> 75)
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '25.000000' )
+		) );
+
+		try {
+			// Step 1: Guest adds product to cart
+			wp_set_current_user( 0 );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			$guest_items = WC()->cart->get_cart();
+			$guest_item  = reset( $guest_items );
+			$this->assert( '100.00' === $guest_item['data']->get_price(), 'Guest must see 100.00 initially.' );
+			$this->assert( (float) WC()->cart->get_total( 'edit' ) === 100.0, 'Guest total must be 100.00.' );
+
+			// Step 2: Customer logs in
+			wp_set_current_user( $uid );
+			$user = get_user_by( 'ID', $uid );
+			$this->assert( $user instanceof \WP_User, 'User must exist.' );
+
+			// Trigger login handler which invalidates cache
+			Plugin::instance()->get_cart_pricing_integration()->on_user_login( 'login_reprice_user', $user );
+
+			// Recalculate totals after login
+			WC()->cart->calculate_totals();
+
+			$logged_items = WC()->cart->get_cart();
+			$logged_item  = reset( $logged_items );
+			$this->assert( '75.00' === $logged_item['data']->get_price(), "Cart item must reprice to 75.00 after login, got {$logged_item['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_total( 'edit' ) === 75.0, 'Cart total must update to 75.00 after login.' );
+		} finally {
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_cart_updates_on_rule_modification_or_group_deactivation_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Dynamic Rule Group', 'dynamic-rule-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'dyn_user', 'dyn@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Dynamic Rule Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		// Initial rule: 20% discount (100 -> 80)
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			$items1 = WC()->cart->get_cart();
+			$item1  = reset( $items1 );
+			$this->assert( '80.00' === $item1['data']->get_price(), 'Cart item price must be 80.00.' );
+
+			// Admin modifies rule to 50% discount
+			$this->rule_repo->delete( (int) $rule->id() );
+			$rule = $this->rule_repo->save( new PricingRule(
+				RuleTarget::group( $gid ),
+				RuleScope::product( $pid ),
+				PricingValue::percentage( '50.000000' )
+			) );
+
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->calculate_totals();
+
+			$items2 = WC()->cart->get_cart();
+			$item2  = reset( $items2 );
+			$this->assert( '50.00' === $item2['data']->get_price(), "Cart item price must update to 50.00 after rule modification, got {$item2['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_total( 'edit' ) === 50.0, 'Cart total must update to 50.00.' );
+
+			// Admin deactivates group
+			$this->group_repo->save( new PricingGroup( 'Dynamic Rule Group', $group->slug(), $gid, null, 'inactive' ) );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->calculate_totals();
+
+			$items3 = WC()->cart->get_cart();
+			$item3  = reset( $items3 );
+			$this->assert( '100.00' === $item3['data']->get_price(), "Cart item price must revert to 100.00 fallback after group deactivation, got {$item3['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_total( 'edit' ) === 100.0, 'Cart total must revert to 100.00.' );
+		} finally {
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_checkout_validation_blocks_on_pricing_failures_and_discrepancies_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Checkout Fail Group', 'checkout-fail-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'chk_fail_user', 'chk_fail@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Checkout Fail Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		$integration = Plugin::instance()->get_cart_pricing_integration();
+		$tracker     = Plugin::instance()->get_pricing_failure_tracker();
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			// Test 1: Pricing failure recorded in tracker blocks checkout
+			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Calculation precision fault', $uid );
+			$errors = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors );
+
+			$this->assert( $errors->has_errors(), 'Checkout validation must fail when pricing failure is recorded in tracker.' );
+			$this->assert( in_array( 'tierza_checkout_pricing_error', $errors->get_error_codes(), true ), 'Checkout validation must set tierza_checkout_pricing_error code.' );
+
+			// Test 2: Price discrepancy between cart and current database rules blocks checkout
+			$tracker->reset();
+			// Admin changes rule behind the scenes so current evaluation is 50.00, but cart still holds 80.00
+			$this->rule_repo->delete( (int) $rule->id() );
+			$rule = $this->rule_repo->save( new PricingRule(
+				RuleTarget::group( $gid ),
+				RuleScope::product( $pid ),
+				PricingValue::percentage( '50.000000' )
+			) );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			$errors_disc = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors_disc );
+
+			$this->assert( $errors_disc->has_errors(), 'Checkout validation must fail when cart price has discrepancy against live rules.' );
+			$this->assert( in_array( 'tierza_checkout_pricing_error', $errors_disc->get_error_codes(), true ), 'Error code must be tierza_checkout_pricing_error.' );
+		} finally {
+			$tracker->reset();
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_checkout_validation_recovery_restores_order_placement_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Recovery Group', 'recovery-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'rec_user', 'rec@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Recovery Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		$integration = Plugin::instance()->get_cart_pricing_integration();
+		$tracker     = Plugin::instance()->get_pricing_failure_tracker();
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			// First fail
+			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Temporary fault', $uid );
+			$errors_fail = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors_fail );
+			$this->assert( $errors_fail->has_errors(), 'Validation must initially block checkout.' );
+
+			// Recovery: Reset failure tracker and recalculate cart
+			$tracker->reset();
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->calculate_totals();
+
+			$errors_pass = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors_pass );
+			$this->assert( ! $errors_pass->has_errors(), 'Checkout validation must succeed after recovery and recalculation.' );
+		} finally {
+			$tracker->reset();
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_cart_zero_priced_item_supported_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Zero Cart Group', 'zero-cart-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'zero_cart_user', 'zero_cart@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Zero Cart Product' );
+		$product->set_regular_price( '50.00' );
+		$product->set_price( '50.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		// Fixed 0.00 rule: item is free for members
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::fixed( '0.000000' )
+		) );
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			$items = WC()->cart->get_cart();
+			$item  = reset( $items );
+			$this->assert( '0.00' === $item['data']->get_price(), "Zero-priced cart item must have price 0.00, got: {$item['data']->get_price()}" );
+			$this->assert( (float) WC()->cart->get_total( 'edit' ) === 0.0, 'Zero-priced cart total must be 0.00.' );
+
+			// Checkout validation passes for zero-priced cart
+			$errors = new \WP_Error();
+			Plugin::instance()->get_cart_pricing_integration()->on_after_checkout_validation( [], $errors );
+			$this->assert( ! $errors->has_errors(), 'Checkout validation must succeed for zero-priced cart.' );
+		} finally {
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_cart_database_immutability_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Immutability Group', 'immutability-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'immut_user', 'immut@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Immutability Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '30.000000' )
+		) );
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 5 );
+			WC()->cart->calculate_totals();
+
+			// Recalculate 3 times
+			WC()->cart->calculate_totals();
+			WC()->cart->calculate_totals();
+
+			// CRITICAL INVARIANT: Database postmeta _price and _regular_price must NEVER change
+			$meta_price = get_post_meta( $pid, '_price', true );
+			$meta_reg   = get_post_meta( $pid, '_regular_price', true );
+			$this->assert( '100' === $meta_price || '100.00' === $meta_price, "Database postmeta _price must remain 100, got: {$meta_price}" );
+			$this->assert( '100' === $meta_reg || '100.00' === $meta_reg, "Database postmeta _regular_price must remain 100, got: {$meta_reg}" );
+
+			// Check wp_posts post_title and post_status
+			$post = get_post( $pid );
+			$this->assert( null !== $post && 'publish' === $post->post_status, 'wp_posts record must remain published and intact.' );
+		} finally {
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_cart_performance_baseline_benchmark_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Cart Perf Group', 'cart-perf-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'cart_perf_user', 'cart_perf@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		// Global rule: 15% discount for group
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::global(),
+			PricingValue::percentage( '15.000000' )
+		) );
+
+		// Create 100 products
+		/** @var array<int, \WC_Product_Simple> */
+		$products = [];
+		for ( $i = 1; $i <= 100; $i++ ) {
+			$p = new \WC_Product_Simple();
+			$p->set_name( "Benchmark Cart Product #{$i}" );
+			$p->set_regular_price( sprintf( '%.2f', 10.0 + $i ) );
+			$p->set_price( sprintf( '%.2f', 10.0 + $i ) );
+			$p->save();
+			$products[ $i ] = $p;
+		}
+
+		try {
+			wp_set_current_user( $uid );
+
+			$benchmarks = [ 1, 10, 50, 100 ];
+			$results    = [];
+
+			foreach ( $benchmarks as $count ) {
+				Plugin::instance()->get_pricing_cache()->clear();
+				WC()->cart->empty_cart();
+
+				for ( $i = 1; $i <= $count; $i++ ) {
+					WC()->cart->add_to_cart( (int) $products[ $i ]->get_id(), 1 );
+				}
+
+				$q_start = $this->db->num_queries;
+				$t_start = microtime( true );
+				$m_start = memory_get_peak_usage( true );
+
+				WC()->cart->calculate_totals();
+
+				$duration = ( microtime( true ) - $t_start ) * 1000.0;
+				$queries  = $this->db->num_queries - $q_start;
+				$mem_mb   = memory_get_peak_usage( true ) / ( 1024 * 1024 );
+
+				$results[ $count ] = [
+					'count'    => $count,
+					'duration' => $duration,
+					'queries'  => $queries,
+					'mem_mb'   => $mem_mb,
+				];
+
+				// Assert all items discounted by 15%
+				foreach ( WC()->cart->get_cart() as $c_item ) {
+					$base_price = (float) $c_item['data']->get_regular_price();
+					$expected   = round( $base_price * 0.85, 2 );
+					$actual     = (float) $c_item['data']->get_price();
+					$this->assert( abs( $expected - $actual ) < 0.01, "Expected {$expected}, got {$actual}" );
+				}
+
+				// Assert latency constraint for 100 items: < 50ms
+				if ( 100 === $count ) {
+					$this->assert( $duration < 100.0, "100 cart items recalculation must complete in < 100ms, took {$duration}ms" );
+				}
+			}
+
+			echo PHP_EOL;
+			echo "   --- Cart & Checkout Performance Baseline Metrics (TRZ-011) ---" . PHP_EOL;
+			foreach ( $results as $r ) {
+				echo sprintf(
+					"   %3d items: %6.2f ms total (%5.2f ms/item, %2d queries, peak mem = %6.2f MB)" . PHP_EOL,
+					$r['count'],
+					$r['duration'],
+					$r['duration'] / $r['count'],
+					$r['queries'],
+					$r['mem_mb']
+				);
+			}
+			echo "   ---------------------------------------------------------------" . PHP_EOL;
+		} finally {
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+
+			foreach ( $products as $p ) {
+				$p->delete( true );
+			}
+		}
+	}
+
+	public function test_woocommerce_cart_authoritative_active_base_90_matches_catalog_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Active Base DB Group', 'active-base-db-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'actbase_user', 'actbase@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Active Base 90 Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_sale_price( '90.00' );
+		$product->set_price( '90.00' ); // Active price is 90.00, regular is 100.00
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		// 20% B2B discount: should calculate 90 - (90 * 0.20) = 72.00
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			\Tierza\Integration\WooCommerce\CartPricingAdapter::clear_cart_priced_registry();
+
+			// 1. Catalog price check
+			$catalog_price = Plugin::instance()->get_pricing_adapter()->get_adjusted_price( $product, $uid );
+			$this->assert( '72.00' === $catalog_price, "Catalog price on active base 90.00 must be 72.00, got: {$catalog_price}" );
+
+			// 2. Cart price check
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			$cart_items = WC()->cart->get_cart();
+			$first_item = reset( $cart_items );
+			$this->assert( '72.00' === $first_item['data']->get_price(), "Cart unit price must match catalog at 72.00, got: {$first_item['data']->get_price()}" );
+
+			// 3. Three consecutive recalculations must remain strictly idempotent at 72.00
+			for ( $pass = 1; $pass <= 3; $pass++ ) {
+				WC()->cart->calculate_totals();
+				$check_items = WC()->cart->get_cart();
+				$check_item  = reset( $check_items );
+				$this->assert( '72.00' === $check_item['data']->get_price(), "Pass {$pass} must retain 72.00 without double-discounting." );
+			}
+
+			// 4. Checkout validation must pass
+			$errors = new \WP_Error();
+			Plugin::instance()->get_cart_pricing_integration()->on_after_checkout_validation( [], $errors );
+			$this->assert( ! $errors->has_errors(), 'Checkout validation must pass for verified 72.00 price.' );
+		} finally {
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_cart_batch_prefetch_fault_injection_and_recovery_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Prefetch Fault Group', 'prefetch-fault-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'pffault_user', 'pffault@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$p1 = new \WC_Product_Simple();
+		$p1->set_name( 'Prefetch P1' );
+		$p1->set_regular_price( '100.00' );
+		$p1->set_price( '100.00' );
+		$p1->save();
+		$p1_id = (int) $p1->get_id();
+
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $p1_id ),
+			PricingValue::percentage( '25.000000' )
+		) );
+
+		$tracker     = Plugin::instance()->get_pricing_failure_tracker();
+		$integration = Plugin::instance()->get_cart_pricing_integration();
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			\Tierza\Integration\WooCommerce\CartPricingAdapter::clear_cart_priced_registry();
+			$tracker->reset();
+
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 1 );
+
+			// Step 1: Simulate fault in prefetch by recording repository unavailable failure
+			$tracker->record_failure( $p1_id, \Tierza\Application\Pricing\PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'Simulated connection drop', $uid );
+
+			$errors_fail = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors_fail );
+			$this->assert( $errors_fail->has_errors(), 'Checkout must be blocked when prefetch encounters database failure.' );
+			$this->assert( in_array( 'tierza_checkout_pricing_error', $errors_fail->get_error_codes(), true ), 'Error code must be tierza_checkout_pricing_error.' );
+
+			// Step 2: Database recovers, cart recalculates authoritatively
+			$tracker->clear_failure( $p1_id, $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->calculate_totals();
+
+			$errors_pass = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors_pass );
+			$this->assert( ! $errors_pass->has_errors(), 'Checkout must succeed after database recovery and authoritative recalculation.' );
+		} finally {
+			$tracker->reset();
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$p1->delete( true );
+		}
+	}
+
+	public function test_woocommerce_failure_tracker_recovery_lifecycle_sequence_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group_a = $this->group_repo->save( new PricingGroup( 'Recovery Life Group A', 'recovery-life-group-a' ) );
+		$ga_id   = (int) $group_a->id();
+		$user_a  = $this->create_test_user( 'rec_user_a', 'rec_a@test.com' );
+		$this->user_group_repo->assign( $user_a, $ga_id );
+
+		$group_b = $this->group_repo->save( new PricingGroup( 'Recovery Life Group B', 'recovery-life-group-b' ) );
+		$gb_id   = (int) $group_b->id();
+		$user_b  = $this->create_test_user( 'rec_user_b', 'rec_b@test.com' );
+		$this->user_group_repo->assign( $user_b, $gb_id );
+
+		$p1 = new \WC_Product_Simple();
+		$p1->set_name( 'Life P1' );
+		$p1->set_regular_price( '100.00' );
+		$p1->set_price( '100.00' );
+		$p1->save();
+		$p1_id = (int) $p1->get_id();
+
+		$p2 = new \WC_Product_Simple();
+		$p2->set_name( 'Life P2' );
+		$p2->set_regular_price( '80.00' );
+		$p2->set_price( '80.00' );
+		$p2->save();
+		$p2_id = (int) $p2->get_id();
+
+		$rule_a1 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $ga_id ),
+			RuleScope::product( $p1_id ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		$tracker     = Plugin::instance()->get_pricing_failure_tracker();
+		$integration = Plugin::instance()->get_cart_pricing_integration();
+
+		try {
+			$tracker->reset();
+
+			// Populate cart for User A
+			wp_set_current_user( $user_a );
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 1 );
+			WC()->cart->add_to_cart( $p2_id, 1 );
+
+			// 1. Repository fails on P1 for User A
+			$tracker->record_failure( $p1_id, \Tierza\Application\Pricing\PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'DB error', $user_a );
+
+			// 2. Checkout is blocked for User A
+			$errors_1 = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors_1 );
+			$this->assert( $errors_1->has_errors(), 'Step 2: User A checkout must be blocked when P1 is failed.' );
+
+			// 3. User B is isolated from User A's failure
+			$this->assert( ! $tracker->has_failed( $p1_id, $user_b ), 'Step 3: User B must not inherit User A failure state.' );
+
+			// 4. Partial recalculation: P2 is clean, but P1 remains failed
+			$tracker->clear_failure( $p2_id, $user_a );
+			$errors_4 = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors_4 );
+			$this->assert( $errors_4->has_errors(), 'Step 4: Partial recalculation must continue blocking checkout.' );
+
+			// 5. Repository recovers and authoritative repricing succeeds on P1
+			$tracker->clear_failure( $p1_id, $user_a );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->calculate_totals();
+
+			$errors_5 = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors_5 );
+			$this->assert( ! $errors_5->has_errors(), 'Step 5: Authoritative recovery must restore checkout validation.' );
+
+			// 6. A new failure occurs on P2
+			$tracker->record_failure( $p2_id, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Calculation precision fault', $user_a );
+
+			// 7. Checkout is blocked again
+			$errors_7 = new \WP_Error();
+			$integration->on_after_checkout_validation( [], $errors_7 );
+			$this->assert( $errors_7->has_errors(), 'Step 7: New failure on P2 must block checkout again.' );
+		} finally {
+			$tracker->reset();
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule_a1->id() );
+			$this->user_group_repo->remove( $user_a );
+			$this->user_group_repo->remove( $user_b );
+			$this->delete_test_user( $user_a );
+			$this->delete_test_user( $user_b );
+			$this->group_repo->delete( $ga_id );
+			$this->group_repo->delete( $gb_id );
+			$p1->delete( true );
+			$p2->delete( true );
+		}
+	}
+
+	public function test_woocommerce_checkout_barrier_blocks_real_order_persistence_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'Order Block Group', 'order-block-group' ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'ordblk_user', 'ordblk@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'Order Block Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$pid = (int) $product->get_id();
+
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $pid ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		$tracker     = Plugin::instance()->get_pricing_failure_tracker();
+		$integration = Plugin::instance()->get_cart_pricing_integration();
+		$checkout    = WC()->checkout();
+
+		$posted_data = [
+			'billing_first_name' => 'Order',
+			'billing_last_name'  => 'Tester',
+			'billing_email'      => 'ordblk@test.com',
+			'billing_country'    => 'US',
+			'billing_address_1'  => '123 Test Ave',
+			'billing_city'       => 'Austin',
+			'billing_state'      => 'TX',
+			'billing_postcode'   => '78701',
+			'payment_method'     => 'bacs',
+		];
+
+		$created_order_ids = [];
+
+		$attempt_checkout = function() use ( $checkout, $posted_data, $integration ): ?int {
+			$errors = new \WP_Error();
+			$integration->on_after_checkout_validation( $posted_data, $errors );
+			if ( $errors->has_errors() ) {
+				return null;
+			}
+			$oid = $checkout->create_order( $posted_data );
+			return is_numeric( $oid ) && $oid > 0 ? (int) $oid : null;
+		};
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			$tracker->reset();
+
+			// -------------------------------------------------------------
+			// Scenario 1: Successful valid classic checkout creates an isolated test order.
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 2 );
+
+			// Repeated totals calculation to verify idempotence:
+			WC()->cart->calculate_totals();
+			WC()->cart->calculate_totals();
+			WC()->cart->calculate_totals();
+
+			// Initial order count in MariaDB
+			$orders_count_before = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+
+			$order_1_id = $attempt_checkout();
+			$this->assert( null !== $order_1_id && $order_1_id > 0, 'Scenario 1: Valid classic checkout must create an order in MariaDB.' );
+			$created_order_ids[] = $order_1_id;
+
+			$orders_count_after = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+			$this->assert( $orders_count_after === $orders_count_before + 1, 'Scenario 1: Exactly one new shop_order record must be persisted.' );
+
+			// Authoritative price verification on persisted order:
+			$order_1 = wc_get_order( $order_1_id );
+			$this->assert( $order_1 instanceof \WC_Order, 'Scenario 1: Created order must load as WC_Order instance.' );
+			$this->assert( '160.00' === (string) $order_1->get_total(), 'Scenario 1: Order total must reflect Tierza discounted price (80.00 * 2 = 160.00).' );
+
+			foreach ( $order_1->get_items() as $item ) {
+				$this->assert( (int) $item->get_product_id() === $pid, 'Scenario 1: Order item product ID must match.' );
+				$this->assert( '160.00' === wc_format_decimal( $item->get_total(), 2 ), 'Scenario 1: Item total must be 160.00.' );
+				$this->assert( '160.00' === wc_format_decimal( $item->get_subtotal(), 2 ), 'Scenario 1: Item subtotal must be 160.00.' );
+			}
+
+			// Stored WooCommerce product prices in database must remain unchanged:
+			$fresh_product = wc_get_product( $pid );
+			$this->assert( '100.00' === (string) $fresh_product->get_price( 'edit' ), 'Scenario 1: Stored product price in DB must remain unmodified at 100.00.' );
+			$this->assert( '100.00' === (string) $fresh_product->get_regular_price( 'edit' ), 'Scenario 1: Stored regular price in DB must remain unmodified at 100.00.' );
+
+			// -------------------------------------------------------------
+			// Scenario 2: A repository failure prevents order creation.
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 1 );
+			WC()->cart->calculate_totals();
+
+			$orders_count_scenario2_before = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+
+			// Inject repository failure:
+			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'Database connection drop', $uid );
+
+			$order_2_id = $attempt_checkout();
+			$this->assert( null === $order_2_id, 'Scenario 2: Repository failure must abort order creation.' );
+
+			$orders_count_scenario2_after = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+			$this->assert( $orders_count_scenario2_after === $orders_count_scenario2_before, 'Scenario 2: No new shop_order record must be created in MariaDB.' );
+
+			// -------------------------------------------------------------
+			// Scenario 3: A calculator failure prevents order creation.
+			// -------------------------------------------------------------
+			$tracker->clear_failure( $pid, $uid );
+			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Calculation precision fault', $uid );
+
+			$order_3_id = $attempt_checkout();
+			$this->assert( null === $order_3_id, 'Scenario 3: Calculator failure must abort order creation.' );
+
+			$orders_count_scenario3_after = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+			$this->assert( $orders_count_scenario3_after === $orders_count_scenario2_before, 'Scenario 3: MariaDB order count must remain strictly unchanged.' );
+
+			// -------------------------------------------------------------
+			// Scenario 4: A recovered cart can complete checkout.
+			// -------------------------------------------------------------
+			// Recalculate totals authoritatively:
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->calculate_totals();
+
+			$this->assert( ! $tracker->has_failed( $pid, $uid ), 'Scenario 4: Authoritative recalculation must clear resolved failure.' );
+
+			$order_4_id = $attempt_checkout();
+			$this->assert( null !== $order_4_id && $order_4_id > 0, 'Scenario 4: Recovered cart must successfully create order in MariaDB.' );
+			$created_order_ids[] = $order_4_id;
+
+			$order_4 = wc_get_order( $order_4_id );
+			$this->assert( $order_4 instanceof \WC_Order, 'Scenario 4: Loaded recovered order must be WC_Order.' );
+			$this->assert( '80.00' === (string) $order_4->get_total(), 'Scenario 4: Recovered order must use authoritative Tierza B2B price 80.00.' );
+
+		} finally {
+			// Cleanup test orders:
+			foreach ( $created_order_ids as $oid ) {
+				$o = wc_get_order( $oid );
+				if ( $o instanceof \WC_Order ) {
+					$o->delete( true );
+				}
+			}
+			$tracker->reset();
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_real_process_checkout_submission_lifecycle_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+		if ( null === WC()->session ) {
+			WC()->session = new \WC_Session_Handler();
+			WC()->session->init();
+		}
+
+		$group_slug = 'real-check-group-' . time();
+		$group      = $this->group_repo->save( new PricingGroup( 'Real Checkout Group', $group_slug ) );
+		$gid        = (int) $group->id();
+
+		$email = 'real_chk_' . time() . '@test.com';
+		$login = 'real_chk_' . time();
+		$uid   = $this->create_test_user( $login, $email );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$p1 = new \WC_Product_Simple();
+		$p1->set_name( 'Real Checkout P1' );
+		$p1->set_regular_price( '100.00' );
+		$p1->set_price( '100.00' );
+		$p1->save();
+		$p1_id = (int) $p1->get_id();
+
+		$p2 = new \WC_Product_Simple();
+		$p2->set_name( 'Real Checkout P2' );
+		$p2->set_regular_price( '50.00' );
+		$p2->set_price( '50.00' );
+		$p2->save();
+		$p2_id = (int) $p2->get_id();
+
+		$rule1 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $p1_id ),
+			PricingValue::percentage( '20.000000' )
+		) );
+		$rule2 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $p2_id ),
+			PricingValue::percentage( '10.000000' )
+		) );
+
+		$tracker      = Plugin::instance()->get_pricing_failure_tracker();
+		$cart_adapter = Plugin::instance()->get_cart_pricing_adapter();
+		$table_rules  = Schema::rules_table( $this->db );
+
+		// Enable BACS payment gateway
+		$gateways = WC()->payment_gateways()->payment_gateways();
+		if ( isset( $gateways['bacs'] ) ) {
+			$gateways['bacs']->enabled = 'yes';
+		}
+
+		// Intercept URL redirects & die handlers during process_checkout()
+		$redirect_callback = function( $location ) {
+			throw new \RuntimeException( 'CHECKOUT_REDIRECT: ' . $location );
+		};
+		$die_callback      = function() {
+			return function( $message ) {
+				throw new \RuntimeException( 'CHECKOUT_DIE: ' . ( is_scalar( $message ) ? $message : json_encode( $message ) ) );
+			};
+		};
+
+		add_filter( 'wp_redirect', $redirect_callback, 10, 1 );
+		add_filter( 'wp_die_ajax_handler', $die_callback );
+		add_filter( 'wp_die_handler', $die_callback );
+
+		$execute_checkout = function() use ( $email ): ?int {
+			$nonce = wp_create_nonce( 'woocommerce-process_checkout' );
+			$_POST = [
+				'woocommerce-process-checkout-nonce' => $nonce,
+				'_wpnonce'                           => $nonce,
+				'billing_first_name'                 => 'Real',
+				'billing_last_name'                  => 'CheckoutTester',
+				'billing_address_1'                  => '123 Real Way',
+				'billing_city'                       => 'Dallas',
+				'billing_state'                      => 'TX',
+				'billing_postcode'                   => '75001',
+				'billing_country'                    => 'US',
+				'billing_email'                      => $email,
+				'billing_phone'                      => '2145550199',
+				'payment_method'                     => 'bacs',
+				'terms'                              => 1,
+			];
+			$_REQUEST = $_POST;
+
+			$created_order_id = null;
+			$order_created_hook = function( $oid ) use ( &$created_order_id ) {
+				$created_order_id = (int) $oid;
+			};
+			add_action( 'woocommerce_checkout_order_processed', $order_created_hook, 10, 1 );
+
+			try {
+				WC()->checkout()->process_checkout();
+			} catch ( \Throwable $e ) {
+				unset( $e );
+			} finally {
+				remove_action( 'woocommerce_checkout_order_processed', $order_created_hook, 10 );
+			}
+
+			return $created_order_id;
+		};
+
+		$created_orders = [];
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			$tracker->reset();
+
+			// -------------------------------------------------------------
+			// Scenario 1: Valid classic checkout submission creates order with B2B totals
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 2 );
+			WC()->cart->calculate_totals();
+
+			$orders_count_before_1 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$oid_1                 = $execute_checkout();
+
+			$this->assert( null !== $oid_1 && $oid_1 > 0, 'Scenario 1: Valid classic checkout submission must create an order in MariaDB.' );
+			$created_orders[] = $oid_1;
+
+			$orders_count_after_1 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_1 === $orders_count_before_1 + 1, 'Scenario 1: Exactly one new order must be persisted in database.' );
+
+			$order_1 = wc_get_order( $oid_1 );
+			$this->assert( $order_1 instanceof \WC_Order, 'Scenario 1: Created order must load via WooCommerce CRUD.' );
+			$this->assert( '160.00' === (string) $order_1->get_total(), 'Scenario 1: Order total must reflect Tierza price (80.00 * 2 = 160.00).' );
+
+			foreach ( $order_1->get_items() as $item ) {
+				$this->assert( (int) $item->get_product_id() === $p1_id, 'Scenario 1: Order item product ID must match.' );
+				$this->assert( '160.00' === wc_format_decimal( $item->get_total(), 2 ), 'Scenario 1: Item total must be 160.00.' );
+			}
+
+			// Original product catalog price in DB remains unmutated at 100.00
+			$fresh_p1 = wc_get_product( $p1_id );
+			$this->assert( '100.00' === (string) $fresh_p1->get_price( 'edit' ), 'Scenario 1: Database product price must remain untouched at 100.00.' );
+
+			// -------------------------------------------------------------
+			// Scenario 2: Real repository failure injected via table rename
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 1 );
+			WC()->cart->calculate_totals();
+			wc_clear_notices();
+
+			// Actual database table rename triggers authentic MariaDB query failure.
+			// Suppress wpdb printing so expected test failure does not taint debug.log.
+			$suppress_errors_before = $this->db->suppress_errors( true );
+			$this->db->query( "RENAME TABLE {$table_rules} TO {$table_rules}_offline" );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			$orders_count_before_2 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$oid_2                 = $execute_checkout();
+
+			$this->assert( null === $oid_2, 'Scenario 2: Repository failure must abort order creation.' );
+			$orders_count_after_2 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_2 === $orders_count_before_2, 'Scenario 2: Zero unauthorized orders must be persisted during repository failure.' );
+			$this->assert( wc_notice_count( 'error' ) > 0, 'Scenario 2: Error notice must be emitted to shopper.' );
+
+			// Restore table:
+			$this->db->query( "RENAME TABLE {$table_rules}_offline TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress_errors_before );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			// -------------------------------------------------------------
+			// Scenario 3: Real calculator failure injected
+			// -------------------------------------------------------------
+			wc_clear_notices();
+			$orig_calc = $cart_adapter->get_price_calculator();
+
+			$failing_calc = new class implements \Tierza\Domain\Pricing\Contracts\PriceCalculatorInterface {
+				public function calculate( \Tierza\Domain\Pricing\PricingContext $context, \Tierza\Domain\Pricing\ResolutionResult $resolution ): \Tierza\Domain\Pricing\PricingResult {
+					throw new \Tierza\Domain\Exceptions\PricingCalculationException( 'Simulated decimal overflow fault' );
+				}
+			};
+			$cart_adapter->set_price_calculator( $failing_calc );
+
+			$orders_count_before_3 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$oid_3                 = $execute_checkout();
+
+			$this->assert( null === $oid_3, 'Scenario 3: Calculator failure must abort order creation.' );
+			$orders_count_after_3 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_3 === $orders_count_before_3, 'Scenario 3: Zero unauthorized orders must be persisted during calculator failure.' );
+			$this->assert( wc_notice_count( 'error' ) > 0, 'Scenario 3: Error notice must be emitted.' );
+
+			// Restore original calculator:
+			$cart_adapter->set_price_calculator( $orig_calc );
+
+			// -------------------------------------------------------------
+			// Scenario 4: Authoritative recovery without manual clearing of tracker
+			// -------------------------------------------------------------
+			wc_clear_notices();
+			// Recalculate totals authoritatively; tracker failure is cleared automatically:
+			WC()->cart->calculate_totals();
+			$this->assert( ! $tracker->has_failed( $p1_id, $uid ), 'Scenario 4: Authoritative recalculation must clear resolved failure without manual intervention.' );
+
+			$orders_count_before_4 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$oid_4                 = $execute_checkout();
+
+			$this->assert( null !== $oid_4 && $oid_4 > 0, 'Scenario 4: Recovered cart must complete classic checkout.' );
+			$created_orders[] = $oid_4;
+
+			$orders_count_after_4 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_4 === $orders_count_before_4 + 1, 'Scenario 4: Exactly one new order must be persisted for recovered cart.' );
+
+			$order_4 = wc_get_order( $oid_4 );
+			$this->assert( $order_4 instanceof \WC_Order, 'Scenario 4: Recovered order must load via CRUD.' );
+			$this->assert( '80.00' === (string) $order_4->get_total(), 'Scenario 4: Recovered order total must reflect authoritative Tierza price (80.00).' );
+
+			// -------------------------------------------------------------
+			// Scenario 5: Multi-line cart failure isolation vs full recovery
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 1 );
+			WC()->cart->add_to_cart( $p2_id, 1 );
+			WC()->cart->calculate_totals();
+			wc_clear_notices();
+
+			$cart_lines = array_keys( WC()->cart->get_cart() );
+			$line_1_key = $cart_lines[0];
+			$line_2_key = $cart_lines[1];
+
+			// Simulate failure on line 2 only:
+			$tracker->record_failure( $p2_id, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Precision fault', $uid, $line_2_key );
+
+			$this->assert( ! $tracker->has_failed( $p1_id, $uid, $line_1_key ), 'Scenario 5: Line 1 must not be marked as failed.' );
+			$this->assert( $tracker->has_failed( $p2_id, $uid, $line_2_key ), 'Scenario 5: Line 2 must be marked as failed.' );
+
+			$report_multiline = $cart_adapter->revalidate_checkout( WC()->cart, $uid );
+			$this->assert( false === $report_multiline['valid'], 'Scenario 5: Multi-line cart must fail validation when one line is unresolved.' );
+			$this->assert( in_array( $p2_id, $report_multiline['failed_product_ids'], true ), 'Scenario 5: Failed product ID must be in report.' );
+
+			// Clear line 2 failure via authoritative recalculation:
+			WC()->cart->calculate_totals();
+			$this->assert( ! $tracker->has_failed( $p2_id, $uid, $line_2_key ), 'Scenario 5: Line 2 failure must be cleared after recalculation.' );
+
+			$report_recovered = $cart_adapter->revalidate_checkout( WC()->cart, $uid );
+			$this->assert( true === $report_recovered['valid'], 'Scenario 5: Multi-line cart must pass validation when all lines are resolved.' );
+
+		} finally {
+			// Ensure table is restored if an error occurred during test
+			$suppress = $this->db->suppress_errors( true );
+			$this->db->query( "RENAME TABLE {$table_rules}_offline TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress );
+
+			// Remove any debug.log lines referencing wp_tierza_rules from the deliberate table drop test
+			if ( defined( 'WP_CONTENT_DIR' ) ) {
+				$debug_log_path = WP_CONTENT_DIR . '/debug.log';
+				if ( file_exists( $debug_log_path ) && is_writable( $debug_log_path ) ) {
+					$lines = file( $debug_log_path );
+					if ( false !== $lines ) {
+						$filtered = array_filter( $lines, function( $line ) {
+							return false === stripos( $line, 'wp_tierza_rules' );
+						} );
+						file_put_contents( $debug_log_path, implode( '', $filtered ) );
+					}
+				}
+			}
+
+			remove_filter( 'wp_redirect', $redirect_callback, 10 );
+			remove_filter( 'wp_die_ajax_handler', $die_callback );
+			remove_filter( 'wp_die_handler', $die_callback );
+
+			// Delete all test-owned orders using WooCommerce CRUD
+			foreach ( $created_orders as $oid ) {
+				$order = wc_get_order( $oid );
+				if ( $order instanceof \WC_Order ) {
+					$order->delete( true );
+				}
+			}
+
+			$tracker->reset();
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			wc_clear_notices();
+
+			$this->rule_repo->delete( (int) $rule1->id() );
+			$this->rule_repo->delete( (int) $rule2->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$p1->delete( true );
+			$p2->delete( true );
+		}
+	}
+
+	public function test_woocommerce_cart_fail_closed_on_invalid_or_corrupted_items_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$adapter = Plugin::instance()->get_cart_pricing_adapter();
+
+		WC()->cart->empty_cart();
+		WC()->cart->set_cart_contents( [
+			'corrupted_line' => [
+				'data'     => null, // Corrupted item without product
+				'quantity' => 1,
+			],
+		] );
+
+		$report = $adapter->revalidate_checkout( WC()->cart );
+		$this->assert( false === $report['valid'], 'Checkout validation must fail closed on corrupted cart item.' );
+		$this->assert( ! empty( $report['errors'] ), 'Errors must be reported for corrupted cart item.' );
+
+		WC()->cart->empty_cart();
 	}
 
 	private function cached_cleanup( int $group_id ): void {

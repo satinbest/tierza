@@ -21,6 +21,8 @@ use Tierza\Infrastructure\Environment;
 use Tierza\Infrastructure\Repositories\WpGroupRepository;
 use Tierza\Infrastructure\Repositories\WpRuleRepository;
 use Tierza\Infrastructure\Repositories\WpUserGroupRepository;
+use Tierza\Integration\WooCommerce\CartPricingAdapter;
+use Tierza\Integration\WooCommerce\CartPricingIntegration;
 use Tierza\Integration\WooCommerce\ProductPricingAdapter;
 use Tierza\Integration\WooCommerce\ProductPricingIntegration;
 
@@ -49,6 +51,8 @@ final class Plugin {
 	private ?VariationPriceCacheInvalidator $variation_cache_invalidator     = null;
 	private ?ProductPricingAdapter $pricing_adapter                          = null;
 	private ?ProductPricingIntegration $pricing_integration                  = null;
+	private ?CartPricingAdapter $cart_pricing_adapter                        = null;
+	private ?CartPricingIntegration $cart_pricing_integration                = null;
 	private ?PricingFailureTracker $pricing_failure_tracker                  = null;
 	private ?AdminPricingSimulationService $admin_pricing_simulation_service = null;
 
@@ -146,6 +150,17 @@ final class Plugin {
 		$this->pricing_failure_tracker = new PricingFailureTracker();
 		$this->pricing_integration     = new ProductPricingIntegration( $this->pricing_adapter, $this->pricing_failure_tracker );
 		$this->pricing_integration->register();
+
+		$this->cart_pricing_adapter     = new CartPricingAdapter(
+			$this->pricing_adapter,
+			$calculator,
+			$resolver,
+			$this->pricing_cache,
+			$this->pricing_failure_tracker,
+			$batch_prefetcher
+		);
+		$this->cart_pricing_integration = new CartPricingIntegration( $this->cart_pricing_adapter, $this->pricing_failure_tracker );
+		$this->cart_pricing_integration->register();
 
 		$this->admin_pricing_simulation_service = new AdminPricingSimulationService( $this->pricing_adapter );
 
@@ -286,6 +301,20 @@ final class Plugin {
 	 */
 	public function get_pricing_integration(): ?ProductPricingIntegration {
 		return $this->pricing_integration;
+	}
+
+	/**
+	 * Get WooCommerce cart pricing adapter.
+	 */
+	public function get_cart_pricing_adapter(): ?CartPricingAdapter {
+		return $this->cart_pricing_adapter;
+	}
+
+	/**
+	 * Get WooCommerce cart pricing integration.
+	 */
+	public function get_cart_pricing_integration(): ?CartPricingIntegration {
+		return $this->cart_pricing_integration;
 	}
 
 	/**

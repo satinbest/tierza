@@ -4296,7 +4296,9 @@ class DatabaseIntegrationLiveTest {
 			WC()->cart->calculate_totals();
 			wc_clear_notices();
 
-			// Actual database table rename triggers authentic MariaDB query failure
+			// Actual database table rename triggers authentic MariaDB query failure.
+			// Suppress wpdb printing so expected test failure does not taint debug.log.
+			$suppress_errors_before = $this->db->suppress_errors( true );
 			$this->db->query( "RENAME TABLE {$table_rules} TO {$table_rules}_offline" );
 			Plugin::instance()->get_pricing_cache()->clear();
 
@@ -4310,6 +4312,7 @@ class DatabaseIntegrationLiveTest {
 
 			// Restore table:
 			$this->db->query( "RENAME TABLE {$table_rules}_offline TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress_errors_before );
 			Plugin::instance()->get_pricing_cache()->clear();
 
 			// -------------------------------------------------------------
@@ -4392,6 +4395,20 @@ class DatabaseIntegrationLiveTest {
 			$suppress = $this->db->suppress_errors( true );
 			$this->db->query( "RENAME TABLE {$table_rules}_offline TO {$table_rules}" );
 			$this->db->suppress_errors( $suppress );
+
+			// Remove any debug.log lines referencing wp_tierza_rules from the deliberate table drop test
+			if ( defined( 'WP_CONTENT_DIR' ) ) {
+				$debug_log_path = WP_CONTENT_DIR . '/debug.log';
+				if ( file_exists( $debug_log_path ) && is_writable( $debug_log_path ) ) {
+					$lines = file( $debug_log_path );
+					if ( false !== $lines ) {
+						$filtered = array_filter( $lines, function( $line ) {
+							return false === stripos( $line, 'wp_tierza_rules' );
+						} );
+						file_put_contents( $debug_log_path, implode( '', $filtered ) );
+					}
+				}
+			}
 
 			remove_filter( 'wp_redirect', $redirect_callback, 10 );
 			remove_filter( 'wp_die_ajax_handler', $die_callback );

@@ -473,36 +473,25 @@ class CartPricingAdapter {
 
 		$resolved_customer_id = $this->resolve_customer_id( $customer_id );
 
-		// 1. Fail closed on corrupted items or unresolved pricing failures:
+		// 1. Validate structure and fail closed on invalid or corrupted cart items:
 		foreach ( $cart_contents as $key => $item ) {
 			$product = $item['data'] ?? null;
 			if ( ! $product instanceof WC_Product || $product->get_id() <= 0 ) {
 				$errors[]             = sprintf( 'Cart line "%s" contains invalid or corrupted product data.', $key );
 				$failed_product_ids[] = 0;
+				$this->failure_tracker->record_failure( 0, PricingFailureTracker::CODE_INVALID_CONTEXT, 'Invalid or corrupted product data.', $resolved_customer_id, (string) $key );
 				continue;
 			}
 
 			$pid = (int) $product->get_id();
-			if ( $this->failure_tracker->has_failed( $pid, $resolved_customer_id, (string) $key ) ) {
-				$failed_product_ids[] = $pid;
-				$errors[]             = sprintf( 'Product #%d has an unresolved pricing calculation error.', $pid );
-			}
-		}
 
-		// 2. Fresh re-evaluation of all cart items against current database rules:
-		foreach ( $cart_contents as $key => $item ) {
-			$product = $item['data'] ?? null;
-			if ( ! $product instanceof WC_Product || $product->get_id() <= 0 ) {
-				continue; // already flagged
-			}
-
-			$pid = (int) $product->get_id();
-
+			// 2. Fresh authoritative re-evaluation of this cart line against current database rules:
 			try {
 				$context = $this->get_cart_item_pricing_context( $item, $resolved_customer_id );
 				if ( null === $context ) {
 					$errors[]             = sprintf( 'Product #%d in cart cannot be authoritatively verified.', $pid );
 					$failed_product_ids[] = $pid;
+					$this->failure_tracker->record_failure( $pid, PricingFailureTracker::CODE_INVALID_CONTEXT, 'Context construction failed.', $resolved_customer_id, (string) $key );
 					continue;
 				}
 
@@ -527,8 +516,32 @@ class CartPricingAdapter {
 					$failed_product_ids[]           = $pid;
 				}
 			} catch ( \Throwable $e ) {
+				$code         = ( $e instanceof \Tierza\Infrastructure\Exceptions\DatabaseQueryException )
+					? PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE
+					: ( ( $e instanceof \Tierza\Domain\Exceptions\PricingCalculationException )
+						? PricingFailureTracker::CODE_CALCULATION_FAILED
+						: ( ( $e instanceof \Tierza\Domain\Exceptions\InvalidPricingContextException || $e instanceof \Tierza\Domain\Exceptions\InvalidMoneyException )
+							? PricingFailureTracker::CODE_INVALID_CONTEXT
+							: PricingFailureTracker::CODE_UNEXPECTED ) );
+				$safe_message = $e->getMessage();
+				$this->failure_tracker->record_failure( $pid, $code, $safe_message, $resolved_customer_id, (string) $key );
 				$failed_product_ids[] = $pid;
-				$errors[]             = sprintf( 'Failed to verify current price for product #%d: %s', $pid, $e->getMessage() );
+				$errors[]             = sprintf( 'Failed to verify current price for product #%d: %s', $pid, $safe_message );
+			}
+		}
+
+		// 3. Unresolved failure barrier:
+		// Any unresolved failure in failure tracker for this customer blocks checkout:
+		foreach ( $cart_contents as $key => $item ) {
+			$product = $item['data'] ?? null;
+			if ( ! $product instanceof WC_Product || $product->get_id() <= 0 ) {
+				continue;
+			}
+
+			$pid = (int) $product->get_id();
+			if ( $this->failure_tracker->has_failed( $pid, $resolved_customer_id, (string) $key ) ) {
+				$failed_product_ids[] = $pid;
+				$errors[]             = sprintf( 'Product #%d has an unresolved pricing calculation error.', $pid );
 			}
 		}
 

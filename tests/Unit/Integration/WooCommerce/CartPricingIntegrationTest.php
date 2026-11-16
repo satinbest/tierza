@@ -320,6 +320,9 @@ class CartPricingIntegrationTest extends TestCase {
 	}
 
 	public function test_failure_recovery_lifecycle_sequence(): void {
+		global $current_user_id_mock;
+		$current_user_id_mock = 42;
+
 		$product_1 = new WC_Product( 810, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
 		$product_2 = new WC_Product( 820, [ 'price' => '50.00', 'regular_price' => '50.00' ] );
 
@@ -330,7 +333,7 @@ class CartPricingIntegrationTest extends TestCase {
 		] );
 		WC()->cart = $cart;
 
-		// 1. Initial state: simulate repository failure on product 810
+		// 1. Initial state: simulate repository failure on product 810 for customer 42
 		$this->failure_tracker->record_failure( 810, PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'DB error', 42, 'line_1' );
 
 		// 2. Checkout must be blocked
@@ -355,10 +358,85 @@ class CartPricingIntegrationTest extends TestCase {
 		$this->assertTrue( $this->failure_tracker->has_failed( 810, 42 ), 'Customer 42 has failed product.' );
 		$this->assertFalse( $this->failure_tracker->has_failed( 810, 99 ), 'Customer 99 must remain isolated and clean.' );
 
-		// 6. New failure occurs on recovered cart
-		$this->failure_tracker->record_failure( 820, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Precision err', 0 );
+		// 6. New failure occurs on recovered cart for customer 42
+		$this->failure_tracker->record_failure( 820, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Precision err', 42, 'line_2' );
 		$errors_step6 = new WP_Error();
 		$this->integration->on_after_checkout_validation( [], $errors_step6 );
 		$this->assertTrue( $errors_step6->has_errors(), 'Step 6: New failure must block checkout again.' );
+
+		$current_user_id_mock = 0;
+	}
+
+	public function test_authoritative_checkout_recovery_lifecycle_across_failures_and_identities(): void {
+		global $current_user_id_mock;
+		$current_user_id_mock = 10;
+
+		$group = $this->group_repo->save( new PricingGroup( 'Recovery Group', 'recovery-group', 1, 'active' ) );
+		$this->user_group_repo->assign( 10, (int) $group->id() );
+
+		$rule_1 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( (int) $group->id() ),
+			RuleScope::product( 10 ),
+			PricingValue::percentage( '20.000000' )
+		) );
+		$rule_2 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( (int) $group->id() ),
+			RuleScope::product( 20 ),
+			PricingValue::percentage( '10.000000' )
+		) );
+
+		$p1 = new WC_Product( 10, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
+		$p2 = new WC_Product( 20, [ 'price' => '50.00', 'regular_price' => '50.00' ] );
+
+		$cart = new WC_Cart();
+		$cart->set_cart_contents( [
+			'line_1' => [ 'data' => $p1, 'quantity' => 1 ],
+			'line_2' => [ 'data' => $p2, 'quantity' => 2 ],
+		] );
+		WC()->cart = $cart;
+
+		// 1. Initial valid calculation:
+		$this->integration->on_before_calculate_totals( $cart );
+		$this->assertSame( '80.00', $p1->get_price() );
+		$this->assertSame( '45.00', $p2->get_price() );
+		$this->assertFalse( $this->failure_tracker->has_failed( 10, 10, 'line_1' ) );
+		$this->assertFalse( $this->failure_tracker->has_failed( 20, 10, 'line_2' ) );
+
+		// 2. Cause repository failure (simulate fault in batch prefetch / rule resolution):
+		$this->failure_tracker->record_failure( 10, PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'DB connection failed', 10, 'line_1' );
+
+		// 3. Confirm failure is recorded:
+		$this->assertTrue( $this->failure_tracker->has_failed( 10, 10, 'line_1' ) );
+
+		// 4. Attempt checkout and confirm it is blocked:
+		$errors_step4 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step4 );
+		$this->assertTrue( $errors_step4->has_errors(), 'Step 5: Checkout must be blocked on failure.' );
+		$this->assertContains( 'tierza_checkout_pricing_error', $errors_step4->get_error_codes() );
+
+		// 5. Customer identity isolation: failure for customer 10 must NOT block customer 20:
+		$this->assertFalse( $this->failure_tracker->has_failed( 10, 20, 'line_1' ) );
+		$this->assertFalse( $this->failure_tracker->has_failed( 10, 20 ) );
+
+		// 6. Recalculate authoritative prices on recovery:
+		$this->integration->on_before_calculate_totals( $cart );
+
+		// 7. Confirm the resolved error is cleared:
+		$this->assertFalse( $this->failure_tracker->has_failed( 10, 10, 'line_1' ), 'Step 8: Error must be cleared after authoritative recalculation.' );
+
+		// 8. Confirm checkout succeeds:
+		$errors_step8 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step8 );
+		$this->assertFalse( $errors_step8->has_errors(), 'Step 9: Checkout must succeed after authoritative recovery.' );
+
+		// 9. Trigger a new failure on product 20:
+		$this->failure_tracker->record_failure( 20, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Precision overflow', 10, 'line_2' );
+
+		// 10. Confirm checkout is blocked again:
+		$errors_step10 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step10 );
+		$this->assertTrue( $errors_step10->has_errors(), 'Step 11: Checkout must be blocked on new failure.' );
+
+		$current_user_id_mock = 0;
 	}
 }

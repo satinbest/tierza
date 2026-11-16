@@ -3463,7 +3463,7 @@ class DatabaseIntegrationLiveTest {
 			WC()->cart->calculate_totals();
 
 			// Test 1: Pricing failure recorded in tracker blocks checkout
-			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Calculation precision fault' );
+			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Calculation precision fault', $uid );
 			$errors = new \WP_Error();
 			$integration->on_after_checkout_validation( [], $errors );
 
@@ -3532,7 +3532,7 @@ class DatabaseIntegrationLiveTest {
 			WC()->cart->calculate_totals();
 
 			// First fail
-			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Temporary fault' );
+			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Temporary fault', $uid );
 			$errors_fail = new \WP_Error();
 			$integration->on_after_checkout_validation( [], $errors_fail );
 			$this->assert( $errors_fail->has_errors(), 'Validation must initially block checkout.' );
@@ -3865,7 +3865,7 @@ class DatabaseIntegrationLiveTest {
 			WC()->cart->add_to_cart( $p1_id, 1 );
 
 			// Step 1: Simulate fault in prefetch by recording repository unavailable failure
-			$tracker->record_failure( $p1_id, \Tierza\Application\Pricing\PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'Simulated connection drop' );
+			$tracker->record_failure( $p1_id, \Tierza\Application\Pricing\PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'Simulated connection drop', $uid );
 
 			$errors_fail = new \WP_Error();
 			$integration->on_after_checkout_validation( [], $errors_fail );
@@ -3873,7 +3873,7 @@ class DatabaseIntegrationLiveTest {
 			$this->assert( in_array( 'tierza_checkout_pricing_error', $errors_fail->get_error_codes(), true ), 'Error code must be tierza_checkout_pricing_error.' );
 
 			// Step 2: Database recovers, cart recalculates authoritatively
-			$tracker->clear_failure( $p1_id );
+			$tracker->clear_failure( $p1_id, $uid );
 			Plugin::instance()->get_pricing_cache()->clear();
 			WC()->cart->calculate_totals();
 
@@ -4013,31 +4013,129 @@ class DatabaseIntegrationLiveTest {
 
 		$tracker     = Plugin::instance()->get_pricing_failure_tracker();
 		$integration = Plugin::instance()->get_cart_pricing_integration();
+		$checkout    = WC()->checkout();
+
+		$posted_data = [
+			'billing_first_name' => 'Order',
+			'billing_last_name'  => 'Tester',
+			'billing_email'      => 'ordblk@test.com',
+			'billing_country'    => 'US',
+			'billing_address_1'  => '123 Test Ave',
+			'billing_city'       => 'Austin',
+			'billing_state'      => 'TX',
+			'billing_postcode'   => '78701',
+			'payment_method'     => 'bacs',
+		];
+
+		$created_order_ids = [];
+
+		$attempt_checkout = function() use ( $checkout, $posted_data, $integration ): ?int {
+			$errors = new \WP_Error();
+			$integration->on_after_checkout_validation( $posted_data, $errors );
+			if ( $errors->has_errors() ) {
+				return null;
+			}
+			$oid = $checkout->create_order( $posted_data );
+			return is_numeric( $oid ) && $oid > 0 ? (int) $oid : null;
+		};
 
 		try {
 			wp_set_current_user( $uid );
 			Plugin::instance()->get_pricing_cache()->clear();
+			$tracker->reset();
+
+			// -------------------------------------------------------------
+			// Scenario 1: Successful valid classic checkout creates an isolated test order.
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $pid, 2 );
+
+			// Repeated totals calculation to verify idempotence:
+			WC()->cart->calculate_totals();
+			WC()->cart->calculate_totals();
+			WC()->cart->calculate_totals();
+
+			// Initial order count in MariaDB
+			$orders_count_before = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+
+			$order_1_id = $attempt_checkout();
+			$this->assert( null !== $order_1_id && $order_1_id > 0, 'Scenario 1: Valid classic checkout must create an order in MariaDB.' );
+			$created_order_ids[] = $order_1_id;
+
+			$orders_count_after = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+			$this->assert( $orders_count_after === $orders_count_before + 1, 'Scenario 1: Exactly one new shop_order record must be persisted.' );
+
+			// Authoritative price verification on persisted order:
+			$order_1 = wc_get_order( $order_1_id );
+			$this->assert( $order_1 instanceof \WC_Order, 'Scenario 1: Created order must load as WC_Order instance.' );
+			$this->assert( '160.00' === (string) $order_1->get_total(), 'Scenario 1: Order total must reflect Tierza discounted price (80.00 * 2 = 160.00).' );
+
+			foreach ( $order_1->get_items() as $item ) {
+				$this->assert( (int) $item->get_product_id() === $pid, 'Scenario 1: Order item product ID must match.' );
+				$this->assert( '160.00' === wc_format_decimal( $item->get_total(), 2 ), 'Scenario 1: Item total must be 160.00.' );
+				$this->assert( '160.00' === wc_format_decimal( $item->get_subtotal(), 2 ), 'Scenario 1: Item subtotal must be 160.00.' );
+			}
+
+			// Stored WooCommerce product prices in database must remain unchanged:
+			$fresh_product = wc_get_product( $pid );
+			$this->assert( '100.00' === (string) $fresh_product->get_price( 'edit' ), 'Scenario 1: Stored product price in DB must remain unmodified at 100.00.' );
+			$this->assert( '100.00' === (string) $fresh_product->get_regular_price( 'edit' ), 'Scenario 1: Stored regular price in DB must remain unmodified at 100.00.' );
+
+			// -------------------------------------------------------------
+			// Scenario 2: A repository failure prevents order creation.
+			// -------------------------------------------------------------
 			WC()->cart->empty_cart();
 			WC()->cart->add_to_cart( $pid, 1 );
 			WC()->cart->calculate_totals();
 
-			// Count current shop_order posts in database before test
-			$initial_orders = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+			$orders_count_scenario2_before = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
 
-			// Inject unresolved pricing failure
-			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Test calculation failure' );
+			// Inject repository failure:
+			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'Database connection drop', $uid );
 
-			$errors = new \WP_Error();
-			$integration->on_after_checkout_validation( [], $errors );
+			$order_2_id = $attempt_checkout();
+			$this->assert( null === $order_2_id, 'Scenario 2: Repository failure must abort order creation.' );
 
-			$this->assert( $errors->has_errors(), 'Checkout validation must produce blocking errors.' );
-			$this->assert( in_array( 'tierza_checkout_pricing_error', $errors->get_error_codes(), true ), 'Error must carry tierza_checkout_pricing_error code.' );
+			$orders_count_scenario2_after = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+			$this->assert( $orders_count_scenario2_after === $orders_count_scenario2_before, 'Scenario 2: No new shop_order record must be created in MariaDB.' );
 
-			// WooCommerce aborts checkout order creation when after_checkout_validation has errors.
-			// Verify that no unauthorized order post was written to MariaDB:
-			$current_orders = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
-			$this->assert( $initial_orders === $current_orders, 'Database must have 0 new shop_order records after blocked checkout.' );
+			// -------------------------------------------------------------
+			// Scenario 3: A calculator failure prevents order creation.
+			// -------------------------------------------------------------
+			$tracker->clear_failure( $pid, $uid );
+			$tracker->record_failure( $pid, \Tierza\Application\Pricing\PricingFailureTracker::CODE_CALCULATION_FAILED, 'Calculation precision fault', $uid );
+
+			$order_3_id = $attempt_checkout();
+			$this->assert( null === $order_3_id, 'Scenario 3: Calculator failure must abort order creation.' );
+
+			$orders_count_scenario3_after = (int) $this->db->get_var( "SELECT COUNT(*) FROM {$this->db->prefix}posts WHERE post_type = 'shop_order'" );
+			$this->assert( $orders_count_scenario3_after === $orders_count_scenario2_before, 'Scenario 3: MariaDB order count must remain strictly unchanged.' );
+
+			// -------------------------------------------------------------
+			// Scenario 4: A recovered cart can complete checkout.
+			// -------------------------------------------------------------
+			// Recalculate totals authoritatively:
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->calculate_totals();
+
+			$this->assert( ! $tracker->has_failed( $pid, $uid ), 'Scenario 4: Authoritative recalculation must clear resolved failure.' );
+
+			$order_4_id = $attempt_checkout();
+			$this->assert( null !== $order_4_id && $order_4_id > 0, 'Scenario 4: Recovered cart must successfully create order in MariaDB.' );
+			$created_order_ids[] = $order_4_id;
+
+			$order_4 = wc_get_order( $order_4_id );
+			$this->assert( $order_4 instanceof \WC_Order, 'Scenario 4: Loaded recovered order must be WC_Order.' );
+			$this->assert( '80.00' === (string) $order_4->get_total(), 'Scenario 4: Recovered order must use authoritative Tierza B2B price 80.00.' );
+
 		} finally {
+			// Cleanup test orders:
+			foreach ( $created_order_ids as $oid ) {
+				$o = wc_get_order( $oid );
+				if ( $o instanceof \WC_Order ) {
+					$o->delete( true );
+				}
+			}
 			$tracker->reset();
 			wp_set_current_user( 0 );
 			WC()->cart->empty_cart();

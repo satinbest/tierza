@@ -135,10 +135,12 @@ class CartPricingIntegration {
 			}
 
 			// 2. Iterate and apply authoritative price to each cart item.
+			$failed_product_ids = [];
 			foreach ( $cart->cart_contents as $key => &$cart_item ) {
 				$product = $cart_item['data'] ?? null;
 				if ( ! $product instanceof WC_Product || $product->get_id() <= 0 ) {
 					$this->failure_tracker->record_failure( 0, PricingFailureTracker::CODE_INVALID_CONTEXT, 'Invalid cart item product data.', $customer_id, (string) $key );
+					$failed_product_ids[0] = true;
 					continue;
 				}
 
@@ -149,12 +151,15 @@ class CartPricingIntegration {
 					// Authoritative recalculation succeeded only if batch prefetch succeeded:
 					if ( ! $prefetch_failed ) {
 						$this->failure_tracker->clear_failure( $pid, $customer_id, (string) $key );
+					} else {
+						$failed_product_ids[ $pid ] = true;
 					}
 				} catch ( Throwable $e ) {
 					$code         = $this->classify_exception( $e );
 					$safe_message = $this->sanitize_error_message( $e );
 
 					$this->failure_tracker->record_failure( $pid, $code, $safe_message, $customer_id, (string) $key );
+					$failed_product_ids[ $pid ] = true;
 					$this->log_error( 'Cart item pricing failed for product #' . $pid, $code, $safe_message );
 
 					if ( function_exists( 'do_action' ) ) {
@@ -163,6 +168,23 @@ class CartPricingIntegration {
 				}
 			}
 			unset( $cart_item );
+
+			// 3. If prefetch succeeded and all lines for a product were priced cleanly,
+			// clear any lingering product-wide failure for this customer:
+			if ( ! $prefetch_failed ) {
+				foreach ( $cart_contents as $item ) {
+					$product = $item['data'] ?? null;
+					$pid     = $product instanceof WC_Product ? (int) $product->get_id() : 0;
+					if ( $pid > 0 && ! isset( $failed_product_ids[ $pid ] ) ) {
+						$this->failure_tracker->clear_failure( $pid, $customer_id, '' );
+					}
+				}
+			}
+
+			// 4. If no unresolved failures remain for this customer in cart, clear historical notices:
+			if ( ! $this->failure_tracker->has_customer_failures( $customer_id ) ) {
+				$this->clear_tierza_notices();
+			}
 		} finally {
 			$this->is_calculating = false;
 		}
@@ -313,11 +335,47 @@ class CartPricingIntegration {
 			}
 		}
 
-		if ( $has_failure && function_exists( 'wc_add_notice' ) ) {
-			wc_add_notice(
-				__( 'Some items in your cart encountered a pricing calculation error. Please reload the page before proceeding.', 'tierza' ),
-				'error'
+		if ( $has_failure ) {
+			if ( function_exists( 'wc_add_notice' ) ) {
+				wc_add_notice(
+					__( 'Some items in your cart encountered a pricing calculation error. Please reload the page before proceeding.', 'tierza' ),
+					'error'
+				);
+			}
+		} else {
+			$this->clear_tierza_notices();
+		}
+	}
+
+	/**
+	 * Clear Tierza-specific error notices from WooCommerce notice store.
+	 */
+	public function clear_tierza_notices(): void {
+		if ( function_exists( 'WC' ) && isset( WC()->session ) && WC()->session ) {
+			$notices = WC()->session->get( 'wc_notices', [] );
+			if ( is_array( $notices ) && ! empty( $notices['error'] ) && is_array( $notices['error'] ) ) {
+				$filtered         = array_filter(
+					$notices['error'],
+					function ( $notice ): bool {
+						$msg = is_array( $notice ) ? ( $notice['notice'] ?? '' ) : (string) $notice;
+						return ! str_contains( $msg, 'pricing calculation error' ) && ! str_contains( $msg, 'pricing verification error' );
+					}
+				);
+				$notices['error'] = array_values( $filtered );
+				WC()->session->set( 'wc_notices', $notices );
+			}
+		}
+
+		global $wc_notices;
+		if ( is_array( $wc_notices ) && ! empty( $wc_notices['error'] ) && is_array( $wc_notices['error'] ) ) {
+			$filtered_global     = array_filter(
+				$wc_notices['error'],
+				function ( $notice ): bool {
+					$msg = is_array( $notice ) ? ( $notice['notice'] ?? '' ) : (string) $notice;
+					return ! str_contains( $msg, 'pricing calculation error' ) && ! str_contains( $msg, 'pricing verification error' );
+				}
 			);
+			$wc_notices['error'] = array_values( $filtered_global );
 		}
 	}
 

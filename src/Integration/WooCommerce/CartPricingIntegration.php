@@ -118,9 +118,9 @@ class CartPricingIntegration {
 				$this->adapter->prefetch_cart( $cart_contents );
 			} catch ( Throwable $e ) {
 				$prefetch_failed = true;
-				$code            = $this->classify_exception( $e );
-				$safe_message    = $this->sanitize_error_message( $e );
-				$this->log_error( 'Batch prefetch failed for cart contents', $code, $safe_message );
+				$code            = CartPricingAdapter::classify_exception( $e );
+				$safe_message    = CartPricingAdapter::get_safe_error_message( $code );
+				$this->log_error( 'Batch prefetch failed for cart contents', $code, PricingFailureTracker::redact_sensitive_text( $e->getMessage() ) );
 
 				// Mark all cart items as unverified in PricingFailureTracker:
 				foreach ( $cart_contents as $key => $item ) {
@@ -155,12 +155,12 @@ class CartPricingIntegration {
 						$failed_product_ids[ $pid ] = true;
 					}
 				} catch ( Throwable $e ) {
-					$code         = $this->classify_exception( $e );
-					$safe_message = $this->sanitize_error_message( $e );
+					$code         = CartPricingAdapter::classify_exception( $e );
+					$safe_message = CartPricingAdapter::get_safe_error_message( $code );
 
 					$this->failure_tracker->record_failure( $pid, $code, $safe_message, $customer_id, (string) $key );
 					$failed_product_ids[ $pid ] = true;
-					$this->log_error( 'Cart item pricing failed for product #' . $pid, $code, $safe_message );
+					$this->log_error( 'Cart item pricing failed for product #' . $pid, $code, PricingFailureTracker::redact_sensitive_text( $e->getMessage() ) );
 
 					if ( function_exists( 'do_action' ) ) {
 						do_action( 'tierza_cart_item_pricing_failed', $pid, $code, $safe_message, $key );
@@ -434,44 +434,11 @@ class CartPricingIntegration {
 	}
 
 	/**
-	 * Classify exception into machine-readable safe error code.
-	 *
-	 * @param Throwable $e Exception instance.
-	 * @return string Error code constant.
-	 */
-	private function classify_exception( Throwable $e ): string {
-		if ( $e instanceof DatabaseQueryException ) {
-			return PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE;
-		}
-		if ( $e instanceof PricingCalculationException ) {
-			return PricingFailureTracker::CODE_CALCULATION_FAILED;
-		}
-		if ( $e instanceof InvalidPricingContextException || $e instanceof InvalidMoneyException ) {
-			return PricingFailureTracker::CODE_INVALID_CONTEXT;
-		}
-		return PricingFailureTracker::CODE_UNEXPECTED;
-	}
-
-	/**
-	 * Sanitize exception message to avoid exposing SQL, credentials, or internal paths.
-	 *
-	 * @param Throwable $e Exception instance.
-	 * @return string Sanitized error message.
-	 */
-	private function sanitize_error_message( Throwable $e ): string {
-		$message = $e->getMessage();
-		$message = (string) preg_replace( '/[a-zA-Z0-9_\-\.\/\\\\]+\.(php|sql|log)/i', '[file]', $message );
-		$message = (string) preg_replace( '/(password|secret|token|key|hash)\s*=\s*[^\s,]+/i', '$1=[redacted]', $message );
-		$message = (string) preg_replace( '/wp_[a-zA-Z0-9_]+/i', '[table]', $message );
-		return substr( trim( $message ), 0, 255 );
-	}
-
-	/**
-	 * Safe internal error logging without leaking sensitive credentials.
+	 * Safe internal error logging without leaking sensitive database credentials.
 	 *
 	 * @param string $context Context description.
 	 * @param string $code    Safe machine-readable error code.
-	 * @param string $message Sanitized message.
+	 * @param string $message Sanitized or redacted diagnostic message.
 	 */
 	private function log_error( string $context, string $code, string $message ): void {
 		if ( function_exists( 'wc_get_logger' ) ) {
@@ -479,7 +446,7 @@ class CartPricingIntegration {
 				$logger = wc_get_logger();
 				if ( method_exists( $logger, 'error' ) ) {
 					$logger->error(
-						sprintf( '[Tierza Cart] %s | Code: %s | Message: %s', $context, $code, $message ),
+						sprintf( '[Tierza Cart] %s | Code: %s | Diagnostic: %s', $context, $code, PricingFailureTracker::redact_sensitive_text( $message ) ),
 						[ 'source' => 'tierza-cart-pricing' ]
 					);
 				}

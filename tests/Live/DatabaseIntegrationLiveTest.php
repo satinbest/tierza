@@ -42,6 +42,7 @@ use Tierza\Domain\ValueObjects\PricingValue;
 use Tierza\Domain\ValueObjects\RuleScope;
 use Tierza\Domain\ValueObjects\RuleStatus;
 use Tierza\Domain\ValueObjects\RuleTarget;
+use Tierza\Application\Pricing\PricingFailureTracker;
 use Tierza\Infrastructure\Database\Schema;
 use Tierza\Infrastructure\Repositories\WpGroupRepository;
 use Tierza\Infrastructure\Repositories\WpRuleRepository;
@@ -152,6 +153,7 @@ class DatabaseIntegrationLiveTest {
 			'test_woocommerce_cart_batch_prefetch_fault_injection_and_recovery_in_mariadb',
 			'test_woocommerce_failure_tracker_recovery_lifecycle_sequence_in_mariadb',
 			'test_woocommerce_checkout_barrier_blocks_real_order_persistence_in_mariadb',
+			'test_woocommerce_real_process_checkout_submission_lifecycle_in_mariadb',
 			'test_woocommerce_cart_fail_closed_on_invalid_or_corrupted_items_in_mariadb',
 			'test_woocommerce_cart_performance_baseline_benchmark_in_mariadb',
 		];
@@ -4144,6 +4146,277 @@ class DatabaseIntegrationLiveTest {
 			$this->delete_test_user( $uid );
 			$this->group_repo->delete( $gid );
 			$product->delete( true );
+		}
+	}
+
+	public function test_woocommerce_real_process_checkout_submission_lifecycle_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+		if ( null === WC()->session ) {
+			WC()->session = new \WC_Session_Handler();
+			WC()->session->init();
+		}
+
+		$group_slug = 'real-check-group-' . time();
+		$group      = $this->group_repo->save( new PricingGroup( 'Real Checkout Group', $group_slug ) );
+		$gid        = (int) $group->id();
+
+		$email = 'real_chk_' . time() . '@test.com';
+		$login = 'real_chk_' . time();
+		$uid   = $this->create_test_user( $login, $email );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$p1 = new \WC_Product_Simple();
+		$p1->set_name( 'Real Checkout P1' );
+		$p1->set_regular_price( '100.00' );
+		$p1->set_price( '100.00' );
+		$p1->save();
+		$p1_id = (int) $p1->get_id();
+
+		$p2 = new \WC_Product_Simple();
+		$p2->set_name( 'Real Checkout P2' );
+		$p2->set_regular_price( '50.00' );
+		$p2->set_price( '50.00' );
+		$p2->save();
+		$p2_id = (int) $p2->get_id();
+
+		$rule1 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $p1_id ),
+			PricingValue::percentage( '20.000000' )
+		) );
+		$rule2 = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $p2_id ),
+			PricingValue::percentage( '10.000000' )
+		) );
+
+		$tracker      = Plugin::instance()->get_pricing_failure_tracker();
+		$cart_adapter = Plugin::instance()->get_cart_pricing_adapter();
+		$table_rules  = Schema::rules_table( $this->db );
+
+		// Enable BACS payment gateway
+		$gateways = WC()->payment_gateways()->payment_gateways();
+		if ( isset( $gateways['bacs'] ) ) {
+			$gateways['bacs']->enabled = 'yes';
+		}
+
+		// Intercept URL redirects & die handlers during process_checkout()
+		$redirect_callback = function( $location ) {
+			throw new \RuntimeException( 'CHECKOUT_REDIRECT: ' . $location );
+		};
+		$die_callback      = function() {
+			return function( $message ) {
+				throw new \RuntimeException( 'CHECKOUT_DIE: ' . ( is_scalar( $message ) ? $message : json_encode( $message ) ) );
+			};
+		};
+
+		add_filter( 'wp_redirect', $redirect_callback, 10, 1 );
+		add_filter( 'wp_die_ajax_handler', $die_callback );
+		add_filter( 'wp_die_handler', $die_callback );
+
+		$execute_checkout = function() use ( $email ): ?int {
+			$nonce = wp_create_nonce( 'woocommerce-process_checkout' );
+			$_POST = [
+				'woocommerce-process-checkout-nonce' => $nonce,
+				'_wpnonce'                           => $nonce,
+				'billing_first_name'                 => 'Real',
+				'billing_last_name'                  => 'CheckoutTester',
+				'billing_address_1'                  => '123 Real Way',
+				'billing_city'                       => 'Dallas',
+				'billing_state'                      => 'TX',
+				'billing_postcode'                   => '75001',
+				'billing_country'                    => 'US',
+				'billing_email'                      => $email,
+				'billing_phone'                      => '2145550199',
+				'payment_method'                     => 'bacs',
+				'terms'                              => 1,
+			];
+			$_REQUEST = $_POST;
+
+			$created_order_id = null;
+			$order_created_hook = function( $oid ) use ( &$created_order_id ) {
+				$created_order_id = (int) $oid;
+			};
+			add_action( 'woocommerce_checkout_order_processed', $order_created_hook, 10, 1 );
+
+			try {
+				WC()->checkout()->process_checkout();
+			} catch ( \Throwable $e ) {
+				unset( $e );
+			} finally {
+				remove_action( 'woocommerce_checkout_order_processed', $order_created_hook, 10 );
+			}
+
+			return $created_order_id;
+		};
+
+		$created_orders = [];
+
+		try {
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			$tracker->reset();
+
+			// -------------------------------------------------------------
+			// Scenario 1: Valid classic checkout submission creates order with B2B totals
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 2 );
+			WC()->cart->calculate_totals();
+
+			$orders_count_before_1 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$oid_1                 = $execute_checkout();
+
+			$this->assert( null !== $oid_1 && $oid_1 > 0, 'Scenario 1: Valid classic checkout submission must create an order in MariaDB.' );
+			$created_orders[] = $oid_1;
+
+			$orders_count_after_1 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_1 === $orders_count_before_1 + 1, 'Scenario 1: Exactly one new order must be persisted in database.' );
+
+			$order_1 = wc_get_order( $oid_1 );
+			$this->assert( $order_1 instanceof \WC_Order, 'Scenario 1: Created order must load via WooCommerce CRUD.' );
+			$this->assert( '160.00' === (string) $order_1->get_total(), 'Scenario 1: Order total must reflect Tierza price (80.00 * 2 = 160.00).' );
+
+			foreach ( $order_1->get_items() as $item ) {
+				$this->assert( (int) $item->get_product_id() === $p1_id, 'Scenario 1: Order item product ID must match.' );
+				$this->assert( '160.00' === wc_format_decimal( $item->get_total(), 2 ), 'Scenario 1: Item total must be 160.00.' );
+			}
+
+			// Original product catalog price in DB remains unmutated at 100.00
+			$fresh_p1 = wc_get_product( $p1_id );
+			$this->assert( '100.00' === (string) $fresh_p1->get_price( 'edit' ), 'Scenario 1: Database product price must remain untouched at 100.00.' );
+
+			// -------------------------------------------------------------
+			// Scenario 2: Real repository failure injected via table rename
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 1 );
+			WC()->cart->calculate_totals();
+			wc_clear_notices();
+
+			// Actual database table rename triggers authentic MariaDB query failure
+			$this->db->query( "RENAME TABLE {$table_rules} TO {$table_rules}_offline" );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			$orders_count_before_2 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$oid_2                 = $execute_checkout();
+
+			$this->assert( null === $oid_2, 'Scenario 2: Repository failure must abort order creation.' );
+			$orders_count_after_2 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_2 === $orders_count_before_2, 'Scenario 2: Zero unauthorized orders must be persisted during repository failure.' );
+			$this->assert( wc_notice_count( 'error' ) > 0, 'Scenario 2: Error notice must be emitted to shopper.' );
+
+			// Restore table:
+			$this->db->query( "RENAME TABLE {$table_rules}_offline TO {$table_rules}" );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			// -------------------------------------------------------------
+			// Scenario 3: Real calculator failure injected
+			// -------------------------------------------------------------
+			wc_clear_notices();
+			$orig_calc = $cart_adapter->get_price_calculator();
+
+			$failing_calc = new class implements \Tierza\Domain\Pricing\Contracts\PriceCalculatorInterface {
+				public function calculate( \Tierza\Domain\Pricing\PricingContext $context, \Tierza\Domain\Pricing\ResolutionResult $resolution ): \Tierza\Domain\Pricing\PricingResult {
+					throw new \Tierza\Domain\Exceptions\PricingCalculationException( 'Simulated decimal overflow fault' );
+				}
+			};
+			$cart_adapter->set_price_calculator( $failing_calc );
+
+			$orders_count_before_3 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$oid_3                 = $execute_checkout();
+
+			$this->assert( null === $oid_3, 'Scenario 3: Calculator failure must abort order creation.' );
+			$orders_count_after_3 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_3 === $orders_count_before_3, 'Scenario 3: Zero unauthorized orders must be persisted during calculator failure.' );
+			$this->assert( wc_notice_count( 'error' ) > 0, 'Scenario 3: Error notice must be emitted.' );
+
+			// Restore original calculator:
+			$cart_adapter->set_price_calculator( $orig_calc );
+
+			// -------------------------------------------------------------
+			// Scenario 4: Authoritative recovery without manual clearing of tracker
+			// -------------------------------------------------------------
+			wc_clear_notices();
+			// Recalculate totals authoritatively; tracker failure is cleared automatically:
+			WC()->cart->calculate_totals();
+			$this->assert( ! $tracker->has_failed( $p1_id, $uid ), 'Scenario 4: Authoritative recalculation must clear resolved failure without manual intervention.' );
+
+			$orders_count_before_4 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$oid_4                 = $execute_checkout();
+
+			$this->assert( null !== $oid_4 && $oid_4 > 0, 'Scenario 4: Recovered cart must complete classic checkout.' );
+			$created_orders[] = $oid_4;
+
+			$orders_count_after_4 = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_4 === $orders_count_before_4 + 1, 'Scenario 4: Exactly one new order must be persisted for recovered cart.' );
+
+			$order_4 = wc_get_order( $oid_4 );
+			$this->assert( $order_4 instanceof \WC_Order, 'Scenario 4: Recovered order must load via CRUD.' );
+			$this->assert( '80.00' === (string) $order_4->get_total(), 'Scenario 4: Recovered order total must reflect authoritative Tierza price (80.00).' );
+
+			// -------------------------------------------------------------
+			// Scenario 5: Multi-line cart failure isolation vs full recovery
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 1 );
+			WC()->cart->add_to_cart( $p2_id, 1 );
+			WC()->cart->calculate_totals();
+			wc_clear_notices();
+
+			$cart_lines = array_keys( WC()->cart->get_cart() );
+			$line_1_key = $cart_lines[0];
+			$line_2_key = $cart_lines[1];
+
+			// Simulate failure on line 2 only:
+			$tracker->record_failure( $p2_id, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Precision fault', $uid, $line_2_key );
+
+			$this->assert( ! $tracker->has_failed( $p1_id, $uid, $line_1_key ), 'Scenario 5: Line 1 must not be marked as failed.' );
+			$this->assert( $tracker->has_failed( $p2_id, $uid, $line_2_key ), 'Scenario 5: Line 2 must be marked as failed.' );
+
+			$report_multiline = $cart_adapter->revalidate_checkout( WC()->cart, $uid );
+			$this->assert( false === $report_multiline['valid'], 'Scenario 5: Multi-line cart must fail validation when one line is unresolved.' );
+			$this->assert( in_array( $p2_id, $report_multiline['failed_product_ids'], true ), 'Scenario 5: Failed product ID must be in report.' );
+
+			// Clear line 2 failure via authoritative recalculation:
+			WC()->cart->calculate_totals();
+			$this->assert( ! $tracker->has_failed( $p2_id, $uid, $line_2_key ), 'Scenario 5: Line 2 failure must be cleared after recalculation.' );
+
+			$report_recovered = $cart_adapter->revalidate_checkout( WC()->cart, $uid );
+			$this->assert( true === $report_recovered['valid'], 'Scenario 5: Multi-line cart must pass validation when all lines are resolved.' );
+
+		} finally {
+			// Ensure table is restored if an error occurred during test
+			$suppress = $this->db->suppress_errors( true );
+			$this->db->query( "RENAME TABLE {$table_rules}_offline TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress );
+
+			remove_filter( 'wp_redirect', $redirect_callback, 10 );
+			remove_filter( 'wp_die_ajax_handler', $die_callback );
+			remove_filter( 'wp_die_handler', $die_callback );
+
+			// Delete all test-owned orders using WooCommerce CRUD
+			foreach ( $created_orders as $oid ) {
+				$order = wc_get_order( $oid );
+				if ( $order instanceof \WC_Order ) {
+					$order->delete( true );
+				}
+			}
+
+			$tracker->reset();
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			wc_clear_notices();
+
+			$this->rule_repo->delete( (int) $rule1->id() );
+			$this->rule_repo->delete( (int) $rule2->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$p1->delete( true );
+			$p2->delete( true );
 		}
 	}
 

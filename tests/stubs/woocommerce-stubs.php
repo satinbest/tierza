@@ -51,6 +51,21 @@ if ( ! class_exists( 'WP_Error' ) ) {
 		}
 
 		/**
+		 * @param string $code
+		 * @return string[]
+		 */
+		public function get_error_messages( string $code = '' ): array {
+			if ( '' !== $code ) {
+				return $this->errors[ $code ] ?? [];
+			}
+			$all = [];
+			foreach ( $this->errors as $messages ) {
+				$all = array_merge( $all, $messages );
+			}
+			return $all;
+		}
+
+		/**
 		 * @return string[]
 		 */
 		public function get_error_codes(): array {

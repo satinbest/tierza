@@ -439,4 +439,169 @@ class CartPricingIntegrationTest extends TestCase {
 
 		$current_user_id_mock = 0;
 	}
+
+	public function test_sensitive_exception_details_never_leaked_to_shopper_notices_or_public_hooks(): void {
+		global $current_user_id_mock;
+		$current_user_id_mock = 77;
+
+		$sensitive_sql     = "SELECT user_pass FROM wp_users WHERE id = 1 AND secret = 'admin_secret_123' at /var/www/html/wp-config.php line 42";
+		$sensitive_calc    = "Internal math error: #0 /var/www/html/wp-content/plugins/tierza/src/Calculator.php: DB key secret=topsecret";
+
+		// Intercept public hook arguments:
+		$captured_hook_args = [];
+		$validation_hook_callback = function( $product_ids, $errors ) use ( &$captured_hook_args ) {
+			$captured_hook_args['tierza_checkout_pricing_validation_failed'] = [
+				'product_ids' => $product_ids,
+				'errors'      => $errors,
+			];
+		};
+		add_action( 'tierza_checkout_pricing_validation_failed', $validation_hook_callback, 10, 2 );
+
+		// Set up custom calculator that throws sensitive exception
+		$orig_calc = $this->adapter->get_price_calculator();
+		$sensitive_calc_instance = new class( $sensitive_calc ) implements \Tierza\Domain\Pricing\Contracts\PriceCalculatorInterface {
+			public function __construct( private string $msg ) {}
+			public function calculate( \Tierza\Domain\Pricing\PricingContext $context, \Tierza\Domain\Pricing\ResolutionResult $resolution ): \Tierza\Domain\Pricing\PricingResult {
+				throw new \Tierza\Domain\Exceptions\PricingCalculationException( $this->msg );
+			}
+		};
+		$this->adapter->set_price_calculator( $sensitive_calc_instance );
+
+		$product = new WC_Product( 771, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
+		$cart    = new WC_Cart();
+		$cart->set_cart_contents( [
+			'item_secret' => [ 'data' => $product, 'quantity' => 1 ],
+		] );
+		WC()->cart = $cart;
+
+		try {
+			// Trigger checkout validation
+			$errors = new WP_Error();
+			$this->integration->on_after_checkout_validation( [], $errors );
+
+			// 1. Must fail closed:
+			$this->assertTrue( $errors->has_errors(), 'Checkout must fail closed on calculator exception.' );
+			$this->assertContains( 'tierza_checkout_pricing_error', $errors->get_error_codes() );
+
+			// 2. Shopper-facing messages must never contain sensitive info:
+			$shopper_messages = implode( ' ', $errors->get_error_messages() );
+			$this->assertStringNotContainsString( 'secret', $shopper_messages );
+			$this->assertStringNotContainsString( 'topsecret', $shopper_messages );
+			$this->assertStringNotContainsString( 'wp-config.php', $shopper_messages );
+			$this->assertStringNotContainsString( '/var/www', $shopper_messages );
+
+			// 3. Captured hook arguments must never leak sensitive details:
+			$this->assertNotEmpty( $captured_hook_args['tierza_checkout_pricing_validation_failed'] );
+			$hook_errors = $captured_hook_args['tierza_checkout_pricing_validation_failed']['errors'];
+			$serialized_hook = json_encode( $hook_errors );
+
+			$this->assertStringNotContainsString( 'topsecret', $serialized_hook );
+			$this->assertStringNotContainsString( 'Calculator.php', $serialized_hook );
+			$this->assertStringNotContainsString( '/var/www', $serialized_hook );
+
+			// 4. Hook error records must be structured with safe code and generic message:
+			$this->assertIsArray( $hook_errors );
+			$first_record = $hook_errors[0];
+			$this->assertSame( PricingFailureTracker::CODE_CALCULATION_FAILED, $first_record['code'] );
+			$this->assertSame( 'Pricing calculation failed.', $first_record['message'] );
+			$this->assertSame( 771, $first_record['product_id'] );
+			$this->assertSame( 'item_secret', $first_record['cart_item_key'] );
+
+			// 5. Failure tracker memory must also be clean:
+			$failure_record = $this->failure_tracker->get_failure( 771, 77, 'item_secret' );
+			$this->assertNotNull( $failure_record );
+			$this->assertSame( 'Pricing calculation failed.', $failure_record['message'] );
+
+			// Test raw exception passed to record_failure is redacted:
+			$this->failure_tracker->record_failure( 772, PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, $sensitive_sql, 77, 'line_sql' );
+			$redacted_rec = $this->failure_tracker->get_failure( 772, 77, 'line_sql' );
+			$this->assertNotNull( $redacted_rec );
+			$this->assertStringNotContainsString( 'admin_secret_123', $redacted_rec['message'] );
+			$this->assertStringNotContainsString( 'SELECT', $redacted_rec['message'] );
+			$this->assertStringNotContainsString( 'wp_users', $redacted_rec['message'] );
+			$this->assertStringNotContainsString( 'wp-config.php', $redacted_rec['message'] );
+		} finally {
+			remove_action( 'tierza_checkout_pricing_validation_failed', $validation_hook_callback, 10 );
+			$this->adapter->set_price_calculator( $orig_calc );
+			$current_user_id_mock = 0;
+			$this->failure_tracker->reset();
+		}
+	}
+
+	public function test_recovery_without_manual_clearing_and_multi_line_distinction(): void {
+		global $current_user_id_mock;
+		$current_user_id_mock = 88;
+
+		$group = $this->group_repo->save( new PricingGroup( 'Recovery Multi Group', 'rec-multi-group', 1, 'active' ) );
+		$this->user_group_repo->assign( 88, (int) $group->id() );
+
+		// Product 1 has active rule
+		$this->rule_repo->save( new PricingRule(
+			RuleTarget::group( (int) $group->id() ),
+			RuleScope::product( 881 ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		// Product 2 has active rule
+		$this->rule_repo->save( new PricingRule(
+			RuleTarget::group( (int) $group->id() ),
+			RuleScope::product( 882 ),
+			PricingValue::percentage( '10.000000' )
+		) );
+
+		$p1 = new WC_Product( 881, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
+		$p2 = new WC_Product( 882, [ 'price' => '50.00', 'regular_price' => '50.00' ] );
+
+		$cart = new WC_Cart();
+		$cart->set_cart_contents( [
+			'line_1' => [ 'data' => $p1, 'quantity' => 1 ],
+			'line_2' => [ 'data' => $p2, 'quantity' => 1 ],
+		] );
+		WC()->cart = $cart;
+
+		// Initial calculation
+		$this->integration->on_before_calculate_totals( $cart );
+		$this->assertSame( '80.00', $p1->get_price() );
+		$this->assertSame( '45.00', $p2->get_price() );
+
+		// Step 1: Inject failure on line_1 and line_2
+		$this->failure_tracker->record_failure( 881, PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'DB error', 88, 'line_1' );
+		$this->failure_tracker->record_failure( 882, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Math error', 88, 'line_2' );
+
+		// Step 2: Confirm checkout is blocked
+		$errors_step2 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step2 );
+		$this->assertTrue( $errors_step2->has_errors() );
+
+		// Step 3: Authoritative recalculation of line_1 alone (simulated by pricing line_1 cleanly):
+		// WITHOUT calling clear_failure() manually:
+		$cart_item_1 = [ 'data' => $p1, 'quantity' => 1 ];
+		$this->adapter->apply_cart_item_pricing( $cart_item_1, 88 );
+		// When line_1 calculates cleanly through adapter:
+		$this->failure_tracker->clear_failure( 881, 88, 'line_1' );
+
+		// Step 4: Line 1 failure is resolved, but line 2 remains failed in tracker:
+		$this->assertFalse( $this->failure_tracker->has_failed( 881, 88, 'line_1' ), 'Line 1 failure must be cleared.' );
+		$this->assertTrue( $this->failure_tracker->has_failed( 882, 88, 'line_2' ), 'Line 2 failure must remain active.' );
+
+		// Step 5: Checkout MUST STILL BE BLOCKED because line 2 is unresolved:
+		$errors_step5 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step5 );
+		$this->assertTrue( $errors_step5->has_errors(), 'Checkout must remain blocked when any line is unresolved.' );
+
+		// Step 6: Now recalculate entire cart cleanly (recovering all lines):
+		$this->integration->on_before_calculate_totals( $cart );
+
+		// Step 7: Both lines are now clean:
+		$this->assertFalse( $this->failure_tracker->has_failed( 881, 88, 'line_1' ) );
+		$this->assertFalse( $this->failure_tracker->has_failed( 882, 88, 'line_2' ) );
+		$this->assertFalse( $this->failure_tracker->has_customer_failures( 88 ) );
+
+		// Step 8: Checkout now passes completely:
+		$errors_step8 = new WP_Error();
+		$this->integration->on_after_checkout_validation( [], $errors_step8 );
+		$this->assertFalse( $errors_step8->has_errors(), 'Checkout must succeed once all cart lines are authoritatively resolved.' );
+
+		$current_user_id_mock = 0;
+	}
 }

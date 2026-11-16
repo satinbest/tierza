@@ -138,6 +138,14 @@ class CartPricingAdapter {
 		return $this->product_adapter;
 	}
 
+	public function get_price_calculator(): PriceCalculatorInterface {
+		return $this->price_calculator;
+	}
+
+	public function set_price_calculator( PriceCalculatorInterface $price_calculator ): void {
+		$this->price_calculator = $price_calculator;
+	}
+
 	public function get_failure_tracker(): PricingFailureTracker {
 		return $this->failure_tracker;
 	}
@@ -439,6 +447,91 @@ class CartPricingAdapter {
 	}
 
 	/**
+	 * Classify exception into machine-readable safe error code.
+	 *
+	 * @param \Throwable $e Exception instance.
+	 * @return string Error code constant.
+	 */
+	public static function classify_exception( \Throwable $e ): string {
+		$check = $e;
+		while ( null !== $check ) {
+			if ( $check instanceof \Tierza\Infrastructure\Exceptions\DatabaseQueryException ) {
+				return PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE;
+			}
+			if ( $check instanceof \Tierza\Domain\Exceptions\PricingCalculationException ) {
+				return PricingFailureTracker::CODE_CALCULATION_FAILED;
+			}
+			if ( $check instanceof \Tierza\Domain\Exceptions\InvalidPricingContextException || $check instanceof \Tierza\Domain\Exceptions\InvalidMoneyException ) {
+				return PricingFailureTracker::CODE_INVALID_CONTEXT;
+			}
+			$check = $check->getPrevious();
+		}
+		return PricingFailureTracker::CODE_UNEXPECTED;
+	}
+
+	/**
+	 * Map machine-readable error code to safe, generic translatable message.
+	 *
+	 * Guarantees that internal database queries, credentials, and paths never leak to shoppers.
+	 *
+	 * @param string $code Error code constant.
+	 * @return string Generic safe description.
+	 */
+	public static function get_safe_error_message( string $code ): string {
+		return match ( $code ) {
+			PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE => __( 'Pricing repository unavailable.', 'tierza' ),
+			PricingFailureTracker::CODE_CALCULATION_FAILED     => __( 'Pricing calculation failed.', 'tierza' ),
+			PricingFailureTracker::CODE_INVALID_CONTEXT        => __( 'Invalid pricing context or monetary value.', 'tierza' ),
+			'TRZ_ERR_PRICE_DISCREPANCY'                        => __( 'Cart price does not match current pricing rules.', 'tierza' ),
+			default                                            => __( 'An unexpected error occurred during pricing evaluation.', 'tierza' ),
+		};
+	}
+
+	/**
+	 * Log diagnostic details safely to internal WooCommerce logger with redaction.
+	 *
+	 * @param string     $context Context description.
+	 * @param string     $code    Machine-readable error code.
+	 * @param \Throwable $e       Exception instance.
+	 */
+	private function log_diagnostic_error( string $context, string $code, \Throwable $e ): void {
+		if ( function_exists( 'wc_get_logger' ) ) {
+			try {
+				$logger = wc_get_logger();
+				if ( method_exists( $logger, 'error' ) ) {
+					$redacted = PricingFailureTracker::redact_sensitive_text( $e->getMessage() );
+					$logger->error(
+						sprintf( '[Tierza Checkout] %s | Code: %s | Diagnostic: %s', $context, $code, $redacted ),
+						[ 'source' => 'tierza-checkout-pricing' ]
+					);
+				}
+			} catch ( \Throwable $e ) {
+				unset( $e );
+				// Prevent logging failures from halting checkout execution.
+			}
+		}
+	}
+
+	/**
+	 * Deduplicate structured error records by code, product_id, and cart_item_key.
+	 *
+	 * @param array<int, array{code: string, message: string, product_id: int, cart_item_key: string, cart_price?: string, current_price?: string}> $records
+	 * @return array<int, array{code: string, message: string, product_id: int, cart_item_key: string, cart_price?: string, current_price?: string}>
+	 */
+	private function deduplicate_error_records( array $records ): array {
+		$seen   = [];
+		$unique = [];
+		foreach ( $records as $record ) {
+			$sig = sprintf( '%s:%d:%s', $record['code'], $record['product_id'], $record['cart_item_key'] );
+			if ( ! isset( $seen[ $sig ] ) ) {
+				$seen[ $sig ] = true;
+				$unique[]     = $record;
+			}
+		}
+		return $unique;
+	}
+
+	/**
 	 * Time-of-check / time-of-use revalidation at the checkout boundary.
 	 *
 	 * Guarantees that:
@@ -446,12 +539,13 @@ class CartPricingAdapter {
 	 * 2. No unresolved calculation, repository, or prefetch failure permits order creation.
 	 * 3. Final cart line prices match currently active pricing rules.
 	 * 4. Stale customer identities or modified rules block checkout until reconciled.
+	 * 5. Structured, sanitized error records are produced without leaking database internals.
 	 *
 	 * @param WC_Cart  $cart        WooCommerce cart instance.
 	 * @param int|null $customer_id Optional customer ID.
 	 * @return array{
 	 *     valid: bool,
-	 *     errors: string[],
+	 *     errors: array<int, array{code: string, message: string, product_id: int, cart_item_key: string, cart_price?: string, current_price?: string}>,
 	 *     failed_product_ids: int[],
 	 *     discrepancies: array<string, array{cart_price: string, current_price: string}>
 	 * } Revalidation report.
@@ -477,7 +571,12 @@ class CartPricingAdapter {
 		foreach ( $cart_contents as $key => $item ) {
 			$product = $item['data'] ?? null;
 			if ( ! $product instanceof WC_Product || $product->get_id() <= 0 ) {
-				$errors[]             = sprintf( 'Cart line "%s" contains invalid or corrupted product data.', $key );
+				$errors[]             = [
+					'code'          => PricingFailureTracker::CODE_INVALID_CONTEXT,
+					'message'       => __( 'Invalid or corrupted cart item product data.', 'tierza' ),
+					'product_id'    => 0,
+					'cart_item_key' => (string) $key,
+				];
 				$failed_product_ids[] = 0;
 				$this->failure_tracker->record_failure( 0, PricingFailureTracker::CODE_INVALID_CONTEXT, 'Invalid or corrupted product data.', $resolved_customer_id, (string) $key );
 				continue;
@@ -489,7 +588,12 @@ class CartPricingAdapter {
 			try {
 				$context = $this->get_cart_item_pricing_context( $item, $resolved_customer_id );
 				if ( null === $context ) {
-					$errors[]             = sprintf( 'Product #%d in cart cannot be authoritatively verified.', $pid );
+					$errors[]             = [
+						'code'          => PricingFailureTracker::CODE_INVALID_CONTEXT,
+						'message'       => __( 'Pricing context could not be determined.', 'tierza' ),
+						'product_id'    => $pid,
+						'cart_item_key' => (string) $key,
+					];
 					$failed_product_ids[] = $pid;
 					$this->failure_tracker->record_failure( $pid, PricingFailureTracker::CODE_INVALID_CONTEXT, 'Context construction failed.', $resolved_customer_id, (string) $key );
 					continue;
@@ -507,26 +611,29 @@ class CartPricingAdapter {
 						'cart_price'    => $actual_cart_price,
 						'current_price' => $expected_price,
 					];
-					$errors[]                       = sprintf(
-						'Price discrepancy on product #%d: cart price is %s but current rule yields %s.',
-						$pid,
-						$actual_cart_price,
-						$expected_price
-					);
+					$errors[]                       = [
+						'code'          => 'TRZ_ERR_PRICE_DISCREPANCY',
+						'message'       => __( 'Cart price does not match current pricing rules.', 'tierza' ),
+						'product_id'    => $pid,
+						'cart_item_key' => (string) $key,
+						'cart_price'    => $actual_cart_price,
+						'current_price' => $expected_price,
+					];
 					$failed_product_ids[]           = $pid;
 				}
 			} catch ( \Throwable $e ) {
-				$code         = ( $e instanceof \Tierza\Infrastructure\Exceptions\DatabaseQueryException )
-					? PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE
-					: ( ( $e instanceof \Tierza\Domain\Exceptions\PricingCalculationException )
-						? PricingFailureTracker::CODE_CALCULATION_FAILED
-						: ( ( $e instanceof \Tierza\Domain\Exceptions\InvalidPricingContextException || $e instanceof \Tierza\Domain\Exceptions\InvalidMoneyException )
-							? PricingFailureTracker::CODE_INVALID_CONTEXT
-							: PricingFailureTracker::CODE_UNEXPECTED ) );
-				$safe_message = $e->getMessage();
+				$code         = self::classify_exception( $e );
+				$safe_message = self::get_safe_error_message( $code );
+
 				$this->failure_tracker->record_failure( $pid, $code, $safe_message, $resolved_customer_id, (string) $key );
+				$this->log_diagnostic_error( sprintf( 'Revalidation exception on product #%d', $pid ), $code, $e );
 				$failed_product_ids[] = $pid;
-				$errors[]             = sprintf( 'Failed to verify current price for product #%d: %s', $pid, $safe_message );
+				$errors[]             = [
+					'code'          => $code,
+					'message'       => $safe_message,
+					'product_id'    => $pid,
+					'cart_item_key' => (string) $key,
+				];
 			}
 		}
 
@@ -541,13 +648,20 @@ class CartPricingAdapter {
 			$pid = (int) $product->get_id();
 			if ( $this->failure_tracker->has_failed( $pid, $resolved_customer_id, (string) $key ) ) {
 				$failed_product_ids[] = $pid;
-				$errors[]             = sprintf( 'Product #%d has an unresolved pricing calculation error.', $pid );
+				$failure_record       = $this->failure_tracker->get_failure( $pid, $resolved_customer_id, (string) $key );
+				$code                 = $failure_record['error_code'] ?? PricingFailureTracker::CODE_UNEXPECTED;
+				$errors[]             = [
+					'code'          => $code,
+					'message'       => self::get_safe_error_message( $code ),
+					'product_id'    => $pid,
+					'cart_item_key' => (string) $key,
+				];
 			}
 		}
 
 		return [
 			'valid'              => empty( $errors ),
-			'errors'             => array_values( array_unique( $errors ) ),
+			'errors'             => $this->deduplicate_error_records( $errors ),
 			'failed_product_ids' => array_values( array_unique( $failed_product_ids ) ),
 			'discrepancies'      => $discrepancies,
 		];

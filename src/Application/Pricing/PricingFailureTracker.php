@@ -32,6 +32,8 @@ class PricingFailureTracker {
 	/**
 	 * Record a failure for a specific product ID, with customer and optional cart item context.
 	 *
+	 * Message is automatically redacted to prevent leaking raw SQL, credentials, or paths.
+	 *
 	 * @param int    $product_id    Product or variation ID (0 for invalid context).
 	 * @param string $error_code    Machine-readable error code.
 	 * @param string $safe_message  Sanitized failure description.
@@ -49,12 +51,34 @@ class PricingFailureTracker {
 
 		$this->failures[ $key ] = [
 			'error_code'    => $error_code,
-			'message'       => $safe_message,
+			'message'       => self::redact_sensitive_text( $safe_message ),
 			'product_id'    => $product_id,
 			'customer_id'   => $customer_id,
 			'cart_item_key' => $cart_item_key,
 			'timestamp'     => time(),
 		];
+	}
+
+	/**
+	 * Redact sensitive database queries, credentials, passwords, file paths, and stack traces.
+	 *
+	 * @param string $text Raw message or diagnostic string.
+	 * @return string Sanitized and redacted text.
+	 */
+	public static function redact_sensitive_text( string $text ): string {
+		// Redact table names with prefixes
+		$text = (string) preg_replace( '/\b[a-zA-Z0-9_]+users\b/i', '[table]', $text );
+		$text = (string) preg_replace( '/\bwp_[a-zA-Z0-9_]+\b/i', '[table]', $text );
+		// Redact SQL statements
+		$text = (string) preg_replace( '/\b(SELECT|INSERT|UPDATE|DELETE|DROP|ALTER)\b[^\n;]+/i', '[sql_redacted]', $text );
+		// Redact credentials, passwords, tokens, hashes, keys
+		$text = (string) preg_replace( '/\b(password|secret|token|key|hash|pass|auth|credential)\b\s*[:=]\s*[^\s,;]+/i', '$1=[redacted]', $text );
+		// Redact filesystem paths (Unix and Windows)
+		$text = (string) preg_replace( '/(\/[a-zA-Z0-9_\.\-]+)+|[A-Za-z]:\\\\[a-zA-Z0-9_\.\-\\\\]+/i', '[file_path_redacted]', $text );
+		// Redact stack traces
+		$text = (string) preg_replace( '/#\d+\s+[^\n]+/i', '[stack_trace_redacted]', $text );
+
+		return substr( trim( $text ), 0, 500 );
 	}
 
 	/**

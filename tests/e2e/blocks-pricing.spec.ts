@@ -115,25 +115,22 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 	});
 
 	test('1. Guest customer sees regular price in Cart Block and Store API minor units', async ({ page }) => {
-		let capturedCartJson: any = null;
-		await page.route('**/wp-json/wc/store/v1/cart**', async (route) => {
-			const res = await route.fetch();
-			try {
-				capturedCartJson = await res.json();
-			} catch {}
-			await route.fulfill({ response: res });
-		});
-
 		await page.goto(`/?add-to-cart=${simpleId}`);
 		await page.goto(cartUrl);
 
 		const cartBlock = page.locator('.wp-block-woocommerce-cart, .wc-block-cart').first();
 		await expect(cartBlock).toBeVisible({ timeout: 20000 });
 
+		// Fetch Store API cart directly within active browser session
+		const cartJson: any = await page.evaluate(async () => {
+			const res = await fetch('/wp-json/wc/store/v1/cart');
+			return await res.json();
+		});
+
 		// Assert Store API minor units: 10000 = $100.00
-		expect(capturedCartJson).not.toBeNull();
-		expect(capturedCartJson.items[0].prices.price).toBe('10000');
-		expect(capturedCartJson.items[0].totals.line_total).toBe('10000');
+		expect(cartJson).not.toBeNull();
+		expect(cartJson.items[0].prices.price).toBe('10000');
+		expect(cartJson.items[0].totals.line_total).toBe('10000');
 
 		// Verify Cart Block UI displays 100 and not 80
 		const priceElement = page.locator('.wc-block-cart-items, .wc-block-cart__main, table.wc-block-cart-items').first();
@@ -145,15 +142,6 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 
 	test('2. Authenticated B2B customer sees personalized 20% discount in Cart Block and Store API (8000)', async ({ page }) => {
 		await clearUserCart(userId);
-		let capturedCartJson: any = null;
-		await page.route('**/wp-json/wc/store/v1/cart**', async (route) => {
-			const res = await route.fetch();
-			try {
-				capturedCartJson = await res.json();
-			} catch {}
-			await route.fulfill({ response: res });
-		});
-
 		await loginB2B(page);
 		await page.goto(`/?add-to-cart=${simpleId}`);
 		await page.goto(cartUrl);
@@ -161,10 +149,16 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 		const cartBlock = page.locator('.wp-block-woocommerce-cart, .wc-block-cart').first();
 		await expect(cartBlock).toBeVisible({ timeout: 20000 });
 
+		// Fetch Store API cart directly within authenticated session
+		const cartJson: any = await page.evaluate(async () => {
+			const res = await fetch('/wp-json/wc/store/v1/cart');
+			return await res.json();
+		});
+
 		// Assert Store API minor units for B2B price: 8000 = $80.00
-		expect(capturedCartJson).not.toBeNull();
-		expect(capturedCartJson.items[0].prices.price).toBe('8000');
-		expect(capturedCartJson.items[0].totals.line_total).toBe('8000');
+		expect(cartJson).not.toBeNull();
+		expect(cartJson.items[0].prices.price).toBe('8000');
+		expect(cartJson.items[0].totals.line_total).toBe('8000');
 
 		// Verify Cart Block displays discounted B2B price 80
 		const cartMain = page.locator('.wc-block-cart__main, .wc-block-cart-items, .wp-block-woocommerce-cart').first();
@@ -174,15 +168,6 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 	});
 
 	test('3. Quantity changes in Cart Block recalculate totals without stacking discounts (qty 2 -> 16000)', async ({ page }) => {
-		let latestCartJson: any = null;
-		await page.route('**/wp-json/wc/store/v1/cart**', async (route) => {
-			const res = await route.fetch();
-			try {
-				latestCartJson = await res.json();
-			} catch {}
-			await route.fulfill({ response: res });
-		});
-
 		await loginB2B(page);
 		await page.goto(`/?add-to-cart=${simpleId}`);
 		await page.goto(cartUrl);
@@ -199,11 +184,16 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 		await qtyInput.press('Enter');
 		await page.waitForTimeout(3000);
 
+		// Fetch Store API cart directly to verify updated minor units
+		const latestCartJson: any = await page.evaluate(async () => {
+			const res = await fetch('/wp-json/wc/store/v1/cart');
+			return await res.json();
+		});
+
 		// Assert Store API minor units: 8000 unit, 16000 line total
-		if (latestCartJson && latestCartJson.items && latestCartJson.items.length > 0) {
-			expect(latestCartJson.items[0].prices.price).toBe('8000');
-			expect(latestCartJson.items[0].totals.line_total).toBe('16000');
-		}
+		expect(latestCartJson).not.toBeNull();
+		expect(latestCartJson.items[0].prices.price).toBe('8000');
+		expect(latestCartJson.items[0].totals.line_total).toBe('16000');
 
 		// Cart Block UI must display line total of 160 (or 80 each * 2)
 		const cartMain = page.locator('.wc-block-cart__main, .wc-block-cart-items, .wp-block-woocommerce-cart').first();
@@ -212,16 +202,6 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 
 	test('4. Real Checkout Block submission persists authoritative B2B price ($80.00)', async ({ page }) => {
 		await clearUserCart(userId);
-
-		let checkoutResponseData: any = null;
-		await page.route('**/wp-json/wc/store/v1/checkout**', async (route) => {
-			const res = await route.fetch();
-			try {
-				checkoutResponseData = await res.json();
-			} catch {}
-			await route.fulfill({ response: res });
-		});
-
 		await loginB2B(page);
 
 		// Fresh cart with 1 item
@@ -248,15 +228,12 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 		const pageText = await page.innerText('body');
 		expect(pageText).toMatch(/80(\.00)?/);
 
-		// Authoritatively verify persisted WC_Order from CLI
-		if (checkoutResponseData && checkoutResponseData.order_id) {
-			const orderId = checkoutResponseData.order_id;
-			const orderVerifyOutput = execSync(
-				`npx wp-env run cli wp eval "echo wc_get_order(${orderId})->get_total();"`,
-				{ encoding: 'utf-8' }
-			);
-			expect(orderVerifyOutput).toContain('80.00');
-		}
+		// Authoritatively verify persisted WC_Order from database
+		const orderVerifyOutput = execSync(
+			'npx wp-env run cli wp db query "SELECT meta_value FROM wp_postmeta WHERE meta_key=\'_order_total\' ORDER BY post_id DESC LIMIT 1;"',
+			{ encoding: 'utf-8' }
+		);
+		expect(orderVerifyOutput).toContain('80.00');
 	});
 
 	test('5. Failure injection triggers visible error notice banner in Checkout Block UI and recovers cleanly', async ({ page }) => {

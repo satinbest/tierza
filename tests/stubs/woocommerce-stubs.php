@@ -487,6 +487,90 @@ if ( ! class_exists( 'WC_Checkout' ) ) {
 	}
 }
 
+if ( ! class_exists( 'WC_Order_Item_Product' ) ) {
+	class WC_Order_Item_Product {
+		public int $id = 0;
+		public int $product_id = 0;
+		public int $variation_id = 0;
+		public int $quantity = 1;
+		public string $subtotal = '0.00';
+		public string $subtotal_tax = '0.00';
+		public string $total = '0.00';
+		public string $total_tax = '0.00';
+		public ?WC_Product $product = null;
+
+		public function get_id(): int {
+			return $this->id;
+		}
+
+		public function get_product_id(): int {
+			return $this->product_id;
+		}
+
+		public function get_variation_id(): int {
+			return $this->variation_id;
+		}
+
+		public function get_quantity(): int {
+			return $this->quantity;
+		}
+
+		public function get_subtotal(): string {
+			return $this->subtotal;
+		}
+
+		public function get_subtotal_tax(): string {
+			return $this->subtotal_tax;
+		}
+
+		public function get_total(): string {
+			return $this->total;
+		}
+
+		public function get_total_tax(): string {
+			return $this->total_tax;
+		}
+
+		public function get_product(): ?WC_Product {
+			return $this->product;
+		}
+	}
+}
+
+if ( ! class_exists( 'WC_Order' ) ) {
+	class WC_Order {
+		public int $id = 0;
+		public int $customer_id = 0;
+		public string $total = '0.00';
+		/** @var array<int|string, WC_Order_Item_Product> */
+		public array $items = [];
+
+		public function get_id(): int {
+			return $this->id;
+		}
+
+		public function get_customer_id(): int {
+			return $this->customer_id;
+		}
+
+		public function get_total(): string {
+			return $this->total;
+		}
+
+		/**
+		 * @param string $type
+		 * @return array<int|string, object>
+		 */
+		public function get_items( string $type = 'line_item' ): array {
+			return $this->items;
+		}
+
+		public function delete( bool $force_delete = false ): bool {
+			return true;
+		}
+	}
+}
+
 if ( ! function_exists( 'wc_add_notice' ) ) {
 	/**
 	 * @param string $message
@@ -523,6 +607,13 @@ if ( ! function_exists( 'wc_clear_notices' ) ) {
 	function wc_clear_notices(): void {
 		global $wc_notices;
 		$wc_notices = [];
+	}
+}
+
+if ( ! function_exists( 'wc_prices_include_tax' ) ) {
+	function wc_prices_include_tax(): bool {
+		global $wc_prices_include_tax_mock;
+		return (bool) ( $wc_prices_include_tax_mock ?? false );
 	}
 }
 

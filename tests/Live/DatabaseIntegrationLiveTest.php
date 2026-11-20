@@ -156,6 +156,9 @@ class DatabaseIntegrationLiveTest {
 			'test_woocommerce_real_process_checkout_submission_lifecycle_in_mariadb',
 			'test_woocommerce_cart_fail_closed_on_invalid_or_corrupted_items_in_mariadb',
 			'test_woocommerce_cart_performance_baseline_benchmark_in_mariadb',
+			'test_woocommerce_store_api_cart_and_checkout_lifecycle_in_mariadb',
+			'test_woocommerce_store_api_nine_step_recovery_and_draft_order_lifecycle_in_mariadb',
+			'test_woocommerce_store_api_performance_baseline_benchmark_in_mariadb',
 		];
 
 		foreach ( $methods as $method ) {
@@ -177,6 +180,9 @@ class DatabaseIntegrationLiveTest {
 			$this->assertions,
 			count( $this->failures )
 		) . PHP_EOL;
+		foreach ( $this->failures as $f ) {
+			echo "   FAILED: " . $f . PHP_EOL;
+		}
 		echo "==========================================================" . PHP_EOL;
 
 		return empty( $this->failures ) ? 0 : 1;
@@ -4457,6 +4463,601 @@ class DatabaseIntegrationLiveTest {
 		$this->assert( ! empty( $report['errors'] ), 'Errors must be reported for corrupted cart item.' );
 
 		WC()->cart->empty_cart();
+	}
+
+	public function test_woocommerce_store_api_cart_and_checkout_lifecycle_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+		if ( null === WC()->session ) {
+			WC()->session = new \WC_Session_Handler();
+			WC()->session->init();
+		}
+
+		$group_a_slug = 'sapi-grp-a-' . time();
+		$group_b_slug = 'sapi-grp-b-' . time();
+
+		$group_a = $this->group_repo->save( new PricingGroup( 'StoreAPI Group A', $group_a_slug ) );
+		$gid_a   = (int) $group_a->id();
+
+		$group_b = $this->group_repo->save( new PricingGroup( 'StoreAPI Group B', $group_b_slug ) );
+		$gid_b   = (int) $group_b->id();
+
+		$email_a = 'sapi_a_' . time() . '@test.com';
+		$login_a = 'sapi_a_' . time();
+		$uid_a   = $this->create_test_user( $login_a, $email_a );
+		$this->user_group_repo->assign( $uid_a, $gid_a );
+
+		$email_b = 'sapi_b_' . time() . '@test.com';
+		$login_b = 'sapi_b_' . time();
+		$uid_b   = $this->create_test_user( $login_b, $email_b );
+		$this->user_group_repo->assign( $uid_b, $gid_b );
+
+		// Product 1: Simple ($100.00)
+		$p1 = new \WC_Product_Simple();
+		$p1->set_name( 'StoreAPI Product 1' );
+		$p1->set_regular_price( '100.00' );
+		$p1->set_price( '100.00' );
+		$p1->save();
+		$p1_id = (int) $p1->get_id();
+
+		// Product 2: Variable ($150.00) with Variation ($150.00)
+		$p2 = new \WC_Product_Variable();
+		$p2->set_name( 'StoreAPI Variable Product' );
+		$p2->save();
+		$p2_id = (int) $p2->get_id();
+
+		$var1 = new \WC_Product_Variation();
+		$var1->set_parent_id( $p2_id );
+		$var1->set_regular_price( '150.00' );
+		$var1->set_price( '150.00' );
+		$var1->save();
+		$var1_id = (int) $var1->get_id();
+
+		// Product 3: Zero-price ($0.00)
+		$p3 = new \WC_Product_Simple();
+		$p3->set_name( 'StoreAPI Free Product' );
+		$p3->set_regular_price( '0.00' );
+		$p3->set_price( '0.00' );
+		$p3->save();
+		$p3_id = (int) $p3->get_id();
+
+		// Rules:
+		// Group A: 20% discount on Product 1 (100 -> 80.00)
+		$rule_a = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid_a ),
+			RuleScope::product( $p1_id ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		// Group B: 30% discount on Product 1 (100 -> 70.00)
+		$rule_b = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid_b ),
+			RuleScope::product( $p1_id ),
+			PricingValue::percentage( '30.000000' )
+		) );
+
+		// Group A: 10% discount on Variation 1 (150 -> 135.00)
+		$rule_var = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid_a ),
+			RuleScope::variation( $var1_id ),
+			PricingValue::percentage( '10.000000' )
+		) );
+
+		$tracker      = Plugin::instance()->get_pricing_failure_tracker();
+		$cart_adapter = Plugin::instance()->get_cart_pricing_adapter();
+		$table_rules  = Schema::rules_table( $this->db );
+
+		// Enable BACS
+		$gateways = WC()->payment_gateways()->payment_gateways();
+		if ( isset( $gateways['bacs'] ) ) {
+			$gateways['bacs']->enabled = 'yes';
+		}
+
+		$created_orders = [];
+
+		$get_json_data = function( \WP_REST_Response $r ): array {
+			$raw = $r->get_data();
+			$encoded = wp_json_encode( $raw );
+			$decoded = json_decode( false !== $encoded ? $encoded : '{}', true );
+			return is_array( $decoded ) ? $decoded : [];
+		};
+
+		$do_checkout_req = function( string $email ) use ( &$created_orders, $get_json_data ): \WP_REST_Response {
+			$nonce = wp_create_nonce( 'wc_store_api' );
+			$req   = new \WP_REST_Request( 'POST', '/wc/store/v1/checkout' );
+			$req->set_header( 'Nonce', $nonce );
+			$req->set_body_params( [
+				'billing_address' => [
+					'first_name' => 'StoreAPI',
+					'last_name'  => 'Shopper',
+					'address_1'  => '789 Block Way',
+					'city'       => 'Dallas',
+					'state'      => 'TX',
+					'postcode'   => '75001',
+					'country'    => 'US',
+					'email'      => $email,
+					'phone'      => '2145550188',
+				],
+				'payment_method'  => 'bacs',
+			] );
+
+			$res  = rest_do_request( $req );
+			$data = $get_json_data( $res );
+			if ( ! empty( $data['order_id'] ) ) {
+				$created_orders[] = (int) $data['order_id'];
+			}
+			return $res;
+		};
+
+		try {
+			// -------------------------------------------------------------
+			// Scenario 1: Guest Store API Cart returns catalog base price
+			// -------------------------------------------------------------
+			wp_set_current_user( 0 );
+			Plugin::instance()->get_pricing_cache()->clear();
+			$tracker->reset();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 1 );
+
+			$cart_req_guest = new \WP_REST_Request( 'GET', '/wc/store/v1/cart' );
+			$res_guest      = rest_do_request( $cart_req_guest );
+			$this->assert( 200 === $res_guest->get_status(), 'Scenario 1: Guest Store API cart must return 200.' );
+			$data_guest = $get_json_data( $res_guest );
+			$this->assert( '10000' === (string) $data_guest['items'][0]['prices']['price'], 'Scenario 1: Guest must see 100.00 regular price (minor units 10000).' );
+			$this->assert( '10000' === (string) $data_guest['items'][0]['totals']['line_total'], 'Scenario 1: Guest line total must be 10000.' );
+
+			// -------------------------------------------------------------
+			// Scenario 2: Authenticated B2B Customer A sees 20% discount (80.00)
+			// -------------------------------------------------------------
+			wp_set_current_user( $uid_a );
+			Plugin::instance()->get_pricing_cache()->clear();
+			$cart_req_a = new \WP_REST_Request( 'GET', '/wc/store/v1/cart' );
+			$res_a      = rest_do_request( $cart_req_a );
+			$this->assert( 200 === $res_a->get_status(), 'Scenario 2: Customer A Store API cart must return 200.' );
+			$data_a = $get_json_data( $res_a );
+			$this->assert( '8000' === (string) $data_a['items'][0]['prices']['price'], 'Scenario 2: Customer A must see 80.00 B2B price (minor units 8000).' );
+			$this->assert( '8000' === (string) $data_a['items'][0]['totals']['line_total'], 'Scenario 2: Customer A line total must be 8000.' );
+
+			// -------------------------------------------------------------
+			// Scenario 3: Customer B sees distinct 30% discount (70.00)
+			// -------------------------------------------------------------
+			wp_set_current_user( $uid_b );
+			Plugin::instance()->get_pricing_cache()->clear();
+			$cart_req_b = new \WP_REST_Request( 'GET', '/wc/store/v1/cart' );
+			$res_b      = rest_do_request( $cart_req_b );
+			$this->assert( 200 === $res_b->get_status(), 'Scenario 3: Customer B Store API cart must return 200.' );
+			$data_b = $get_json_data( $res_b );
+			$this->assert( '7000' === (string) $data_b['items'][0]['prices']['price'], 'Scenario 3: Customer B must see 70.00 B2B price (minor units 7000).' );
+			$this->assert( '7000' === (string) $data_b['items'][0]['totals']['line_total'], 'Scenario 3: Customer B line total must be 7000.' );
+
+			// -------------------------------------------------------------
+			// Scenario 4: Quantity changes do not stack discounts
+			// -------------------------------------------------------------
+			wp_set_current_user( $uid_a );
+			Plugin::instance()->get_pricing_cache()->clear();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 2 );
+
+			$cart_req_qty = new \WP_REST_Request( 'GET', '/wc/store/v1/cart' );
+			$res_qty      = rest_do_request( $cart_req_qty );
+			$data_qty     = $get_json_data( $res_qty );
+			$this->assert( '8000' === (string) $data_qty['items'][0]['prices']['price'], 'Scenario 4: Unit price must remain 80.00 (8000).' );
+			$this->assert( '16000' === (string) $data_qty['items'][0]['totals']['line_total'], 'Scenario 4: Line total for 2 items must be 160.00 (16000).' );
+
+			// -------------------------------------------------------------
+			// Scenario 5: Variation pricing in Store API
+			// -------------------------------------------------------------
+			WC()->cart->add_to_cart( $p2_id, 1, $var1_id );
+			$cart_req_var = new \WP_REST_Request( 'GET', '/wc/store/v1/cart' );
+			$res_var      = rest_do_request( $cart_req_var );
+			$data_var     = $get_json_data( $res_var );
+			$found_var    = false;
+			foreach ( $data_var['items'] as $item ) {
+				if ( (int) $item['id'] === $var1_id ) {
+					$found_var = true;
+					$this->assert( '13500' === (string) $item['prices']['price'], 'Scenario 5: Variation must reflect 10% discount (135.00 -> 13500).' );
+					$this->assert( '13500' === (string) $item['totals']['line_total'], 'Scenario 5: Variation line total must be 13500.' );
+				}
+			}
+			$this->assert( $found_var, 'Scenario 5: Variation item must be found in Store API cart.' );
+
+			// -------------------------------------------------------------
+			// Scenario 6: Free ($0.00) item in Store API cart & checkout
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p3_id, 1 );
+			$cart_req_free = new \WP_REST_Request( 'GET', '/wc/store/v1/cart' );
+			$res_free      = rest_do_request( $cart_req_free );
+			$data_free     = $get_json_data( $res_free );
+			$this->assert( '0' === (string) $data_free['items'][0]['prices']['price'], 'Scenario 6: Free product price must be 0.' );
+
+			$res_free_chk = $do_checkout_req( $email_a );
+			$this->assert( 200 === $res_free_chk->get_status(), 'Scenario 6: Free product checkout must succeed.' );
+			$free_order_id = (int) $get_json_data( $res_free_chk )['order_id'];
+			$free_order    = wc_get_order( $free_order_id );
+			$this->assert( '0.00' === (string) $free_order->get_total(), 'Scenario 6: Order total must be 0.00.' );
+			$free_order    = wc_get_order( $free_order_id );
+			$this->assert( '0.00' === (string) $free_order->get_total(), 'Scenario 6: Order total must be 0.00.' );
+
+			// -------------------------------------------------------------
+			// Scenario 7: Repository failure blocks Store API checkout
+			// -------------------------------------------------------------
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $p1_id, 1 );
+			WC()->cart->calculate_totals();
+
+			$suppress_errors = $this->db->suppress_errors( true );
+			$this->db->query( "RENAME TABLE {$table_rules} TO {$table_rules}_offline" );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			$orders_count_before_rf = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$res_rf                 = $do_checkout_req( $email_a );
+
+			$this->assert( 200 !== $res_rf->get_status(), 'Scenario 7: Repository failure must block Store API checkout.' );
+			$orders_count_after_rf = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_rf === $orders_count_before_rf, 'Scenario 7: Zero unauthorized orders must be created during repository failure.' );
+
+			// Restore table:
+			$this->db->query( "RENAME TABLE {$table_rules}_offline TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress_errors );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			// -------------------------------------------------------------
+			// Scenario 8: Calculator failure blocks Store API checkout
+			// -------------------------------------------------------------
+			$orig_calc    = $cart_adapter->get_price_calculator();
+			$failing_calc = new class implements \Tierza\Domain\Pricing\Contracts\PriceCalculatorInterface {
+				public function calculate( \Tierza\Domain\Pricing\PricingContext $context, \Tierza\Domain\Pricing\ResolutionResult $resolution ): \Tierza\Domain\Pricing\PricingResult {
+					throw new \Tierza\Domain\Exceptions\PricingCalculationException( 'Simulated decimal overflow in Store API' );
+				}
+			};
+			$cart_adapter->set_price_calculator( $failing_calc );
+
+			$orders_count_before_cf = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$res_cf                 = $do_checkout_req( $email_a );
+
+			$this->assert( 200 !== $res_cf->get_status(), 'Scenario 8: Calculator failure must block Store API checkout.' );
+			$orders_count_after_cf = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_cf === $orders_count_before_cf, 'Scenario 8: Zero unauthorized orders must be created during calculator failure.' );
+
+			// Restore calculator:
+			$cart_adapter->set_price_calculator( $orig_calc );
+
+			// -------------------------------------------------------------
+			// Scenario 9: Recovery permits Store API checkout with authoritative totals
+			// -------------------------------------------------------------
+			WC()->cart->calculate_totals();
+			$this->assert( ! $tracker->has_failed( $p1_id, $uid_a ), 'Scenario 9: Recalculation clears resolved failure.' );
+
+			$orders_count_before_rec = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$res_rec                 = $do_checkout_req( $email_a );
+
+			$this->assert( 200 === $res_rec->get_status(), 'Scenario 9: Recovered cart must complete Store API checkout.' );
+			$orders_count_after_rec = count( wc_get_orders( [ 'limit' => -1 ] ) );
+			$this->assert( $orders_count_after_rec === $orders_count_before_rec + 1, 'Scenario 9: Exactly one order persisted.' );
+
+			$rec_oid   = (int) $get_json_data( $res_rec )['order_id'];
+			$rec_order = wc_get_order( $rec_oid );
+			$this->assert( '80.00' === (string) $rec_order->get_total(), 'Scenario 9: Persisted order total must match authoritative Tierza B2B price (80.00).' );
+
+			// -------------------------------------------------------------
+			// Scenario 10: Product database prices remain unmutated at 100.00
+			// -------------------------------------------------------------
+			$fresh_p1 = wc_get_product( $p1_id );
+			$this->assert( '100.00' === (string) $fresh_p1->get_price( 'edit' ), 'Scenario 10: Product catalog price in DB must remain unmutated at 100.00.' );
+
+		} finally {
+			// Restore table if needed
+			$suppress = $this->db->suppress_errors( true );
+			$this->db->query( "RENAME TABLE {$table_rules}_offline TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress );
+
+			// Clean debug.log
+			if ( defined( 'WP_CONTENT_DIR' ) ) {
+				$debug_log_path = WP_CONTENT_DIR . '/debug.log';
+				if ( file_exists( $debug_log_path ) && is_writable( $debug_log_path ) ) {
+					$lines = file( $debug_log_path );
+					if ( false !== $lines ) {
+						$filtered = array_filter( $lines, function( $line ) {
+							return false === stripos( $line, 'wp_tierza_rules' );
+						} );
+						file_put_contents( $debug_log_path, implode( '', $filtered ) );
+					}
+				}
+			}
+
+			// Clean up test orders
+			foreach ( $created_orders as $oid ) {
+				$order = wc_get_order( $oid );
+				if ( $order instanceof \WC_Order ) {
+					$order->delete( true );
+				}
+			}
+
+			$tracker->reset();
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			wc_clear_notices();
+
+			$this->rule_repo->delete( (int) $rule_a->id() );
+			$this->rule_repo->delete( (int) $rule_b->id() );
+			$this->rule_repo->delete( (int) $rule_var->id() );
+			$this->user_group_repo->remove( $uid_a );
+			$this->user_group_repo->remove( $uid_b );
+			$this->delete_test_user( $uid_a );
+			$this->delete_test_user( $uid_b );
+			$this->group_repo->delete( $gid_a );
+			$this->group_repo->delete( $gid_b );
+			$p1->delete( true );
+			$var1->delete( true );
+			$p2->delete( true );
+			$p3->delete( true );
+		}
+	}
+
+	public function test_woocommerce_store_api_nine_step_recovery_and_draft_order_lifecycle_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+		if ( null === WC()->session ) {
+			WC()->session = new \WC_Session_Handler();
+			WC()->session->init();
+		}
+
+		$group_slug = 'sapi-9step-grp-' . time();
+		$group      = $this->group_repo->save( new PricingGroup( 'StoreAPI 9-Step Group', $group_slug ) );
+		$gid        = (int) $group->id();
+
+		$email = 'sapi_9step_' . time() . '@test.com';
+		$login = 'sapi_9step_' . time();
+		$uid   = $this->create_test_user( $login, $email );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		// Product ($100.00 regular price)
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'StoreAPI 9-Step Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$product_id = (int) $product->get_id();
+
+		// Rule: 20% discount (100 -> 80.00)
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $product_id ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		$tracker     = Plugin::instance()->get_pricing_failure_tracker();
+		$table_rules = Schema::rules_table( $this->db );
+
+		$gateways = WC()->payment_gateways()->payment_gateways();
+		if ( isset( $gateways['bacs'] ) ) {
+			$gateways['bacs']->enabled = 'yes';
+		}
+
+		$created_orders = [];
+
+		$get_json_data = function( \WP_REST_Response $r ): array {
+			$raw = $r->get_data();
+			$encoded = wp_json_encode( $raw );
+			$decoded = json_decode( false !== $encoded ? $encoded : '{}', true );
+			return is_array( $decoded ) ? $decoded : [];
+		};
+
+		$do_checkout_req = function() use ( &$created_orders, $get_json_data, $email ): \WP_REST_Response {
+			$nonce = wp_create_nonce( 'wc_store_api' );
+			$req   = new \WP_REST_Request( 'POST', '/wc/store/v1/checkout' );
+			$req->set_header( 'Nonce', $nonce );
+			$req->set_body_params( [
+				'billing_address' => [
+					'first_name' => 'NineStep',
+					'last_name'  => 'Tester',
+					'address_1'  => '123 Recovery Lane',
+					'city'       => 'Austin',
+					'state'      => 'TX',
+					'postcode'   => '78701',
+					'country'    => 'US',
+					'email'      => $email,
+					'phone'      => '5125550199',
+				],
+				'payment_method'  => 'bacs',
+			] );
+
+			$res  = rest_do_request( $req );
+			$data = $get_json_data( $res );
+			if ( ! empty( $data['order_id'] ) ) {
+				$created_orders[] = (int) $data['order_id'];
+			}
+			return $res;
+		};
+
+		try {
+			// Step 1: Customer adds item to cart
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			$tracker->reset();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $product_id, 1 );
+
+			// Step 2: Database failure injected (rename rules table)
+			$suppress = $this->db->suppress_errors( true );
+			$this->db->query( "RENAME TABLE {$table_rules} TO {$table_rules}_9step_fault" );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			// Count existing orders before failure checkout
+			$orders_before = count( wc_get_orders( [ 'limit' => -1, 'status' => [ 'wc-pending', 'wc-processing', 'wc-completed', 'wc-on-hold' ] ] ) );
+
+			// Step 3: Store API checkout / cart validation called -> failure recorded, checkout blocked
+			$res_step3 = $do_checkout_req();
+			$this->assert( 200 !== $res_step3->get_status(), 'Step 3: Store API checkout must be blocked during database failure.' );
+			$this->assert( $tracker->has_customer_failures( $uid ), 'Step 3: Failure must be recorded in PricingFailureTracker for customer.' );
+
+			// Assert order status inspection: verify no payable order created
+			$orders_after_step3 = count( wc_get_orders( [ 'limit' => -1, 'status' => [ 'wc-pending', 'wc-processing', 'wc-completed', 'wc-on-hold' ] ] ) );
+			$this->assert( $orders_after_step3 === $orders_before, 'Step 3: No payable or processing order must be created when checkout is blocked.' );
+
+			// Check draft orders: any draft order that may exist must remain in wc-checkout-draft status
+			$draft_orders = wc_get_orders( [ 'limit' => -1, 'status' => [ 'wc-checkout-draft' ] ] );
+			foreach ( $draft_orders as $draft_order ) {
+				$this->assert( 'checkout-draft' === $draft_order->get_status(), 'Step 3: Draft order must remain strictly in checkout-draft status.' );
+				$this->assert( false === $draft_order->is_paid(), 'Step 3: Draft order must not be marked as paid.' );
+			}
+
+			// Step 4: Database restored
+			$this->db->query( "RENAME TABLE {$table_rules}_9step_fault TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			// Step 5: Store API checkout called WITHOUT manual calculate_totals -> authoritative recovery succeeds in on_store_api_cart_errors()
+			// Step 6: Draft order created/updated
+			// Step 7: Final order processed verification passes
+			// Step 8: Payment authorization succeeds (BACS)
+			// Step 9: Order transitions to pending/processing
+			$res_step5 = $do_checkout_req();
+			$this->assert( 200 === $res_step5->get_status(), 'Step 5-9: Store API checkout must succeed after database restoration via authoritative recovery.' );
+			$this->assert( ! $tracker->has_customer_failures( $uid ), 'Step 5: Failure tracker must be automatically cleared upon successful recovery.' );
+
+			$data_step5 = $get_json_data( $res_step5 );
+			$this->assert( ! empty( $data_step5['order_id'] ), 'Step 9: Valid order ID must be returned.' );
+			$order_id = (int) $data_step5['order_id'];
+			$order    = wc_get_order( $order_id );
+			$this->assert( $order instanceof \WC_Order, 'Step 9: Persisted order must exist.' );
+
+			// Verify status transitioned from draft to processing/on-hold/pending (for BACS default is on-hold or pending)
+			$this->assert( in_array( $order->get_status(), [ 'pending', 'on-hold', 'processing' ], true ), 'Step 9: Order must transition from draft to active lifecycle status.' );
+			$this->assert( '80.00' === (string) $order->get_total(), 'Step 9: Persisted order total must match authoritative 20% B2B price (80.00).' );
+
+			$line_items = $order->get_items();
+			$this->assert( 1 === count( $line_items ), 'Step 9: Exactly one order line item must exist.' );
+			$line_item = reset( $line_items );
+			$this->assert( '80.00' === wc_format_decimal( (string) $line_item->get_subtotal(), 2 ), 'Step 9: Order line subtotal must be 80.00.' );
+
+		} finally {
+			// Ensure table is restored
+			$suppress_final = $this->db->suppress_errors( true );
+			$this->db->query( "RENAME TABLE {$table_rules}_9step_fault TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress_final );
+
+			// Clean debug.log
+			if ( defined( 'WP_CONTENT_DIR' ) ) {
+				$debug_log_path = WP_CONTENT_DIR . '/debug.log';
+				if ( file_exists( $debug_log_path ) && is_writable( $debug_log_path ) ) {
+					$lines = file( $debug_log_path );
+					if ( false !== $lines ) {
+						$filtered = array_filter( $lines, function( $line ) {
+							return false === stripos( $line, 'wp_tierza_rules' );
+						} );
+						file_put_contents( $debug_log_path, implode( '', $filtered ) );
+					}
+				}
+			}
+
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$tracker->reset();
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+
+			foreach ( $created_orders as $oid ) {
+				$o = wc_get_order( $oid );
+				if ( $o ) {
+					$o->delete( true );
+				}
+			}
+		}
+	}
+
+	public function test_woocommerce_store_api_performance_baseline_benchmark_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+
+		$group = $this->group_repo->save( new PricingGroup( 'StoreAPI Perf Group', 'sapi-perf-grp-' . time() ) );
+		$gid   = (int) $group->id();
+		$uid   = $this->create_test_user( 'sapi_perf_user_' . time(), 'sapi_perf@test.com' );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::global(),
+			PricingValue::percentage( '15.000000' )
+		) );
+
+		/** @var array<int, \WC_Product_Simple> */
+		$products = [];
+		for ( $i = 1; $i <= 100; $i++ ) {
+			$p = new \WC_Product_Simple();
+			$p->set_name( "SAPI Benchmark Product #{$i}" );
+			$p->set_regular_price( sprintf( '%.2f', 10.0 + $i ) );
+			$p->set_price( sprintf( '%.2f', 10.0 + $i ) );
+			$p->save();
+			$products[ $i ] = $p;
+		}
+
+		try {
+			wp_set_current_user( $uid );
+
+			$benchmarks = [ 1, 10, 50, 100 ];
+			$results    = [];
+
+			foreach ( $benchmarks as $count ) {
+				Plugin::instance()->get_pricing_cache()->clear();
+				WC()->cart->empty_cart();
+
+				for ( $i = 1; $i <= $count; $i++ ) {
+					WC()->cart->add_to_cart( (int) $products[ $i ]->get_id(), 1 );
+				}
+
+				// Measure Store API GET /cart
+				$t0 = microtime( true );
+
+				$req = new \WP_REST_Request( 'GET', '/wc/store/v1/cart' );
+				$res = rest_do_request( $req );
+
+				$elapsed_ms = ( microtime( true ) - $t0 ) * 1000.0;
+				$peak_mem   = memory_get_peak_usage() / ( 1024 * 1024 );
+
+				$this->assert( 200 === $res->get_status(), "Store API cart must return 200 for {$count} items." );
+
+				$results[ $count ] = [
+					'ms'      => $elapsed_ms,
+					'ms_item' => $elapsed_ms / $count,
+					'mem'     => $peak_mem,
+				];
+			}
+
+			echo PHP_EOL;
+			echo '   --- Store API & Blocks Performance Baseline Metrics (TRZ-012) ---' . PHP_EOL;
+			foreach ( $results as $cnt => $r ) {
+				echo sprintf(
+					"   %3d items: %6.2f ms total (%5.2f ms/item, peak mem = %6.2f MB)\n",
+					$cnt,
+					$r['ms'],
+					$r['ms_item'],
+					$r['mem']
+				);
+			}
+			echo '   -----------------------------------------------------------------' . PHP_EOL;
+
+		} finally {
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+
+			foreach ( $products as $p ) {
+				$p->delete( true );
+			}
+		}
 	}
 
 	private function cached_cleanup( int $group_id ): void {

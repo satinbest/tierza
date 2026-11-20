@@ -5,6 +5,7 @@ parameters:
     bootstrapFiles:
         - tests/bootstrap.php
         - tests/stubs/woocommerce-stubs.php
+        - tests/stubs/store-api-stubs.php
     reportUnmatchedIgnoredErrors: false
     ignoreErrors:
         - identifier: requireOnce.fileNotFound

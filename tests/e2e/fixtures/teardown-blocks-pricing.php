@@ -42,7 +42,23 @@ foreach ( $orders as $o ) {
 	$o->delete( true );
 }
 
-// 5. Clear cart & pricing cache
+// 5. Restore cart and checkout pages to classic shortcodes for subsequent test suites
+$cart_pid = wc_get_page_id( 'cart' );
+if ( $cart_pid > 0 ) {
+	wp_update_post( [
+		'ID'           => $cart_pid,
+		'post_content' => '[woocommerce_cart]',
+	] );
+}
+$checkout_pid = wc_get_page_id( 'checkout' );
+if ( $checkout_pid > 0 ) {
+	wp_update_post( [
+		'ID'           => $checkout_pid,
+		'post_content' => '[woocommerce_checkout]',
+	] );
+}
+
+// 6. Clear cart & pricing cache
 if ( null !== WC()->cart ) {
 	WC()->cart->empty_cart();
 }

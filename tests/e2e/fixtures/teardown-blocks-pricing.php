@@ -41,6 +41,7 @@ $orders = wc_get_orders( [
 foreach ( $orders as $o ) {
 	$o->delete( true );
 }
+$wpdb->query( "DELETE FROM {$wpdb->posts} WHERE post_type = 'shop_order' AND post_status = 'wc-checkout-draft'" );
 
 // 5. Restore cart and checkout pages to classic shortcodes for subsequent test suites
 $cart_pid = wc_get_page_id( 'cart' );

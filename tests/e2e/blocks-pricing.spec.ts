@@ -83,6 +83,10 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 	}
 
 	test.beforeAll(async () => {
+		try {
+			execSync('npx wp-env run cli wp rewrite structure "/%postname%/" --hard', { encoding: 'utf-8' });
+		} catch {}
+
 		const output = execSync(
 			'npx wp-env run cli wp eval-file wp-content/plugins/tierza/tests/e2e/fixtures/setup-blocks-pricing.php',
 			{ encoding: 'utf-8' }

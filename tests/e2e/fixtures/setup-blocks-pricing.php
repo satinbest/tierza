@@ -133,7 +133,7 @@ if ( $cart_pid > 0 ) {
 	if ( ! str_contains( $current_cart, 'wp:woocommerce/cart' ) ) {
 		wp_update_post( [
 			'ID'           => $cart_pid,
-			'post_content' => '<!-- wp:woocommerce/cart -->\n<div class="wp-block-woocommerce-cart alignwide"></div>\n<!-- /wp:woocommerce/cart -->',
+			'post_content' => "<!-- wp:woocommerce/cart -->\n<div class=\"wp-block-woocommerce-cart alignwide\"></div>\n<!-- /wp:woocommerce/cart -->",
 		] );
 	}
 }
@@ -144,16 +144,17 @@ if ( $checkout_pid > 0 ) {
 	if ( ! str_contains( $current_checkout, 'wp:woocommerce/checkout' ) ) {
 		wp_update_post( [
 			'ID'           => $checkout_pid,
-			'post_content' => '<!-- wp:woocommerce/checkout -->\n<div class="wp-block-woocommerce-checkout alignwide"></div>\n<!-- /wp:woocommerce/checkout -->',
+			'post_content' => "<!-- wp:woocommerce/checkout -->\n<div class=\"wp-block-woocommerce-checkout alignwide\"></div>\n<!-- /wp:woocommerce/checkout -->",
 		] );
 	}
 }
 
 // Ensure pretty permalinks are enabled for REST API /wp-json/
 global $wp_rewrite;
-if ( empty( get_option( 'permalink_structure' ) ) ) {
-	$wp_rewrite->set_permalink_structure( '/%postname%/' );
-	$wp_rewrite->flush_rules();
+$wp_rewrite->set_permalink_structure( '/%postname%/' );
+$wp_rewrite->flush_rules( true );
+if ( function_exists( 'save_mod_rewrite_rules' ) ) {
+	save_mod_rewrite_rules();
 }
 
 // Ensure BACS is enabled for testing checkout

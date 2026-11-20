@@ -7,6 +7,26 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+// 0. Clean any previous test products, orders, and draft orders
+$old_prods = wc_get_products( [
+	'limit' => -1,
+	's'     => 'Tierza Blocks E2E',
+] );
+foreach ( $old_prods as $old_p ) {
+	$old_p->delete( true );
+}
+
+$old_orders = wc_get_orders( [
+	'limit'         => -1,
+	'billing_email' => 'e2e_blocks_b2b@tierza.test',
+] );
+foreach ( $old_orders as $old_o ) {
+	$old_o->delete( true );
+}
+
+global $wpdb;
+$wpdb->query( "DELETE FROM {$wpdb->posts} WHERE post_type = 'shop_order' AND post_status = 'wc-checkout-draft'" );
+
 // 1. Create simple product ($100.00)
 $prod1 = new WC_Product_Simple();
 $prod1->set_name( 'Tierza Blocks E2E Simple Product' );
@@ -129,6 +149,13 @@ if ( $checkout_pid > 0 ) {
 	}
 }
 
+// Ensure pretty permalinks are enabled for REST API /wp-json/
+global $wp_rewrite;
+if ( empty( get_option( 'permalink_structure' ) ) ) {
+	$wp_rewrite->set_permalink_structure( '/%postname%/' );
+	$wp_rewrite->flush_rules();
+}
+
 // Ensure BACS is enabled for testing checkout
 update_option( 'woocommerce_bacs_settings', [ 'enabled' => 'yes' ] );
 
@@ -136,12 +163,14 @@ update_option( 'woocommerce_bacs_settings', [ 'enabled' => 'yes' ] );
 \Tierza\Plugin::instance()->get_pricing_cache()->clear();
 
 echo wp_json_encode( [
-	'simple_id'     => $p1_id,
-	'simple_url'    => get_permalink( $p1_id ),
-	'variable_id'   => $p2_id,
-	'variation_id'  => $v1_id,
-	'user_id'       => $uid,
-	'group_id'      => $gid,
-	'cart_url'      => wc_get_cart_url(),
-	'checkout_url'  => wc_get_checkout_url(),
+	'simple_id'         => $p1_id,
+	'simple_url'        => get_permalink( $p1_id ),
+	'variable_id'       => $p2_id,
+	'variation_id'      => $v1_id,
+	'user_id'           => $uid,
+	'group_id'          => $gid,
+	'cart_url'          => wc_get_cart_url(),
+	'checkout_url'      => wc_get_checkout_url(),
+	'rest_cart_url'     => get_rest_url( null, 'wc/store/v1/cart' ),
+	'rest_checkout_url' => get_rest_url( null, 'wc/store/v1/checkout' ),
 ] );

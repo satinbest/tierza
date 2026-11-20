@@ -24,11 +24,12 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 	let userId = 0;
 	let cartUrl = '/cart/';
 	let checkoutUrl = '/checkout/';
+	let restCartUrl = '/wp-json/wc/store/v1/cart';
 
 	async function clearUserCart(uid: number) {
 		try {
 			execSync(
-				'npx wp-env run cli wp db query "TRUNCATE TABLE wp_woocommerce_sessions; DELETE FROM wp_usermeta WHERE meta_key LIKE \'_woocommerce_persistent_cart_%\';"',
+				'npx wp-env run cli wp db query "TRUNCATE TABLE wp_woocommerce_sessions; DELETE FROM wp_usermeta WHERE meta_key LIKE \'_woocommerce_persistent_cart_%\'; DELETE FROM wp_posts WHERE post_type=\'shop_order\' AND post_status=\'wc-checkout-draft\';"',
 				{ encoding: 'utf-8' }
 			);
 		} catch {}
@@ -87,7 +88,7 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 			{ encoding: 'utf-8' }
 		);
 
-		const jsonMatch = output.match(/\{"simple_id":\d+,"simple_url":"[^"]+","variable_id":\d+,"variation_id":\d+,"user_id":\d+,"group_id":\d+,"cart_url":"[^"]*","checkout_url":"[^"]*"\}\s*$/m);
+		const jsonMatch = output.match(/\{"simple_id":[\s\S]*\}$/m);
 		if (!jsonMatch) {
 			throw new Error(`Failed to parse setup output: ${output}`);
 		}
@@ -100,6 +101,9 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 		}
 		if (data.checkout_url) {
 			checkoutUrl = data.checkout_url;
+		}
+		if (data.rest_cart_url) {
+			restCartUrl = data.rest_cart_url;
 		}
 	});
 
@@ -122,10 +126,10 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 		await expect(cartBlock).toBeVisible({ timeout: 20000 });
 
 		// Fetch Store API cart directly within active browser session
-		const cartJson: any = await page.evaluate(async () => {
-			const res = await fetch('/wp-json/wc/store/v1/cart');
+		const cartJson: any = await page.evaluate(async (url) => {
+			const res = await fetch(url);
 			return await res.json();
-		});
+		}, restCartUrl);
 
 		// Assert Store API minor units: 10000 = $100.00
 		expect(cartJson).not.toBeNull();
@@ -150,10 +154,10 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 		await expect(cartBlock).toBeVisible({ timeout: 20000 });
 
 		// Fetch Store API cart directly within authenticated session
-		const cartJson: any = await page.evaluate(async () => {
-			const res = await fetch('/wp-json/wc/store/v1/cart');
+		const cartJson: any = await page.evaluate(async (url) => {
+			const res = await fetch(url);
 			return await res.json();
-		});
+		}, restCartUrl);
 
 		// Assert Store API minor units for B2B price: 8000 = $80.00
 		expect(cartJson).not.toBeNull();
@@ -185,10 +189,10 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 		await page.waitForTimeout(3000);
 
 		// Fetch Store API cart directly to verify updated minor units
-		const latestCartJson: any = await page.evaluate(async () => {
-			const res = await fetch('/wp-json/wc/store/v1/cart');
+		const latestCartJson: any = await page.evaluate(async (url) => {
+			const res = await fetch(url);
 			return await res.json();
-		});
+		}, restCartUrl);
 
 		// Assert Store API minor units: 8000 unit, 16000 line total
 		expect(latestCartJson).not.toBeNull();
@@ -206,10 +210,15 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 
 		// Fresh cart with 1 item
 		await page.goto(`/?add-to-cart=${simpleId}`);
+		await page.waitForLoadState('networkidle');
 		await page.goto(checkoutUrl);
 
 		const checkoutBlock = page.locator('.wp-block-woocommerce-checkout, .wc-block-checkout').first();
 		await expect(checkoutBlock).toBeVisible({ timeout: 20000 });
+
+		// Verify order summary displays $80.00 before proceeding
+		const orderSummary = page.locator('.wc-block-components-order-summary, .wc-block-checkout__sidebar, .wc-block-components-totals-item').first();
+		await expect(orderSummary).toContainText('80', { timeout: 15000 });
 
 		await fillCheckoutForm(page);
 
@@ -241,6 +250,7 @@ test.describe('WooCommerce Blocks & Store API Pricing Integration (TRZ-012)', ()
 		await loginB2B(page);
 
 		await page.goto(`/?add-to-cart=${simpleId}`);
+		await page.waitForLoadState('networkidle');
 		await page.goto(checkoutUrl);
 
 		const checkoutBlock = page.locator('.wp-block-woocommerce-checkout, .wc-block-checkout').first();

@@ -98,3 +98,25 @@ Benchmarking under live MariaDB workloads confirms near-linear scaling and low l
 | **100 items** | ~31.37 ms | 0.31 ms/item | 107.23 MB | 1 (Prefetched) |
 
 All product and variation pricing rules are batched via `PricingBatchPrefetcher` in a single SQL query, avoiding $O(N)$ database query spikes.
+
+---
+
+## 5. Dynamic Failure Recovery, Draft Order Persistence & Tax/Coupon Handling
+
+### Dynamic Failure Recovery & Re-entrancy Protection
+In the WooCommerce Store API, `woocommerce_store_api_cart_errors` is invoked prior to order draft creation. If transient failures (e.g. database disconnects or lock timeouts) were recorded in `PricingFailureTracker`, TRZ-012 triggers an authoritative recalculation pass:
+1. **Re-entrancy Guard:** `$is_revalidating` prevents infinite recursive invocation when cart calculations trigger cart events.
+2. **Prefetch Fault Detection:** If batch prefetching encounters a repository exception, all cart lines are discretely marked as failed.
+3. **Item-by-Item Recalculation:** Each cart line is resolved against live database rules. Successfully recalculated lines have their failures cleared via `clear_failure()`.
+4. **Authoritative Cart Revalidation:** `CartPricingAdapter::revalidate_checkout()` audits all items. Only when zero failures remain does the error gate open.
+
+### Draft Order Lifecycle & Persisted Totals Safety
+WooCommerce Blocks persists orders in status `wc-checkout-draft` during form completion and transitions them to `on-hold` or `processing` upon payment authorization:
+- `woocommerce_store_api_checkout_update_order_meta` revalidates live pricing before order totals are written.
+- If order customer ID is missing or mismatched in guest/B2B context, the authenticated customer ID from `WC()->session` or current user is authoritatively resolved.
+- If draft order creation fails or is aborted, no pending or corrupt orders with stale or fallback pricing remain.
+
+### Tax-Inclusive vs Tax-Exclusive Stores & Coupon Reconciliation
+1. **Tax Reconciliation:** In tax-inclusive stores (`wc_prices_include_tax() === true`), order item totals are compared against subtotal plus subtotal tax (`$item->get_subtotal() + $item->get_subtotal_tax()`) to match Tierza's tax-inclusive unit pricing. In tax-exclusive stores, the net subtotal is compared.
+2. **Coupons:** Checkout reconciliation audits line subtotals rather than post-coupon totals, ensuring coupons discounting line totals never trigger false pricing discrepancy errors.
+3. **Zero-Priced & Free Items:** Handled with strict precision (`"0.00"` / `0`) without tripping fallback or discrepancy logic.

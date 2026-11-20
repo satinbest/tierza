@@ -494,7 +494,9 @@ if ( ! class_exists( 'WC_Order_Item_Product' ) ) {
 		public int $variation_id = 0;
 		public int $quantity = 1;
 		public string $subtotal = '0.00';
+		public string $subtotal_tax = '0.00';
 		public string $total = '0.00';
+		public string $total_tax = '0.00';
 		public ?WC_Product $product = null;
 
 		public function get_id(): int {
@@ -517,8 +519,16 @@ if ( ! class_exists( 'WC_Order_Item_Product' ) ) {
 			return $this->subtotal;
 		}
 
+		public function get_subtotal_tax(): string {
+			return $this->subtotal_tax;
+		}
+
 		public function get_total(): string {
 			return $this->total;
+		}
+
+		public function get_total_tax(): string {
+			return $this->total_tax;
 		}
 
 		public function get_product(): ?WC_Product {
@@ -597,6 +607,13 @@ if ( ! function_exists( 'wc_clear_notices' ) ) {
 	function wc_clear_notices(): void {
 		global $wc_notices;
 		$wc_notices = [];
+	}
+}
+
+if ( ! function_exists( 'wc_prices_include_tax' ) ) {
+	function wc_prices_include_tax(): bool {
+		global $wc_prices_include_tax_mock;
+		return (bool) ( $wc_prices_include_tax_mock ?? false );
 	}
 }
 

@@ -157,6 +157,7 @@ class DatabaseIntegrationLiveTest {
 			'test_woocommerce_cart_fail_closed_on_invalid_or_corrupted_items_in_mariadb',
 			'test_woocommerce_cart_performance_baseline_benchmark_in_mariadb',
 			'test_woocommerce_store_api_cart_and_checkout_lifecycle_in_mariadb',
+			'test_woocommerce_store_api_nine_step_recovery_and_draft_order_lifecycle_in_mariadb',
 			'test_woocommerce_store_api_performance_baseline_benchmark_in_mariadb',
 		];
 
@@ -4792,6 +4793,184 @@ class DatabaseIntegrationLiveTest {
 			$var1->delete( true );
 			$p2->delete( true );
 			$p3->delete( true );
+		}
+	}
+
+	public function test_woocommerce_store_api_nine_step_recovery_and_draft_order_lifecycle_in_mariadb(): void {
+		if ( null === WC()->cart ) {
+			wc_load_cart();
+		}
+		if ( null === WC()->session ) {
+			WC()->session = new \WC_Session_Handler();
+			WC()->session->init();
+		}
+
+		$group_slug = 'sapi-9step-grp-' . time();
+		$group      = $this->group_repo->save( new PricingGroup( 'StoreAPI 9-Step Group', $group_slug ) );
+		$gid        = (int) $group->id();
+
+		$email = 'sapi_9step_' . time() . '@test.com';
+		$login = 'sapi_9step_' . time();
+		$uid   = $this->create_test_user( $login, $email );
+		$this->user_group_repo->assign( $uid, $gid );
+
+		// Product ($100.00 regular price)
+		$product = new \WC_Product_Simple();
+		$product->set_name( 'StoreAPI 9-Step Product' );
+		$product->set_regular_price( '100.00' );
+		$product->set_price( '100.00' );
+		$product->save();
+		$product_id = (int) $product->get_id();
+
+		// Rule: 20% discount (100 -> 80.00)
+		$rule = $this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( $product_id ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		$tracker     = Plugin::instance()->get_pricing_failure_tracker();
+		$table_rules = Schema::rules_table( $this->db );
+
+		$gateways = WC()->payment_gateways()->payment_gateways();
+		if ( isset( $gateways['bacs'] ) ) {
+			$gateways['bacs']->enabled = 'yes';
+		}
+
+		$created_orders = [];
+
+		$get_json_data = function( \WP_REST_Response $r ): array {
+			$raw = $r->get_data();
+			$encoded = wp_json_encode( $raw );
+			$decoded = json_decode( false !== $encoded ? $encoded : '{}', true );
+			return is_array( $decoded ) ? $decoded : [];
+		};
+
+		$do_checkout_req = function() use ( &$created_orders, $get_json_data, $email ): \WP_REST_Response {
+			$nonce = wp_create_nonce( 'wc_store_api' );
+			$req   = new \WP_REST_Request( 'POST', '/wc/store/v1/checkout' );
+			$req->set_header( 'Nonce', $nonce );
+			$req->set_body_params( [
+				'billing_address' => [
+					'first_name' => 'NineStep',
+					'last_name'  => 'Tester',
+					'address_1'  => '123 Recovery Lane',
+					'city'       => 'Austin',
+					'state'      => 'TX',
+					'postcode'   => '78701',
+					'country'    => 'US',
+					'email'      => $email,
+					'phone'      => '5125550199',
+				],
+				'payment_method'  => 'bacs',
+			] );
+
+			$res  = rest_do_request( $req );
+			$data = $get_json_data( $res );
+			if ( ! empty( $data['order_id'] ) ) {
+				$created_orders[] = (int) $data['order_id'];
+			}
+			return $res;
+		};
+
+		try {
+			// Step 1: Customer adds item to cart
+			wp_set_current_user( $uid );
+			Plugin::instance()->get_pricing_cache()->clear();
+			$tracker->reset();
+			WC()->cart->empty_cart();
+			WC()->cart->add_to_cart( $product_id, 1 );
+
+			// Step 2: Database failure injected (rename rules table)
+			$suppress = $this->db->suppress_errors( true );
+			$this->db->query( "RENAME TABLE {$table_rules} TO {$table_rules}_9step_fault" );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			// Count existing orders before failure checkout
+			$orders_before = count( wc_get_orders( [ 'limit' => -1, 'status' => [ 'wc-pending', 'wc-processing', 'wc-completed', 'wc-on-hold' ] ] ) );
+
+			// Step 3: Store API checkout / cart validation called -> failure recorded, checkout blocked
+			$res_step3 = $do_checkout_req();
+			$this->assert( 200 !== $res_step3->get_status(), 'Step 3: Store API checkout must be blocked during database failure.' );
+			$this->assert( $tracker->has_customer_failures( $uid ), 'Step 3: Failure must be recorded in PricingFailureTracker for customer.' );
+
+			// Assert order status inspection: verify no payable order created
+			$orders_after_step3 = count( wc_get_orders( [ 'limit' => -1, 'status' => [ 'wc-pending', 'wc-processing', 'wc-completed', 'wc-on-hold' ] ] ) );
+			$this->assert( $orders_after_step3 === $orders_before, 'Step 3: No payable or processing order must be created when checkout is blocked.' );
+
+			// Check draft orders: any draft order that may exist must remain in wc-checkout-draft status
+			$draft_orders = wc_get_orders( [ 'limit' => -1, 'status' => [ 'wc-checkout-draft' ] ] );
+			foreach ( $draft_orders as $draft_order ) {
+				$this->assert( 'checkout-draft' === $draft_order->get_status(), 'Step 3: Draft order must remain strictly in checkout-draft status.' );
+				$this->assert( false === $draft_order->is_paid(), 'Step 3: Draft order must not be marked as paid.' );
+			}
+
+			// Step 4: Database restored
+			$this->db->query( "RENAME TABLE {$table_rules}_9step_fault TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress );
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			// Step 5: Store API checkout called WITHOUT manual calculate_totals -> authoritative recovery succeeds in on_store_api_cart_errors()
+			// Step 6: Draft order created/updated
+			// Step 7: Final order processed verification passes
+			// Step 8: Payment authorization succeeds (BACS)
+			// Step 9: Order transitions to pending/processing
+			$res_step5 = $do_checkout_req();
+			$this->assert( 200 === $res_step5->get_status(), 'Step 5-9: Store API checkout must succeed after database restoration via authoritative recovery.' );
+			$this->assert( ! $tracker->has_customer_failures( $uid ), 'Step 5: Failure tracker must be automatically cleared upon successful recovery.' );
+
+			$data_step5 = $get_json_data( $res_step5 );
+			$this->assert( ! empty( $data_step5['order_id'] ), 'Step 9: Valid order ID must be returned.' );
+			$order_id = (int) $data_step5['order_id'];
+			$order    = wc_get_order( $order_id );
+			$this->assert( $order instanceof \WC_Order, 'Step 9: Persisted order must exist.' );
+
+			// Verify status transitioned from draft to processing/on-hold/pending (for BACS default is on-hold or pending)
+			$this->assert( in_array( $order->get_status(), [ 'pending', 'on-hold', 'processing' ], true ), 'Step 9: Order must transition from draft to active lifecycle status.' );
+			$this->assert( '80.00' === (string) $order->get_total(), 'Step 9: Persisted order total must match authoritative 20% B2B price (80.00).' );
+
+			$line_items = $order->get_items();
+			$this->assert( 1 === count( $line_items ), 'Step 9: Exactly one order line item must exist.' );
+			$line_item = reset( $line_items );
+			$this->assert( '80.00' === wc_format_decimal( (string) $line_item->get_subtotal(), 2 ), 'Step 9: Order line subtotal must be 80.00.' );
+
+		} finally {
+			// Ensure table is restored
+			$suppress_final = $this->db->suppress_errors( true );
+			$this->db->query( "RENAME TABLE {$table_rules}_9step_fault TO {$table_rules}" );
+			$this->db->suppress_errors( $suppress_final );
+
+			// Clean debug.log
+			if ( defined( 'WP_CONTENT_DIR' ) ) {
+				$debug_log_path = WP_CONTENT_DIR . '/debug.log';
+				if ( file_exists( $debug_log_path ) && is_writable( $debug_log_path ) ) {
+					$lines = file( $debug_log_path );
+					if ( false !== $lines ) {
+						$filtered = array_filter( $lines, function( $line ) {
+							return false === stripos( $line, 'wp_tierza_rules' );
+						} );
+						file_put_contents( $debug_log_path, implode( '', $filtered ) );
+					}
+				}
+			}
+
+			wp_set_current_user( 0 );
+			WC()->cart->empty_cart();
+			$tracker->reset();
+			Plugin::instance()->get_pricing_cache()->clear();
+
+			$this->rule_repo->delete( (int) $rule->id() );
+			$this->user_group_repo->remove( $uid );
+			$this->delete_test_user( $uid );
+			$this->group_repo->delete( $gid );
+			$product->delete( true );
+
+			foreach ( $created_orders as $oid ) {
+				$o = wc_get_order( $oid );
+				if ( $o ) {
+					$o->delete( true );
+				}
+			}
 		}
 	}
 

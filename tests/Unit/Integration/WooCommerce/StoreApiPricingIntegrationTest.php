@@ -55,11 +55,12 @@ class StoreApiPricingIntegrationTest extends TestCase {
 	protected function setUp(): void {
 		parent::setUp();
 
-		global $current_user_id_mock, $wc_currency_mock, $wc_decimals_mock, $wp_actions, $wp_filters, $wc_notices;
-		$current_user_id_mock = 0;
-		$wc_currency_mock     = 'USD';
-		$wc_decimals_mock     = 2;
-		$wp_actions           = [];
+		global $current_user_id_mock, $wc_currency_mock, $wc_decimals_mock, $wc_prices_include_tax_mock, $wp_actions, $wp_filters, $wc_notices;
+		$current_user_id_mock       = 0;
+		$wc_currency_mock           = 'USD';
+		$wc_decimals_mock           = 2;
+		$wc_prices_include_tax_mock = false;
+		$wp_actions                 = [];
 		$wp_filters           = [];
 		$wc_notices           = [];
 
@@ -150,6 +151,8 @@ class StoreApiPricingIntegrationTest extends TestCase {
 	}
 
 	protected function tearDown(): void {
+		global $wc_prices_include_tax_mock;
+		$wc_prices_include_tax_mock = false;
 		$this->integration->unregister();
 		$this->failure_tracker->reset();
 		CartPricingAdapter::clear_cart_priced_registry();
@@ -185,8 +188,9 @@ class StoreApiPricingIntegrationTest extends TestCase {
 		$cart    = new WC_Cart();
 		$cart->set_cart_contents( [ 'cart_key_101' => [ 'data' => $product, 'quantity' => 1 ] ] );
 
-		// Simulate recorded failure in tracker
-		$this->failure_tracker->record_failure( 101, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Calculation error', $uid, 'cart_key_101' );
+		// Simulate ongoing failure in repository
+		$this->rule_repo->set_should_fail_on_query( true );
+		$this->failure_tracker->record_failure( 101, PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'Calculation error', $uid, 'cart_key_101' );
 
 		$cart_errors = new WP_Error();
 		$this->integration->on_store_api_cart_errors( $cart_errors, $cart );
@@ -374,6 +378,7 @@ class StoreApiPricingIntegrationTest extends TestCase {
 		// Simulate sensitive exception with SQL, table names, DB credentials, file paths
 		$sensitive_msg = "Table 'wordpress.wp_tierza_rules' doesn't exist for query SELECT * FROM wp_tierza_rules WHERE user='root' pass='s3cr3t' /var/www/html/wp-content/plugins/tierza/src/repo.php:123";
 
+		$this->rule_repo->set_should_fail_on_query( true );
 		$this->failure_tracker->record_failure(
 			501,
 			PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE,
@@ -547,21 +552,165 @@ class StoreApiPricingIntegrationTest extends TestCase {
 		$cart    = new WC_Cart();
 		$cart->set_cart_contents( [ 'cart_key_401' => [ 'data' => $product, 'quantity' => 1 ] ] );
 
-		// Simulate transient failure:
-		$this->failure_tracker->record_failure( 401, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Precision fault', $uid, 'cart_key_401' );
+		// Step 1: Simulate ongoing failure (repo failure)
+		$this->rule_repo->set_should_fail_on_query( true );
+		$this->failure_tracker->record_failure( 401, PricingFailureTracker::CODE_REPOSITORY_UNAVAILABLE, 'DB error', $uid, 'cart_key_401' );
 
 		$cart_errors = new WP_Error();
 		$this->integration->on_store_api_cart_errors( $cart_errors, $cart );
 		$this->assertTrue( $cart_errors->has_errors(), 'Checkout validation must fail while transient error exists.' );
 
-		// Authoritative recalculation clears resolved error automatically:
-		$classic_integration = new CartPricingIntegration( $this->cart_adapter, $this->failure_tracker );
-		$classic_integration->on_before_calculate_totals( $cart );
-
-		$this->assertFalse( $this->failure_tracker->has_customer_failures( $uid ), 'Tracker must be cleared automatically upon successful recalculation.' );
+		// Step 2: Restore repo availability
+		$this->rule_repo->set_should_fail_on_query( false );
 
 		$recovered_errors = new WP_Error();
 		$this->integration->on_store_api_cart_errors( $recovered_errors, $cart );
 		$this->assertFalse( $recovered_errors->has_errors(), 'Checkout validation must pass cleanly after recovery.' );
+		$this->assertFalse( $this->failure_tracker->has_customer_failures( $uid ), 'Tracker must be cleared automatically upon successful recalculation.' );
+	}
+
+	public function test_cart_errors_prefetch_failure_marks_all_items_and_prevents_recovery(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Prefetch Group', 'prefetch-grp' ) );
+		$gid   = (int) $group->id();
+		$uid   = 71;
+		$this->user_group_repo->assign( $uid, $gid );
+
+		global $current_user_id_mock;
+		$current_user_id_mock = $uid;
+
+		$p1 = new WC_Product( 601, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
+		$p2 = new WC_Product( 602, [ 'price' => '50.00', 'regular_price' => '50.00' ] );
+		$cart = new WC_Cart();
+		$cart->set_cart_contents( [
+			'k1' => [ 'data' => $p1, 'quantity' => 1 ],
+			'k2' => [ 'data' => $p2, 'quantity' => 2 ],
+		] );
+
+		// Simulate pre-existing failure on item 601
+		$this->failure_tracker->record_failure( 601, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Prior error', $uid, 'k1' );
+
+		// Fail queries so prefetch fails
+		$this->rule_repo->set_should_fail_on_query( true );
+
+		$cart_errors = new WP_Error();
+		$this->integration->on_store_api_cart_errors( $cart_errors, $cart );
+
+		$this->assertTrue( $cart_errors->has_errors(), 'Checkout must remain blocked on prefetch failure.' );
+		$this->assertTrue( $this->failure_tracker->has_failed( 601, $uid, 'k1' ), 'Item 1 must remain recorded as failed.' );
+		$this->assertTrue( $this->failure_tracker->has_failed( 602, $uid, 'k2' ), 'Item 2 must be recorded as failed when batch prefetch fails.' );
+	}
+
+	public function test_checkout_order_processed_tax_inclusive_store(): void {
+		global $wc_prices_include_tax_mock;
+		$wc_prices_include_tax_mock = true;
+
+		$group = $this->group_repo->save( new PricingGroup( 'Tax Group', 'tax-grp' ) );
+		$gid   = (int) $group->id();
+		$uid   = 82;
+		$this->user_group_repo->assign( $uid, $gid );
+
+		// Tierza rule: 20% discount on product 701 (base price 100.00 inc tax -> 80.00 inc tax)
+		$this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( 701 ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		$product = new WC_Product( 701, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
+
+		$order              = new WC_Order();
+		$order->id          = 5001;
+		$order->customer_id = $uid;
+
+		// In WooCommerce, when tax is included (e.g. 10% tax rate),
+		// Unit price inc tax = 80.00. For qty 2, total inc tax = 160.00.
+		// Subtotal net of tax = 145.45, subtotal tax = 14.55.
+		// 145.45 + 14.55 = 160.00 = 80.00 * 2.
+		$item               = new WC_Order_Item_Product();
+		$item->product_id   = 701;
+		$item->quantity     = 2;
+		$item->subtotal     = '145.45';
+		$item->subtotal_tax = '14.55';
+		$item->product      = $product;
+		$order->items       = [ $item ];
+
+		$threw = false;
+		try {
+			$this->integration->on_store_api_checkout_order_processed( $order );
+		} catch ( RouteException $e ) {
+			$threw = true;
+		}
+
+		$this->assertFalse( $threw, 'Tax-inclusive store must reconcile subtotal + subtotal_tax with Tierza tax-inclusive unit price.' );
+
+		$wc_prices_include_tax_mock = false;
+	}
+
+	public function test_checkout_order_processed_coupon_discount_does_not_cause_discrepancy(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Coupon Group', 'coupon-grp' ) );
+		$gid   = (int) $group->id();
+		$uid   = 83;
+		$this->user_group_repo->assign( $uid, $gid );
+
+		// Tierza rule: 20% discount on product 702 (base price 100.00 -> 80.00)
+		$this->rule_repo->save( new PricingRule(
+			RuleTarget::group( $gid ),
+			RuleScope::product( 702 ),
+			PricingValue::percentage( '20.000000' )
+		) );
+
+		$product = new WC_Product( 702, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
+
+		$order              = new WC_Order();
+		$order->id          = 5002;
+		$order->customer_id = $uid;
+
+		// Qty 2. Tierza price = 80.00 each -> subtotal = 160.00.
+		// A coupon applied 20.00 discount, reducing line total to 140.00.
+		// get_subtotal() remains 160.00 (pre-coupon), get_total() becomes 140.00.
+		$item             = new WC_Order_Item_Product();
+		$item->product_id = 702;
+		$item->quantity   = 2;
+		$item->subtotal   = '160.00';
+		$item->total      = '140.00';
+		$item->product    = $product;
+		$order->items     = [ $item ];
+
+		$threw = false;
+		try {
+			$this->integration->on_store_api_checkout_order_processed( $order );
+		} catch ( RouteException $e ) {
+			$threw = true;
+		}
+
+		$this->assertFalse( $threw, 'Pre-coupon subtotal verification must succeed without false discrepancy rejection when coupons are applied.' );
+	}
+
+	public function test_customer_failure_isolation_between_shoppers(): void {
+		$group = $this->group_repo->save( new PricingGroup( 'Iso Group', 'iso-grp' ) );
+		$gid   = (int) $group->id();
+		$uid_a = 91;
+		$uid_b = 92;
+		$this->user_group_repo->assign( $uid_a, $gid );
+		$this->user_group_repo->assign( $uid_b, $gid );
+
+		// Record failure exclusively for customer A
+		$this->failure_tracker->record_failure( 101, PricingFailureTracker::CODE_CALCULATION_FAILED, 'Fatal calc', $uid_a, 'cart_key_101' );
+
+		$this->assertTrue( $this->failure_tracker->has_customer_failures( $uid_a ) );
+		$this->assertFalse( $this->failure_tracker->has_customer_failures( $uid_b ) );
+
+		// Customer B attempts checkout with valid cart
+		global $current_user_id_mock;
+		$current_user_id_mock = $uid_b;
+
+		$product = new WC_Product( 101, [ 'price' => '100.00', 'regular_price' => '100.00' ] );
+		$cart_b  = new WC_Cart();
+		$cart_b->set_cart_contents( [ 'cart_key_101' => [ 'data' => $product, 'quantity' => 1 ] ] );
+
+		$cart_errors = new WP_Error();
+		$this->integration->on_store_api_cart_errors( $cart_errors, $cart_b );
+
+		$this->assertFalse( $cart_errors->has_errors(), 'Customer A failures must never bleed into or block Customer B.' );
 	}
 }
